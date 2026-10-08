@@ -1,0 +1,11 @@
+[package]
+name = "cdp-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire layer for the Chrome DevTools Protocol: HTTP discovery, WebSocket framing, JSON envelopes."
+
+[dependencies]
+serde_json.workspace = true
+sha1.workspace = true
+base64.workspace = true

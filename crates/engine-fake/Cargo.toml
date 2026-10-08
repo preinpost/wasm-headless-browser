@@ -1,0 +1,10 @@
+[package]
+name = "engine-fake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "M0 engine: a fixed page model that answers a known set of CDP commands, so client plumbing can be proven without parsing HTML."
+
+[dependencies]
+serde_json.workspace = true
+browser-core.workspace = true

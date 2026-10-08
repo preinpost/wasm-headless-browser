@@ -1,0 +1,160 @@
+===== [1] Runtime.evaluate =====
+1
+
+===== [2] Runtime.evaluate =====
+location.href
+
+===== [3] Runtime.evaluate =====
+document.title
+
+===== [4] Runtime.evaluate =====
+
+(function() {
+    var results = [];
+    if (!document.body) return results;
+
+    var interactiveRoles = {
+        'button':1, 'link':1, 'textbox':1, 'checkbox':1, 'radio':1, 'combobox':1, 'listbox':1,
+        'menuitem':1, 'menuitemcheckbox':1, 'menuitemradio':1, 'option':1, 'searchbox':1,
+        'slider':1, 'spinbutton':1, 'switch':1, 'tab':1, 'treeitem':1
+    };
+    var interactiveTags = {
+        'a':1, 'button':1, 'input':1, 'select':1, 'textarea':1, 'details':1, 'summary':1
+    };
+
+    var allElements = document.body.querySelectorAll('*');
+    for (var i = 0; i < allElements.length; i++) {
+        var el = allElements[i];
+
+        if (el.closest && el.closest('[hidden], [aria-hidden="true"]')) continue;
+
+        var tagName = el.tagName.toLowerCase();
+        if (interactiveTags[tagName]) continue;
+
+        var role = el.getAttribute('role');
+        if (role && interactiveRoles[role.toLowerCase()]) continue;
+
+        var computedStyle = getComputedStyle(el);
+        var hasCursorPointer = computedStyle.cursor === 'pointer';
+        var hasOnClick = el.hasAttribute('onclick') || el.onclick !== null;
+        var tabIndex = el.getAttribute('tabindex');
+        var hasTabIndex = tabIndex !== null && tabIndex !== '-1';
+        var ce = el.getAttribute('contenteditable');
+        var isEditable = ce === '' || ce === 'true';
+
+        if (!hasCursorPointer && !hasOnClick && !hasTabIndex && !isEditable) continue;
+
+        // Skip elements that only inherit cursor:pointer from an ancestor
+        if (hasCursorPointer && !hasOnClick && !hasTabIndex && !isEditable) {
+            var parent = el.parentElement;
+            if (parent && getComputedStyle(parent).cursor === 'pointer') continue;
+        }
+
+        var text = (el.textContent || '').trim().slice(0, 100);
+
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        // Detect hidden radio/checkbox inputs inside this element (common pattern:
+        // <label> wrapping a display:none <input type="radio"> styled as a card).
+        // Note: we only check display/visibility/hidden, NOT opacity:0 or sr-only,
+        // because those inputs remain in Chrome's AX tree and already appear as
+        // role="radio" without promotion.
+        var hiddenInputType = null;
+        var hiddenInputChecked = null;
+        var hiddenInput = el.querySelector('input[type="radio"], input[type="checkbox"]');
+        if (hiddenInput) {
+            var hiddenInputStyle = getComputedStyle(hiddenInput);
+            var isInputHidden = hiddenInputStyle.display === 'none' || hiddenInputStyle.visibility === 'hidden' || hiddenInput.hidden;
+            if (isInputHidden) {
+                hiddenInputType = hiddenInput.type;
+                hiddenInputChecked = hiddenInput.indeterminate ? 'mixed' : String(hiddenInput.checked);
+            }
+        }
+
+        el.setAttribute('data-__ab-ci', String(results.length));
+        results.push({
+            text: text,
+            tagName: tagName,
+            hasOnClick: hasOnClick,
+            hasCursorPointer: hasCursorPointer,
+            hasTabIndex: hasTabIndex,
+            isEditable: isEditable,
+            hiddenInputType: hiddenInputType,
+            hiddenInputChecked: hiddenInputChecked
+        });
+    }
+    return results;
+})()
+
+
+===== [5] Runtime.evaluate =====
+(() => {
+            const el = document.querySelector("a");
+            if (!el) return null;
+            const inView = (r) => r.width > 0 && r.height > 0 &&
+                r.bottom > 0 && r.right > 0 &&
+                r.top < (window.innerHeight || document.documentElement.clientHeight) &&
+                r.left < (window.innerWidth || document.documentElement.clientWidth);
+            let rect = el.getBoundingClientRect();
+            if (!inView(rect)) {
+                el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+                rect = el.getBoundingClientRect();
+            }
+            const x = rect.x + rect.width / 2;
+            const y = rect.y + rect.height / 2;
+            const blockerAt = (doc, el, x, y) => {
+    // Descend from the given document through same-origin iframes so a point
+    // over a frame resolves to the element inside it, in that frame's space.
+    let d = doc, lx = x, ly = y;
+    let hit = d.elementFromPoint(lx, ly);
+    while (hit && (hit.tagName === 'IFRAME' || hit.tagName === 'FRAME') && hit.contentDocument && hit !== el) {
+        const r = hit.getBoundingClientRect();
+        lx -= r.x + hit.clientLeft;
+        ly -= r.y + hit.clientTop;
+        d = hit.contentDocument;
+        hit = d.elementFromPoint(lx, ly);
+    }
+    if (!hit || hit === el) return null;
+    const up = (n) => n.parentNode || n.host || (n.getRootNode && n.getRootNode().host) || null;
+    for (let n = hit; n; n = up(n)) { if (n === el) return null; }
+    for (let n = el; n; n = up(n)) { if (n === hit) return null; }
+    const hitLabel = hit.closest ? hit.closest('label') : null;
+    if (hitLabel && (hitLabel.control === el || hitLabel.contains(el))) return null;
+    const elLabel = el.closest ? el.closest('label') : null;
+    if (elLabel && elLabel.contains(hit)) return null;
+    let desc = hit.tagName.toLowerCase();
+    if (hit.id) desc += '#' + hit.id;
+    else if (typeof hit.className === 'string' && hit.className.trim())
+        desc += '.' + hit.className.trim().split(/\s+/).slice(0, 2).join('.');
+    if (!hit.id && hit.closest) {
+        const anchored = hit.closest('[id]');
+        if (anchored && anchored !== hit)
+            desc += ' inside ' + anchored.tagName.toLowerCase() + '#' + anchored.id;
+    }
+    return desc;
+};
+            return { x: x, y: y, blocker: blockerAt(document, el, x, y) };
+        })()
+
+===== [6] Runtime.evaluate =====
+document.querySelector("body")
+
+===== [7] Runtime.evaluate =====
+document.querySelector("a")
+
+===== [8] Runtime.evaluate =====
+1+1
+
+===== [9] Runtime.evaluate =====
+window.scrollBy(0, 300)
+
+===== [10] Runtime.evaluate =====
+history.back()
+
+===== [11] Runtime.evaluate =====
+history.forward()
+
+===== [12] Runtime.callFunctionOn =====
+function() { this.focus(); }
+

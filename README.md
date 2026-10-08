@@ -1,0 +1,132 @@
+# wasm-headless-browser
+
+A CDP-speaking headless browser, built to run inside a WASIX sandbox so that
+browser automation can happen where the credentials are.
+
+The immediate goal is modest: when a task needs a little crawling, do it inside
+the sandbox. A user hands over an id and password, those live in memory only,
+and a browser automation client drives the requests. The longer-term goal is
+that a coding agent running in the same sandbox can reach for it as a tool.
+
+It is not a browser for people. There is no window, no compositor, and no
+rendering pipeline. It speaks the Chrome DevTools Protocol so that existing
+clients work unchanged.
+
+## Status: M0
+
+M0 proves the protocol path and fixes the shape of the seam. It does **not**
+parse HTML.
+
+What works today, driven by the real `agent-browser` CLI:
+
+```
+$ agent-browser --cdp http://127.0.0.1:9333 open https://example.com
+✓ Sandbox Login
+  https://example.com
+
+$ agent-browser --cdp http://127.0.0.1:9333 snapshot
+- generic
+  - heading "Sandbox Login" [level=1, ref=e1]
+  - paragraph "Sign in to continue to the sandbox."
+  - form
+    - LabelText
+      - StaticText "User"
+    - textbox "User" [ref=e2]
+    - LabelText
+      - StaticText "Password"
+    - textbox "Password" [ref=e3]
+    - button "Sign in" [ref=e4]
+  - link "More info" [ref=e5]
+```
+
+Also verified: navigation, `get url`, `get title`, `eval`, `scroll`, history
+back and forward, `cookies get`, and `Page.captureScreenshot` returning a real
+PNG that reflects the fake block layout.
+
+The page behind those results comes from `engine-fake`, which answers from a
+fixed model. It cannot run JavaScript. Two things therefore do not work yet:
+free-form selectors resolved through page script (`find text ...`), and clicking.
+
+```bash
+./scripts/verify-m0.sh      # 16 checks, all against the real agent-browser
+```
+
+## Why the shape is what it is
+
+**No rendering engine.** A headless browser for automation needs the DOM, a
+JavaScript engine, an accessibility tree, and approximate box geometry. It does
+not need pixels. Dropping the rendering pipeline also removes the WASI GPU
+problem, since WASI has no surface interface yet and `wasi:webgpu` is still a
+proposal.
+
+**CDP is the boundary.** Roughly 24 methods and 25 events are all a client
+touches. Measured, not assumed: see [`docs/cdp-surface.md`](docs/cdp-surface.md).
+Building to that boundary means any existing client works, and it means the
+engine can be replaced under it without touching clients.
+
+**The engine is a trait.** `browser-core` owns protocol semantics and asks an
+`Engine` for answers. `engine-fake` is the M0 implementation. A real engine
+implements the same trait, and nothing above it changes.
+
+**The transport is hand-rolled.** `cdp-wire` implements the WebSocket handshake
+and RFC 6455 framing directly on `std::net`, with no async runtime. WASIX
+supports tokio, but a single-client protocol does not need it, and fewer
+dependencies means fewer WASIX surprises.
+
+## Layout
+
+```
+crates/
+  cdp-wire/       HTTP discovery, WebSocket framing, JSON envelope. No CDP semantics.
+  browser-core/   Targets, sessions, method dispatch. Engine-agnostic.
+  engine-fake/    M0 engine: fixed page model, accessibility projection, PNG encoder.
+  browser/        The binary. Wires a transport to an engine.
+docs/
+  cdp-surface.md          The measured protocol surface, and what it implies.
+  capture/                Raw frames and expressions from a real Chrome session.
+tools/cdp-log-proxy/      The logging proxy used to take that capture.
+scripts/verify-m0.sh      M0 acceptance test.
+```
+
+## Running it
+
+```bash
+cargo build
+./target/debug/wasm-headless-browser 127.0.0.1:9222
+```
+
+Then point any CDP client at it. With `agent-browser`:
+
+```bash
+agent-browser --cdp http://127.0.0.1:9222 open https://example.com
+agent-browser --cdp http://127.0.0.1:9222 snapshot
+```
+
+A bare port (`--cdp 9222`) also works; `host:port` without a scheme does not.
+
+## Roadmap
+
+| Milestone | Content |
+|---|---|
+| M0 | Protocol plumbing and the engine seam. **Done** |
+| M1 | Real engine: HTML parsing, a DOM, an accessibility tree, approximate layout |
+| M2 | A JavaScript engine, which is what makes clicking and arbitrary selectors work |
+| M3 | Network: real fetches, `Network.*` events, cookies |
+| M4 | Move into the WASIX sandbox, loopback between engine and client |
+| M5 | Credentials held in memory only, injected at request time and never written to disk |
+
+M1 is the first milestone where a real site can be read. M2 is where the cost
+concentrates, because the two heaviest expressions a client sends are page
+scripts, not protocol commands.
+
+## Open questions
+
+- **Does WASIX allow loopback `bind`/`listen`?** WASIX supports Berkeley sockets
+  and there is an official Axum-on-WASIX tutorial, but loopback inside the
+  browser sandbox specifically has not been confirmed. This is the largest
+  unknown and is worth breaking early.
+- **How does a client reach the engine?** Either both run inside the sandbox and
+  talk over loopback, or only the engine does and the host reaches in through
+  port exposure. The second path is unverified.
+- **How much of Playwright is reachable?** Playwright leans harder on page-side
+  JavaScript than `agent-browser` does, so it needs a more complete engine.

@@ -1,0 +1,9 @@
+[package]
+name = "browser-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CDP semantics: targets, sessions, method dispatch. Engine-agnostic."
+
+[dependencies]
+serde_json.workspace = true
