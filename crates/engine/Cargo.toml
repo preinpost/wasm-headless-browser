@@ -1,0 +1,13 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The real engine: HTML parsing, an arena DOM, and an accessibility tree."
+
+[dependencies]
+browser-core.workspace = true
+html5ever = "0.40"
+markup5ever = "0.40"
+serde_json.workspace = true
+base64.workspace = true

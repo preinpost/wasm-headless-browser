@@ -1,0 +1,22 @@
+//! The real engine.
+//!
+//! M0 answered the protocol from a fixed page model in `engine-fake`. This
+//! crate replaces that model with a real one: HTML goes in, a tree comes out,
+//! and the accessibility tree is derived from that tree.
+//!
+//! What is here so far:
+//!
+//!   * [`dom`] — an arena DOM, `Send`, with index handles
+//!   * [`parse`] — `html5ever` driven into that DOM
+//!   * [`ax`] — the accessibility tree derived from it
+//!
+//! Still to come: the `Engine` implementation that answers CDP from this tree,
+//! fetching, layout, and a JavaScript engine.
+
+pub mod ax;
+pub mod dom;
+pub mod parse;
+
+pub use ax::AxNode;
+pub use dom::{Document, NodeId};
+pub use parse::parse_html;

@@ -87,12 +87,14 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 `crates/engine-fake`를 대체할 `crates/engine`을 만듭니다. `browser-core`의
 `Engine` trait은 그대로 두고 구현만 갈아끼웁니다.
 
-- [ ] M1.1 `html5ever`로 HTML을 파싱해 실제 DOM 트리를 만든다.
-      `engine-fake/src/dom.rs`의 고정 모델을 대체한다.
-- [ ] M1.2 접근성 트리를 실제 DOM 위에서 계산한다. role과 name을 구하고,
-      `ignored` 판정을 넣는다. `snapshot`이 곧 이것에 의존하므로 M1에서
-      가장 값어치 있는 조각이다.
-- [ ] M1.3 엔진이 직접 페이지를 가져온다. `std::net`으로 평문 HTTP를 열면
+- [x] M1.1 `html5ever`로 HTML을 파싱해 실제 DOM 트리를 만든다.
+      `crates/engine/src/dom.rs`와 `parse.rs`가 아레나 DOM과 `TreeSink`를
+      담당한다. `Send`이고 핸들이 색인이라 M2의 JS 바인딩에 그대로 쓴다.
+- [x] M1.2 접근성 트리를 실제 DOM 위에서 계산한다.
+      `crates/engine/src/ax.rs`. role·name·parentage·backendDOMNodeId를 내고,
+      레벨과 컨트롤 값을 붙인다. **비밀번호 필드의 값은 비운다.**
+      `engine-fake`가 냈던 로그인 페이지 결과를 그대로 재현하는 테스트가 있다.
+- [ ] M1.3 엔진이 직접 페이지를 가져온다. (다음 조각) `std::net`으로 평문 HTTP를 열면
       네이티브와 WASIX 양쪽에서 동작하고, 브라우저 샌드박스에서는 E4·E5로
       확인한 대로 WISP가 자동으로 처리한다. **WISP를 인지하는 코드는 필요 없다.**
       HTTPS는 TLS를 게스트로 가져와야 하므로 별도 조각으로 둔다.
@@ -103,6 +105,8 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       저장 방식 deflate라 결과가 큽니다. `miniz_oxide` 도입을 검토한다.
 - [ ] M1.6 같은 캡처 방식으로 CDP 표면을 다시 측정한다. 실제 사이트를
       대상으로 어떤 메서드가 더 필요해지는지 확인한다.
+- [ ] M1.7 `browser` 바이너리에 엔진 선택 플래그를 넣는다. `verify-m0.sh`의
+      기대값을 깨지 않으려면 가짜 엔진이 기본값으로 남아야 한다.
 
 ### 4.3 M2 JavaScript (P0, 큼)
 

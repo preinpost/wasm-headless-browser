@@ -8,6 +8,7 @@ members = [
     "crates/cdp-wire",
     "crates/browser-core",
     "crates/engine-fake",
+    "crates/engine",
     "crates/browser",
 ]
 
@@ -20,6 +21,7 @@ license = "MIT"
 cdp-wire = { path = "crates/cdp-wire" }
 browser-core = { path = "crates/browser-core" }
 engine-fake = { path = "crates/engine-fake" }
+engine = { path = "crates/engine" }
 serde_json = "1"
 base64 = "0.22"
 
