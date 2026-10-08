@@ -99,7 +99,10 @@ crates/
 docs/
   cdp-surface.md          The measured protocol surface, and what it implies.
   wasix.md                What the WASIX run proved, and how it was measured.
+  quickjs.md              Why Context::full aborts, and the context setup that works.
   capture/                Raw frames and expressions from a real Chrome session.
+experiments/
+  quickjs/                Probe: QuickJS evaluating JavaScript inside WASIX.
 tools/cdp-log-proxy/      The logging proxy used to take that capture.
 scripts/
   verify-m0.sh            M0 acceptance test, native or WASIX.
@@ -130,7 +133,7 @@ A bare port (`--cdp 9222`) also works; `host:port` without a scheme does not.
 |---|---|
 | M0 | Protocol plumbing and the engine seam. **Done** |
 | M1 | Real engine: HTML parsing, a DOM, an accessibility tree, approximate layout |
-| M2 | A JavaScript engine, which is what makes clicking and arbitrary selectors work |
+| M2 | A JavaScript engine, which is what makes clicking and arbitrary selectors work. QuickJS is chosen and proven to run; see [`docs/quickjs.md`](docs/quickjs.md) |
 | M3 | Network: real fetches, `Network.*` events, cookies |
 | M4 | Credentials held in memory only, injected at request time and never written to disk |
 
@@ -146,6 +149,7 @@ scripts, not protocol commands.
   running both sides inside the sandbox is already known to work.
 - **How much of Playwright is reachable?** Playwright leans harder on page-side
   JavaScript than `agent-browser` does, so it needs a more complete engine.
-- **Where does the JavaScript engine go?** It is the single largest piece of M1
-  and M2. QuickJS in the same WASIX module keeps the sandbox boundary intact;
-  reaching for a host engine would not.
+- **Do we compile QuickJS against the WASIX sysroot?** It currently builds with
+  wasi-sdk's, and one libc constant diverges, which is worked around by skipping
+  `JS_AddPerformance`. Installing `wasixcc` would fix it properly. See
+  [`docs/quickjs.md`](docs/quickjs.md).

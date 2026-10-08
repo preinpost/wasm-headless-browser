@@ -175,5 +175,5 @@ scripts/wasix-run.sh             # → serves on 127.0.0.1:9222
 MODE=wasix ./scripts/verify-m0.sh
 ```
 
-For the browser sandbox, see [`../harness/README.md`](../harness/README.md) and
-[docs/browser-sandbox.md](browser-sandbox.md).
+For the browser sandbox, see the section above and
+[`../harness/README.md`](../harness/README.md).

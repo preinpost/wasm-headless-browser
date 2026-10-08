@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
+exclude = [
+    "experiments/quickjs",
+]
+
 members = [
     "crates/cdp-wire",
     "crates/browser-core",

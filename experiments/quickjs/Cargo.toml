@@ -1,0 +1,17 @@
+[package]
+name = "quickjs-probe"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Probe: does QuickJS run inside WASIX? See docs/quickjs.md."
+
+[dependencies]
+# `full-wasi` is rquickjs's feature set for wasm32-wasip1/wasip2 targets.
+# `bindgen` is required here because rquickjs ships no pre-generated bindings
+# for wasm32-wasmer-wasi.
+rquickjs = { version = "0.14", features = ["full-wasi", "bindgen"] }
+rquickjs-sys = { version = "0.14", features = ["bindgen"] }
+
+[[bin]]
+name = "quickjs-probe"
+path = "src/main.rs"
