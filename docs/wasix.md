@@ -107,6 +107,62 @@ happen to work either way, because every dependency here exists in both
 registries, but depending on a third-party mirror for the default build is not
 something to leave in place by accident.
 
+## The browser sandbox: loopback is shared
+
+`scripts/verify-m0.sh` proves the engine works under a WASIX runtime on the host.
+It does not prove anything about `@wasmer/sdk` in a page, which is a different
+runtime and the one that matters.
+
+`harness/` answers it. It loads two WASIX modules into one browser sandbox: the
+real engine, and a client that opens a TCP connection to `127.0.0.1` and speaks
+HTTP. Run against `@wasmer/sdk` 0.19.0 in Chrome, with
+`network: { mode: "http" }`:
+
+| | Question | Result |
+|---|---|---|
+| E0 | Does the engine bind loopback in the sandbox? | **pass** |
+| E1 | Can a second command in the *same* sandbox reach it? | **pass** |
+| E2 | Does the SDK observe the guest listener? | **pass** |
+| E3 | Can the *host page* reach it? | fail |
+
+E1 is the one that decides the architecture, and it is a clean pass. The client
+connected on its first attempt and received the engine's full response:
+
+```
+[client] target 127.0.0.1:9222
+[client] connected on attempt 1
+[client] RESULT: got 444 bytes back
+[client] body: {"Browser":"Chrome/140.0.0.0","Protocol-Version":"1.3",...
+                "webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/66AC..."}
+```
+
+So **the engine and its automation client can both live in one browser sandbox
+and talk over loopback.** No pipe, no port forwarding, no relay. The engine's
+own discovery endpoint answers a client that is inside the same sandbox.
+
+E2 confirms it from the SDK's side: `sandbox.ports.wait(9222)` resolved, meaning
+the platform itself sees the guest listener rather than merely tolerating it.
+
+E3 failed on an external dependency, not on our code:
+
+```
+FAIL  E3 host page reaches the engine: the Wasmer HTTP host at
+      https://default.local.wasmer.site did not become ready
+```
+
+`ports.expose()` routes host HTTP into a guest listener through a service worker
+served from `https://default.local.wasmer.site`, which never became ready here.
+That path is worth revisiting only if a host-side client is ever wanted. E1 says
+it is not needed.
+
+### Two smaller findings
+
+- A spurious `accept failed: Operation timed out (os error 73)` reaches the
+  engine's stderr when a client disconnects. The accept loop already logs and
+  continues rather than tearing down, which is why E1 still passed.
+- `proc.stdout` in the SDK is a `ReadableBytes` with a `lines()` async generator,
+  not a `Web Streams` `ReadableStream`. Piping it with `pipeTo` fails.
+
 ## Commands
 
 ```bash
@@ -118,3 +174,6 @@ scripts/wasix-run.sh             # → serves on 127.0.0.1:9222
 
 MODE=wasix ./scripts/verify-m0.sh
 ```
+
+For the browser sandbox, see [`../harness/README.md`](../harness/README.md) and
+[docs/browser-sandbox.md](browser-sandbox.md).

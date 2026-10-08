@@ -1,0 +1,4 @@
+node_modules/
+public/wasmer-sdk/
+public/engine.wasm
+public/loopback-client.wasm

@@ -1,0 +1,15 @@
+{
+  "name": "wasm-headless-browser-harness",
+  "private": true,
+  "type": "module",
+  "description": "Browser harness for the @wasmer/sdk sandbox questions that cannot be answered from outside it.",
+  "scripts": {
+    "vendor": "node vendor-sdk.mjs",
+    "prestart": "node vendor-sdk.mjs && node copy-wasm.mjs",
+    "start": "node serve.mjs"
+  },
+  "devDependencies": {
+    "@wasmer/sdk": "0.19.0",
+    "esbuild": "^0.25.0"
+  }
+}

@@ -4,7 +4,7 @@
 //! it hands out comes from `engine-fake`, so this binary proves the protocol
 //! path end to end before any HTML is parsed.
 
-use std::io;
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
 
@@ -149,6 +149,9 @@ fn main() -> io::Result<()> {
     println!();
     println!("  agent-browser --cdp {local} open https://example.com");
     println!("  agent-browser --cdp {local} snapshot");
+    // Flush explicitly: when stdout is a pipe rather than a terminal it may be
+    // block-buffered, and a caller waiting on this banner would hang.
+    io::stdout().flush()?;
 
     serve(listener, handler)
 }
