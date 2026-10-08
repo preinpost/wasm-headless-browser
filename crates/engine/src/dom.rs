@@ -12,6 +12,7 @@
 //! Nothing here knows about CSS or layout. This is the tree, and only the tree.
 
 use markup5ever::interface::QualName;
+use markup5ever::{local_name, ns, LocalName};
 
 pub type NodeId = usize;
 
@@ -73,21 +74,132 @@ pub enum Quirks {
     Quirks,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Document {
     nodes: Vec<Node>,
     /// The `<Document>` node. Always 0, but named for readability at call sites.
     document: NodeId,
     quirks: Quirks,
+    url: String,
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Document::new()
+    }
 }
 
 impl Document {
     pub fn new() -> Self {
-        Document { nodes: vec![Node::default()], document: 0, quirks: Quirks::NoQuirks }
+        Document {
+            nodes: vec![Node::default()],
+            document: 0,
+            quirks: Quirks::NoQuirks,
+            url: String::new(),
+        }
     }
 
     pub fn document_id(&self) -> NodeId {
         self.document
+    }
+
+    /// The URL this document was loaded from. The engine keeps it beside the
+    /// tree so that script can read `location.href` and the CDP layer can
+    /// report the frame's url from one place.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn set_url(&mut self, url: &str) {
+        self.url = url.to_string();
+    }
+
+    pub fn set_title(&mut self, title: &str) {
+        // Replace the first <title> in <head>, creating one if the document has
+        // none, which is what assigning to document.title does.
+        let head = self.find_tag(self.document, "head");
+        let existing = head.and_then(|h| self.find_tag(h, "title"));
+        match (existing, head) {
+            (Some(title_node), _) => {
+                for child in self.children(title_node).to_vec() {
+                    self.detach(child);
+                }
+                let text = self.push(Node {
+                    data: NodeData::Text,
+                    text: title.to_string(),
+                    ..Node::default()
+                });
+                self.append_child(title_node, text);
+            }
+            (None, Some(head)) => {
+                let title_node = self.push(Node {
+                    data: NodeData::Element { contents: None },
+                    name: Some(QualName::new(
+                        None,
+                        ns!(html),
+                        LocalName::from("title"),
+                    )),
+                    ..Node::default()
+                });
+                self.append_child(head, title_node);
+                let text = self.push(Node {
+                    data: NodeData::Text,
+                    text: title.to_string(),
+                    ..Node::default()
+                });
+                self.append_child(title_node, text);
+            }
+            (None, None) => {}
+        }
+    }
+
+    pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        if let Some(existing) = self.nodes[id].attrs.iter_mut().find(|a| a.local_name() == name) {
+            existing.value = value.to_string();
+            return;
+        }
+        let attr = Attr {
+            name: QualName::new(None, ns!(html), LocalName::from(name)),
+            value: value.to_string(),
+        };
+        self.nodes[id].attrs.push(attr);
+    }
+
+    pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        self.nodes[id].attrs.retain(|a| a.local_name() != name);
+    }
+
+    /// Creates a detached element. Script builds subtrees and attaches them.
+    pub fn create_element(&mut self, tag: &str) -> NodeId {
+        self.push(Node {
+            data: NodeData::Element { contents: None },
+            name: Some(QualName::new(None, ns!(html), LocalName::from(tag))),
+            ..Node::default()
+        })
+    }
+
+    pub fn create_text(&mut self, text: String) -> NodeId {
+        self.push(Node { data: NodeData::Text, text, ..Node::default() })
+    }
+
+    /// Deep copy, returned detached. `cloneNode(true)` in the specification.
+    pub fn clone_subtree(&mut self, id: NodeId) -> NodeId {
+        let source = self.nodes[id].clone();
+        let copy = self.push(Node { ..source.clone() });
+        for child in self.nodes[id].children.clone() {
+            let child_copy = self.clone_subtree(child);
+            self.append_child(copy, child_copy);
+        }
+        copy
+    }
+
+    /// `document.write`, reduced to appending text to the body. The full
+    /// specification re-opens the parser; appending is wrong in general and
+    /// keeps simple pages working.
+    pub fn document_write(&mut self, text: &str) {
+        let Some(body) = self.find_tag(self.document, "body") else { return };
+        let node = self.push(Node { data: NodeData::Text, text: text.to_string(), ..Node::default() });
+        self.append_child(body, node);
     }
 
     pub fn len(&self) -> usize {

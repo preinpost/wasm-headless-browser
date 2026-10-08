@@ -3,7 +3,7 @@
 작업 기록입니다. 이미 측정으로 확정한 사실과, 아직 남은 일을 나눠 적었습니다.
 문서가 영어로 된 다른 파일들과 섞이지만, 이 문서는 작업용이라 한국어로 씁니다.
 
-마지막 갱신: M1 레이아웃을 뺀 부분 완료.
+마지막 갱신: JS 엔진 통합 착수. BL-010 미검증 상태.
 
 ## 1. 현재 위치
 
@@ -24,6 +24,71 @@
 
 아직 없는 것은 레이아웃과 JavaScript입니다. 둘 다 **흉내 내지 않고 이유를
 말합니다.** 스크린샷과 입력은 "레이아웃이 없다"는 오류를 돌려줍니다.
+
+## 1.5 미검증 상태 (집에서 확인 필요)
+
+**BL-010. `cargo test -p engine`을 끝까지 돌려야 합니다.** QuickJS를 엔진
+크레이트에 넣은 뒤 `browser.rs`를 실제 JS로 갈아끼웠는데, 그 뒤 테스트를
+완주하지 못했습니다.
+
+```bash
+cd wasm-headless-browser
+cargo test -p engine           # 한 번은 오래 걸립니다. 중단하지 마세요.
+cargo test                     # 워크스페이스 전체
+```
+
+중간에 중단하면 안 됩니다. `quickjs.c`가 한 덩어리로 오래 걸리는 컴파일
+단계라, 중단하면 다음 실행이 처음부터 다시 시작합니다. 진행 중인지 보려면
+다른 터미널에서 `ps -A -o comm | grep cc1`을 확인하세요.
+
+확인이 끝나면 아래 항목의 체크를 채우고 이 절을 지웁니다.
+
+- [ ] 워크스페이스 전체 `cargo test` 통과
+- [ ] `./scripts/verify-m0.sh` 통과 (가짜 엔진, 영향 없어야 함)
+- [ ] `./scripts/verify-m1.sh` 통과. 픽스처에 인라인 스크립트를 넣어
+      스크립트가 실제로 도는지도 확인할 가치가 있습니다
+- [ ] `MODE=wasix ./scripts/verify-m0.sh` 통과. WASIX 빌드에 QuickJS가
+      들어갔으므로 `WASI_SDK`를 지정하거나 sysroot를 다시 받습니다
+- [ ] WASIX 모듈 크기 확인 (QuickJS가 들어가면 1MB를 넘습니다)
+
+### 어디까지 쓰여 있는지
+
+| 파일 | 상태 |
+|---|---|
+| `crates/engine/src/js.rs` | `JsRuntime`과 `ScriptHost`. 80개 테스트 통과 시점에 검증됨 |
+| `crates/engine/src/dom.js` | JS 쪽 DOM 래퍼. 같은 시점에 검증됨 |
+| `crates/engine/src/bindings.rs` | DOM 원시 접근자. 같은 시점에 검증됨 |
+| `crates/engine/src/browser.rs` | 실제 JS로 교체. **미검증** |
+
+바인딩까지는 테스트가 통과했습니다. 특히 다음 두 개가 통과한 것이 M2의
+핵심이었습니다.
+
+- `the_clients_click_scan_expression_runs_without_throwing`
+- `the_clients_click_point_expression_runs_without_throwing`
+
+agent-browser가 실제로 보내는 무거운 표현식 두 개가 이제 예외 없이 끝까지
+실행됩니다. 임시 규칙표(`evaluate_expression`)는 삭제했습니다.
+
+미검증인 것은 그 위에 얹은 `browser.rs`의 연결부입니다. 내비게이션 후
+인라인 스크립트 실행, `Runtime.evaluate` 위임, 스크립트가 요청한 이동 처리
+세 가지입니다.
+
+### 설계상 알아둘 것
+
+`rquickjs::Runtime`은 `Send`가 아닙니다. `Send`가 열리는 `parallel` feature가
+tokio의 멀티스레드 런타임을 끌어오기 때문입니다. 그래서 JS 런타임을
+**전용 스레드에 가두고 채널로 통신**합니다(`ScriptHost`). 엔진은 `Sender`만
+들고 있으므로 `Engine: Send`가 유지됩니다.
+
+DOM은 가두지 않았습니다. `Arc<Mutex<Document>>`로 엔진과 공유하므로 페이지
+스크립트가 만든 변경이 접근성 트리에 즉시 반영됩니다. 다만 **JS를 호출할 때
+문서 잠금을 잡고 있으면 안 됩니다.** 스크립트 스레드가 같은 뮤텍스를 잡으므로
+교착합니다. `load()` 류가 잠금 안에서 값을 모아 두었다가 잠금을 놓은 뒤
+필드에 대입하는 이유가 이것입니다.
+
+또 하나: 매크로로 원시 접근자를 생성하려 하면 **매크로 위생 때문에 실패합니다.**
+호출부의 `doc`은 함수 인자(참조)로 해석되어 클로저가 `'static`이 되지 못합니다.
+그래서 `put_reads`/`put_content`/`put_mutations`는 명시적으로 써 두었습니다.
 
 ## 2. 측정으로 확정한 사실
 

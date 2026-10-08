@@ -11,3 +11,9 @@ html5ever = "0.40"
 markup5ever = "0.40"
 serde_json.workspace = true
 base64.workspace = true
+
+# `full-wasi` is rquickjs's feature set for WASI targets: it excludes `dyn-load`,
+# which cannot work in a sandbox. `bindgen` is not optional, because rquickjs
+# ships no pre-generated bindings for wasm32-wasmer-wasi and its fallback looks
+# them up by exact target triple. See docs/quickjs.md.
+rquickjs = { version = "0.14", features = ["full-wasi", "bindgen"] }
