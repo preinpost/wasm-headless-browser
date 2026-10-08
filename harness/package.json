@@ -6,9 +6,11 @@
   "scripts": {
     "vendor": "node vendor-sdk.mjs",
     "prestart": "node vendor-sdk.mjs && node copy-wasm.mjs",
-    "start": "node serve.mjs"
+    "start": "node serve.mjs",
+    "wisp": "node wisp-server.mjs"
   },
   "devDependencies": {
+    "@mercuryworkshop/wisp-js": "^0.5.0",
     "@wasmer/sdk": "0.19.0",
     "esbuild": "^0.25.0"
   }

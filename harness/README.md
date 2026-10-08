@@ -20,42 +20,72 @@ does not, CDP has to be carried over a pipe, or the client has to run outside.
 | E1 | Can a second command **in the same sandbox** reach it over loopback? |
 | E2 | Does the SDK observe the guest listener (`ports.wait`)? |
 | E3 | Can the **host page** reach it (`ports.expose` + `fetch`)? |
+| E4 | Can the sandbox reach the public internet at all? |
+| E5 | Can the sandbox complete a real HTTPS request? |
 
 Two WASIX modules are loaded into one sandbox as commands: `engine` is the real
 `wasm-headless-browser`, and `client` is `scripts/wasix-loopback-client.rs`,
 which opens a TCP connection to `127.0.0.1`, speaks HTTP, and prints what came
 back. The engine is spawned in the background; the client runs against it.
 
+E4 and E5 are a different question from E0-E3, and need the WISP relay, because
+the browser sandbox has no direct network access. E4 opens a plain TCP
+connection to a public host. E5 runs the `curl/curl` package inside the sandbox,
+so TLS terminates **in the guest**, and reports the status line plus a slice of
+the response.
+
 ## Result
 
-Recorded in [`../docs/wasix.md`](../docs/wasix.md). E0, E1 and E2 pass. E3 fails,
-because `ports.expose` depends on a service worker hosted at
-`https://default.local.wasmer.site` that never became ready. E3 is not needed:
-E1 is the answer to the architectural question.
+Recorded in [`../docs/wasix.md`](../docs/wasix.md).
+
+E0, E1 and E2 pass. E1 is the answer to the architectural question: the engine
+and its client can share one sandbox.
+
+E3 fails, because `ports.expose` depends on a service worker hosted at
+`https://default.local.wasmer.site` that never became ready. It is not needed,
+and it would not have sufficed anyway: the ingress path is request/response HTTP
+only, with no WebSocket upgrade, so CDP could not pass through it.
+
+E4 and E5 pass.
 
 ## Running it
+
+The easy way drives and judges everything:
+
+```bash
+../scripts/verify-harness.sh
+OUTBOUND=login.example.com:443 CURL=https://login.example.com/ ../scripts/verify-harness.sh
+```
+
+It starts the harness and the WISP relay, opens the page, polls until the page
+reports it is done, and asserts on each expected probe. It cleans up after
+itself; use `../scripts/harness-stop.sh` if something was started by hand.
+
+By hand:
 
 ```bash
 cd harness
 npm install
 npm start                      # vendors the SDK, builds the probes, serves :8099
+npm run wisp                   # in another shell, relay on :5010
 ```
 
-Then open `http://127.0.0.1:8099/?mode=http` in a browser. Chrome is required:
-the SDK needs JSPI as well as `SharedArrayBuffer`. Results appear on the page and
-on `window.__harness`.
+Then open a URL. Chrome is required: the SDK needs JSPI as well as
+`SharedArrayBuffer`. Results appear on the page and on `window.__harness`.
+
+```
+http://127.0.0.1:8099/?mode=wisp&wisp=ws://127.0.0.1:5010/&outbound=example.com:80
+http://127.0.0.1:8099/?mode=wisp&wisp=ws://127.0.0.1:5010/&outbound=login.example.com:443&curl=https://login.example.com/
+```
 
 Query parameters:
 
-- `mode` — the sandbox's `network.mode`, default `http`. E3 only applies to `http`.
+- `mode` — the sandbox's `network.mode`, default `http`. `wisp` is what E4 and
+  E5 need. E3 only applies to `http`.
+- `wisp` — the relay URL.
 - `port` — the port the engine listens on, default `9222`.
-
-To drive it headlessly and read the result:
-
-```bash
-agent-browser open "http://127.0.0.1:8099/?mode=http"
-agent-browser eval "JSON.stringify(window.__harness)"
-```
+- `outbound` / `outboundPath` — the E4 target.
+- `curl` — the E5 URL.
 
 ## Notes
 
@@ -68,3 +98,9 @@ agent-browser eval "JSON.stringify(window.__harness)"
   its worker and wasm-bindgen module relative to `import.meta.url`.
   `vendor-sdk.mjs` copies it and bundles only the entry point, to inline its one
   bare import.
+- Reading the result back through `agent-browser eval` double-encodes it: the
+  result arrives as a JSON string, so inner quotes are escaped and a shell test
+  for `"done":true` will not match. The page exposes `window.__harnessDone` as a
+  bare boolean for exactly this reason.
+- `curl/curl` has to be fetched before the sandbox is created, because a
+  sandbox's package set is fixed at creation time.

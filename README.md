@@ -100,15 +100,20 @@ docs/
   cdp-surface.md          The measured protocol surface, and what it implies.
   wasix.md                What the WASIX run proved, and how it was measured.
   quickjs.md              Why Context::full aborts, and the context setup that works.
+  backlog.md              What is measured, what is left, and what was decided against.
   capture/                Raw frames and expressions from a real Chrome session.
 experiments/
   quickjs/                Probe: QuickJS evaluating JavaScript inside WASIX.
 tools/cdp-log-proxy/      The logging proxy used to take that capture.
+harness/                  Browser-sandbox experiments (E0-E5) and a runner page.
 scripts/
   verify-m0.sh            M0 acceptance test, native or WASIX.
+  verify-harness.sh       Runs the browser-sandbox probes and judges them.
+  harness-stop.sh         Frees the harness ports if a manual run was abandoned.
   wasix-build.sh          Builds the WASIX module.
   wasix-run.sh            Runs it under Wasmer with networking enabled.
   wasix-netprobe.rs       Isolated probe for the loopback question.
+  wasix-loopback-client.rs  Sandbox-side HTTP client, used for loopback and egress.
 ```
 
 ## Running it
