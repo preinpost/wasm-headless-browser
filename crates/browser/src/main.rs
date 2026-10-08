@@ -9,7 +9,8 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
 
 use cdp_wire::{serve, Connection, Handler, Request, Response};
-use browser_core::Browser;
+use browser_core::{Browser, EngineFactory};
+use engine::HtmlEngine;
 use engine_fake::FakeEngine;
 use serde_json::{json, Value};
 
@@ -128,22 +129,73 @@ impl Handler for CdpHandler {
     }
 }
 
+/// Which page model to serve. `fake` stays the default so that the M0
+/// acceptance test keeps testing what it was written against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineChoice {
+    Fake,
+    Html,
+}
+
+impl EngineChoice {
+    fn factory(self) -> EngineFactory {
+        match self {
+            EngineChoice::Fake => FakeEngine::factory(),
+            EngineChoice::Html => HtmlEngine::factory(),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            EngineChoice::Fake => "M0, fake engine",
+            EngineChoice::Html => "M1, real engine (HTML and accessibility, no JavaScript)",
+        }
+    }
+}
+
+fn usage() -> ! {
+    eprintln!(
+        "usage: wasm-headless-browser [--engine fake|html] [addr]\n\n  \
+         --engine fake  fixed page model, no parsing (default)\n  \
+         --engine html  fetches and parses real pages; no JavaScript or layout"
+    );
+    std::process::exit(2)
+}
+
+fn parse_args() -> (EngineChoice, String) {
+    let mut engine = EngineChoice::Fake;
+    let mut addr: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--engine" => {
+                engine = match args.next().as_deref() {
+                    Some("fake") => EngineChoice::Fake,
+                    Some("html") => EngineChoice::Html,
+                    _ => usage(),
+                }
+            }
+            "-h" | "--help" => usage(),
+            other if other.starts_with('-') => usage(),
+            other => addr = Some(other.to_string()),
+        }
+    }
+    (engine, addr.unwrap_or_else(|| "127.0.0.1:9222".to_string()))
+}
+
 fn main() -> io::Result<()> {
-    let addr = std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with('-'))
-        .unwrap_or_else(|| "127.0.0.1:9222".to_string());
+    let (engine, addr) = parse_args();
 
     let listener = TcpListener::bind(&addr)?;
     let local: SocketAddr = listener.local_addr()?;
 
-    let handler = CdpHandler { browser: Arc::new(Mutex::new(Browser::new(FakeEngine::factory()))) };
+    let handler = CdpHandler { browser: Arc::new(Mutex::new(Browser::new(engine.factory()))) };
     let ws_url = {
         let browser = handler.browser.lock().unwrap();
         format!("ws://{local}/devtools/browser/{}", browser.browser_id)
     };
 
-    println!("wasm-headless-browser (M0, fake engine)");
+    println!("wasm-headless-browser ({})", engine.label());
     println!("  discovery : http://{local}/json/version");
     println!("  websocket : {ws_url}");
     println!();

@@ -20,6 +20,7 @@ version = "0.0.1"
 dependencies = [
  "browser-core",
  "cdp-wire",
+ "engine",
  "engine-fake",
  "serde_json",
 ]

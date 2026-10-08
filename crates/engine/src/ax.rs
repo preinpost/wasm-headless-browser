@@ -400,18 +400,23 @@ pub fn accessible_name(doc: &Document, id: NodeId, role: &str) -> String {
         }
     }
 
-    // Tag-specific sources come before content, because for an image or an
-    // input the content is not the name.
-    if let Some(name) = tag_specific_name(doc, id) {
+    // Sources that outrank a label: an image's alt text is its name, and a
+    // submit button is named by its value.
+    if let Some(name) = strong_tag_name(doc, id) {
         return name;
     }
 
     // A form control takes its name from a label, either by `for` or by being
-    // wrapped in one.
+    // wrapped in one. This outranks a placeholder, which is only a hint.
     if is_labelable(role) {
         if let Some(name) = label_for(doc, id) {
             return name;
         }
+    }
+
+    // Weaker tag-specific fallbacks, such as a placeholder.
+    if let Some(name) = weak_tag_name(doc, id) {
+        return name;
     }
 
     // Content-derived names.
@@ -425,37 +430,47 @@ pub fn accessible_name(doc: &Document, id: NodeId, role: &str) -> String {
     doc.attr(id, "title").map(collapse).unwrap_or_default()
 }
 
-fn tag_specific_name(doc: &Document, id: NodeId) -> Option<String> {
+/// Names that outrank an associated label.
+fn strong_tag_name(doc: &Document, id: NodeId) -> Option<String> {
     let tag = doc.tag(id)?;
     match tag {
         "img" | "area" => doc.attr(id, "alt").map(collapse).filter(|s| !s.is_empty()),
         "input" => {
             let kind = doc.attr(id, "type").unwrap_or("text");
-            if matches!(kind, "button" | "submit" | "reset") {
-                if let Some(value) = doc.attr(id, "value") {
-                    let value = collapse(value);
-                    if !value.is_empty() {
-                        return Some(value);
+            match kind {
+                "button" | "submit" | "reset" => {
+                    if let Some(value) = doc.attr(id, "value") {
+                        let value = collapse(value);
+                        if !value.is_empty() {
+                            return Some(value);
+                        }
                     }
+                    Some(match kind {
+                        "submit" => "Submit".to_string(),
+                        "reset" => "Reset".to_string(),
+                        _ => String::new(),
+                    })
                 }
-                return Some(match kind {
-                    "submit" => "Submit".to_string(),
-                    "reset" => "Reset".to_string(),
-                    _ => String::new(),
-                });
+                "image" => Some(
+                    doc.attr(id, "alt")
+                        .map(collapse)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "Submit".to_string()),
+                ),
+                _ => None,
             }
-            if kind == "image" {
-                if let Some(alt) = doc.attr(id, "alt") {
-                    let alt = collapse(alt);
-                    if !alt.is_empty() {
-                        return Some(alt);
-                    }
-                }
-                return Some("Submit".to_string());
-            }
+        }
+        _ => None,
+    }
+}
+
+/// Names that only apply when nothing better was found. A placeholder is a
+/// hint about expected input, not a name, so a `<label>` beats it.
+fn weak_tag_name(doc: &Document, id: NodeId) -> Option<String> {
+    match doc.tag(id)? {
+        "input" | "textarea" => {
             doc.attr(id, "placeholder").map(collapse).filter(|s| !s.is_empty())
         }
-        "textarea" => doc.attr(id, "placeholder").map(collapse).filter(|s| !s.is_empty()),
         _ => None,
     }
 }
@@ -686,6 +701,31 @@ mod tests {
         assert!(find(&nodes, "button", "Send").is_some());
         assert!(find(&nodes, "textbox", "From placeholder").is_some());
         assert!(find(&nodes, "checkbox", "Wrapped label").is_some());
+    }
+
+    #[test]
+    fn a_label_outranks_a_placeholder() {
+        // Both are present, and the label is the name. Getting this backwards
+        // makes a client look for "type here" instead of "Search terms".
+        let doc = parse_html(
+            "<body><label for='q'>Search terms</label><input id='q' placeholder='type here'></body>",
+        );
+        let nodes = build(&doc);
+        assert!(find(&nodes, "textbox", "Search terms").is_some(), "label should win");
+        assert!(find(&nodes, "textbox", "type here").is_none(), "placeholder should not win");
+
+        // With no label, the placeholder is all there is.
+        let doc = parse_html("<body><input id='q' placeholder='type here'></body>");
+        let nodes = build(&doc);
+        assert!(find(&nodes, "textbox", "type here").is_some());
+    }
+
+    #[test]
+    fn an_alt_outranks_a_label() {
+        // An image inside a label is still named by its alt text.
+        let doc = parse_html("<body><label><img src='x' alt='From alt'> caption</label></body>");
+        let nodes = build(&doc);
+        assert!(find(&nodes, "img", "From alt").is_some());
     }
 
     #[test]

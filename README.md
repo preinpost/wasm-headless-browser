@@ -12,12 +12,20 @@ It is not a browser for people. There is no window, no compositor, and no
 rendering pipeline. It speaks the Chrome DevTools Protocol so that existing
 clients work unchanged.
 
-## Status: M0 complete
+## Status: M1 in progress
 
-M0 proves the protocol path and fixes the shape of the seam. It does **not**
-parse HTML.
+Two engines exist behind the same CDP surface, and the binary picks between
+them with `--engine`:
 
-It runs in two places, and the same 16 checks pass in both:
+| Engine | What it does | Command |
+|---|---|---|
+| `fake` (default) | Answers from a fixed page model. No HTML is parsed. | `./scripts/verify-m0.sh` |
+| `html` | Fetches over HTTP, parses, and projects a real accessibility tree. | `./scripts/verify-m1.sh` |
+
+`fake` stays the default so the M0 acceptance test keeps testing what it was
+written against.
+
+The same 16 M0 checks pass natively and inside WASIX:
 
 | Mode | Command |
 |---|---|
@@ -73,8 +81,14 @@ Building to that boundary means any existing client works, and it means the
 engine can be replaced under it without touching clients.
 
 **The engine is a trait.** `browser-core` owns protocol semantics and asks an
-`Engine` for answers. `engine-fake` is the M0 implementation. A real engine
-implements the same trait, and nothing above it changes.
+`Engine` for answers. `engine-fake` and `engine` implement the same trait, and
+nothing above them changes. That is what made adding a second engine a matter
+of a constructor rather than a rewrite.
+
+**The DOM is an arena, not `Rc<RefCell<_>>`.** Node handles are indices into one
+`Vec`. Indices are `Send`, which `Engine` requires, and they are the stable
+handles M2 will hand to QuickJS. A test asserts `Document: Send` so a regression
+is caught rather than discovered later.
 
 **The transport is hand-rolled.** `cdp-wire` implements the WebSocket handshake
 and RFC 6455 framing directly on `std::net`, with no async runtime. WASIX
@@ -94,8 +108,9 @@ one. Details in [`docs/wasix.md`](docs/wasix.md).
 crates/
   cdp-wire/       HTTP discovery, RFC 6455 framing, SHA-1, JSON envelope.
   browser-core/   Targets, sessions, method dispatch. Engine-agnostic.
+  engine/         The real engine: arena DOM, parser, fetch, selectors, accessibility.
   engine-fake/    M0 engine: fixed page model, accessibility projection, PNG encoder.
-  browser/        The binary. Wires a transport to an engine.
+  browser/        The binary. Wires a transport to an engine, chosen with --engine.
 docs/
   cdp-surface.md          The measured protocol surface, and what it implies.
   wasix.md                What the WASIX run proved, and how it was measured.
@@ -105,9 +120,11 @@ docs/
 experiments/
   quickjs/                Probe: QuickJS evaluating JavaScript inside WASIX.
 tools/cdp-log-proxy/      The logging proxy used to take that capture.
+fixtures/                 Pages the M1 test serves over HTTP.
 harness/                  Browser-sandbox experiments (E0-E5) and a runner page.
 scripts/
   verify-m0.sh            M0 acceptance test, native or WASIX.
+  verify-m1.sh            M1 acceptance test: fetch, parse, snapshot.
   verify-harness.sh       Runs the browser-sandbox probes and judges them.
   harness-stop.sh         Frees the harness ports if a manual run was abandoned.
   wasix-build.sh          Builds the WASIX module.
@@ -137,7 +154,7 @@ A bare port (`--cdp 9222`) also works; `host:port` without a scheme does not.
 | Milestone | Content |
 |---|---|
 | M0 | Protocol plumbing and the engine seam. **Done** |
-| M1 | Real engine: HTML parsing, a DOM, an accessibility tree, approximate layout |
+| M1 | Real engine. HTML parsing, the DOM, fetching and the accessibility tree are **done**; approximate layout is not |
 | M2 | A JavaScript engine, which is what makes clicking and arbitrary selectors work. QuickJS is chosen and proven to run; see [`docs/quickjs.md`](docs/quickjs.md) |
 | M3 | Network: real fetches, `Network.*` events, cookies |
 | M4 | Credentials held in memory only, injected at request time and never written to disk |
