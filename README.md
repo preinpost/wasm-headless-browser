@@ -12,10 +12,17 @@ It is not a browser for people. There is no window, no compositor, and no
 rendering pipeline. It speaks the Chrome DevTools Protocol so that existing
 clients work unchanged.
 
-## Status: M0
+## Status: M0 complete
 
 M0 proves the protocol path and fixes the shape of the seam. It does **not**
 parse HTML.
+
+It runs in two places, and the same 16 checks pass in both:
+
+| Mode | Command |
+|---|---|
+| Native, for fast iteration | `./scripts/verify-m0.sh` |
+| WASIX module under Wasmer | `MODE=wasix ./scripts/verify-m0.sh` |
 
 What works today, driven by the real `agent-browser` CLI:
 
@@ -47,9 +54,10 @@ The page behind those results comes from `engine-fake`, which answers from a
 fixed model. It cannot run JavaScript. Two things therefore do not work yet:
 free-form selectors resolved through page script (`find text ...`), and clicking.
 
-```bash
-./scripts/verify-m0.sh      # 16 checks, all against the real agent-browser
-```
+The WASIX build is 272 KB, binds loopback inside the sandbox, and is reachable
+from outside it. The largest open question going in — whether WASIX allows
+loopback `bind`/`listen` at all — is answered yes, with the evidence in
+[`docs/wasix.md`](docs/wasix.md).
 
 ## Why the shape is what it is
 
@@ -71,21 +79,33 @@ implements the same trait, and nothing above it changes.
 **The transport is hand-rolled.** `cdp-wire` implements the WebSocket handshake
 and RFC 6455 framing directly on `std::net`, with no async runtime. WASIX
 supports tokio, but a single-client protocol does not need it, and fewer
-dependencies means fewer WASIX surprises.
+dependencies means fewer WASIX surprises. SHA-1 is implemented in-tree rather
+than pulled in, because the `sha1` crate reaches `libc`, which WASIX would then
+have to port.
+
+**Networking is the runtime's decision, not the engine's.** Under Wasmer, the
+guest cannot create a socket unless the runtime allows it, and denial appears as
+`EOPNOTSUPP` on the first `bind`. That reads like a WASIX limitation and is not
+one. Details in [`docs/wasix.md`](docs/wasix.md).
 
 ## Layout
 
 ```
 crates/
-  cdp-wire/       HTTP discovery, WebSocket framing, JSON envelope. No CDP semantics.
+  cdp-wire/       HTTP discovery, RFC 6455 framing, SHA-1, JSON envelope.
   browser-core/   Targets, sessions, method dispatch. Engine-agnostic.
   engine-fake/    M0 engine: fixed page model, accessibility projection, PNG encoder.
   browser/        The binary. Wires a transport to an engine.
 docs/
   cdp-surface.md          The measured protocol surface, and what it implies.
+  wasix.md                What the WASIX run proved, and how it was measured.
   capture/                Raw frames and expressions from a real Chrome session.
 tools/cdp-log-proxy/      The logging proxy used to take that capture.
-scripts/verify-m0.sh      M0 acceptance test.
+scripts/
+  verify-m0.sh            M0 acceptance test, native or WASIX.
+  wasix-build.sh          Builds the WASIX module.
+  wasix-run.sh            Runs it under Wasmer with networking enabled.
+  wasix-netprobe.rs       Isolated probe for the loopback question.
 ```
 
 ## Running it
@@ -112,8 +132,7 @@ A bare port (`--cdp 9222`) also works; `host:port` without a scheme does not.
 | M1 | Real engine: HTML parsing, a DOM, an accessibility tree, approximate layout |
 | M2 | A JavaScript engine, which is what makes clicking and arbitrary selectors work |
 | M3 | Network: real fetches, `Network.*` events, cookies |
-| M4 | Move into the WASIX sandbox, loopback between engine and client |
-| M5 | Credentials held in memory only, injected at request time and never written to disk |
+| M4 | Credentials held in memory only, injected at request time and never written to disk |
 
 M1 is the first milestone where a real site can be read. M2 is where the cost
 concentrates, because the two heaviest expressions a client sends are page
@@ -121,12 +140,12 @@ scripts, not protocol commands.
 
 ## Open questions
 
-- **Does WASIX allow loopback `bind`/`listen`?** WASIX supports Berkeley sockets
-  and there is an official Axum-on-WASIX tutorial, but loopback inside the
-  browser sandbox specifically has not been confirmed. This is the largest
-  unknown and is worth breaking early.
-- **How does a client reach the engine?** Either both run inside the sandbox and
-  talk over loopback, or only the engine does and the host reaches in through
-  port exposure. The second path is unverified.
+- **Does `@wasmer/sdk` share loopback with the host page?** Under the Wasmer CLI
+  it does, so a client outside the sandbox can reach the engine. The browser
+  sandbox is a different runtime and needs its own check. If it does not,
+  running both sides inside the sandbox is already known to work.
 - **How much of Playwright is reachable?** Playwright leans harder on page-side
   JavaScript than `agent-browser` does, so it needs a more complete engine.
+- **Where does the JavaScript engine go?** It is the single largest piece of M1
+  and M2. QuickJS in the same WASIX module keeps the sandbox boundary intact;
+  reaching for a host engine would not.

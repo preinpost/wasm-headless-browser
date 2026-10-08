@@ -7,4 +7,5 @@ description = "M0 engine: a fixed page model that answers a known set of CDP com
 
 [dependencies]
 serde_json.workspace = true
+base64.workspace = true
 browser-core.workspace = true

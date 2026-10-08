@@ -17,7 +17,6 @@ cdp-wire = { path = "crates/cdp-wire" }
 browser-core = { path = "crates/browser-core" }
 engine-fake = { path = "crates/engine-fake" }
 serde_json = "1"
-sha1 = "0.10"
 base64 = "0.22"
 
 [profile.release]

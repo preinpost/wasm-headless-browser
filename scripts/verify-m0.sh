@@ -4,10 +4,17 @@
 # Starts the browser, drives it with the real agent-browser CLI, and asserts on
 # what comes back. Every expectation here was first measured against Chrome —
 # see docs/capture/frames.jsonl.
+#
+#   ./scripts/verify-m0.sh                 # native build
+#   MODE=wasix ./scripts/verify-m0.sh      # the WASIX module under Wasmer
+#
+# The same checks run in both modes, on purpose: if the WASIX build diverged,
+# this is where it would show.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${PORT:-9333}"
+MODE="${MODE:-native}"
 SESSION="m0-verify-$$"
 BASE="http://127.0.0.1:${PORT}"
 
@@ -29,6 +36,26 @@ check() {
   fi
 }
 
+start_server() {
+  case "$MODE" in
+    native)
+      cargo build --manifest-path "$ROOT/Cargo.toml" --quiet
+      "$ROOT/target/debug/wasm-headless-browser" "127.0.0.1:${PORT}" &
+      ;;
+    wasix)
+      "$ROOT/scripts/wasix-build.sh" >/dev/null
+      wasmer run --net \
+        "$ROOT/target/wasm32-wasmer-wasi/release/wasm-headless-browser.wasm" \
+        -- "127.0.0.1:${PORT}" &
+      ;;
+    *)
+      echo "unknown MODE '$MODE' (expected native or wasix)" >&2
+      exit 2
+      ;;
+  esac
+  SERVER_PID=$!
+}
+
 cleanup() {
   agent-browser --cdp "$BASE" close >/dev/null 2>&1 || true
   if [[ -n "${SERVER_PID:-}" ]]; then
@@ -38,14 +65,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "building"
-cargo build --manifest-path "$ROOT/Cargo.toml" --quiet
-
+echo "mode: ${MODE}"
 echo "starting wasm-headless-browser on ${PORT}"
-"$ROOT/target/debug/wasm-headless-browser" "127.0.0.1:${PORT}" >/tmp/whb-verify.log 2>&1 &
-SERVER_PID=$!
+start_server
 
-for _ in $(seq 1 50); do
+for _ in $(seq 1 100); do
   curl -sf "$BASE/json/version" >/dev/null 2>&1 && break
   sleep 0.1
 done
@@ -95,7 +119,7 @@ rm -f "$shot"
 
 echo
 if ((fail > 0)); then
-  echo "M0 FAILED: ${pass} passed, ${fail} failed"
+  echo "M0 FAILED (${MODE}): ${pass} passed, ${fail} failed"
   exit 1
 fi
-echo "M0 PASSED: ${pass} checks"
+echo "M0 PASSED (${MODE}): ${pass} checks"

@@ -6,7 +6,8 @@
 use std::io::{self, Read, Write};
 
 use base64::Engine as _;
-use sha1::{Digest, Sha1};
+
+use crate::sha1::sha1;
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -31,10 +32,10 @@ pub struct Frame {
 
 /// `Sec-WebSocket-Accept` for a client's `Sec-WebSocket-Key`.
 pub fn accept_key(key: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(WS_GUID.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+    let mut input = Vec::with_capacity(key.len() + WS_GUID.len());
+    input.extend_from_slice(key.as_bytes());
+    input.extend_from_slice(WS_GUID.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(sha1(&input))
 }
 
 /// Writes the 101 response that completes the upgrade.
@@ -114,4 +115,15 @@ pub fn write_frame(w: &mut impl Write, opcode: u8, payload: &[u8]) -> io::Result
     w.write_all(&head)?;
     w.write_all(payload)?;
     w.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accept_key;
+
+    /// The worked example from RFC 6455 section 1.3.
+    #[test]
+    fn computes_the_rfc_example_accept_key() {
+        assert_eq!(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
 }

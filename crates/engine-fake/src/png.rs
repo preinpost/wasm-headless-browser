@@ -156,17 +156,6 @@ fn adler32(data: &[u8]) -> u32 {
 }
 
 pub fn to_base64(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for group in data.chunks(3) {
-        let b0 = group[0] as u32;
-        let b1 = *group.get(1).unwrap_or(&0) as u32;
-        let b2 = *group.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if group.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if group.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }

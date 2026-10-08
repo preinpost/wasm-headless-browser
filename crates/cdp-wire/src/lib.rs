@@ -9,6 +9,7 @@
 
 pub mod http;
 pub mod server;
+pub mod sha1;
 pub mod ws;
 
 pub use http::{Request, Response};
