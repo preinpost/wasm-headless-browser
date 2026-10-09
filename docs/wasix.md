@@ -170,8 +170,10 @@ read this page at all, which is the whole argument for M2.
 
 ## Build notes
 
-**No C toolchain was needed.** The project is pure Rust, and nothing in the
-dependency tree needs a sysroot. `wasixcc` was not installed.
+**No C toolchain was needed at first.** The project was pure Rust, and nothing
+in the dependency tree needed a sysroot. QuickJS and ring changed that: both
+compile C, and both build through `cargo wasix` without further setup. See
+[quickjs.md](quickjs.md) for QuickJS.
 
 **`sha1` was removed for this reason.** The `sha1` crate reaches `libc` through
 `cpufeatures`, and the WASIX overlay registry has no matching `libc`, which
@@ -198,12 +200,47 @@ The file is gitignored so a fresh clone resolves from crates.io. Depending on a
 third-party mirror for the default build is not something to leave in place by
 accident.
 
-**One `Cargo.lock` cannot serve both registries.** Once QuickJS came in, `cc`
-and `libc` are locked, and the overlay registry carries only `+wasix` builds of
-them (`libc 0.2.186+wasix.1`), which crates.io does not have. Each registry
+**One `Cargo.lock` cannot serve both registries.** For `libc`, `cc`, `ring`
+and `getrandom` the overlay registry carries `+wasix` builds
+(`libc 0.2.186+wasix.1`), which crates.io does not have. Each registry
 therefore fails to resolve the other's lockfile. The committed lockfile is the
-crates.io one; `scripts/wasix-build.sh` re-pins those two packages for the
-build, then restores the lockfile and removes `.cargo/config.toml`.
+crates.io one; `scripts/wasix-build.sh` re-pins the packages in its
+`WASIX_FORKS` list for the build, then restores the lockfile and removes
+`.cargo/config.toml`.
+
+## TLS inside the guest
+
+`experiments/tls` probes it, and `crates/engine/src/fetch.rs` uses the result.
+
+rustls 0.23 with the **ring** provider, over a plain `std::net::TcpStream`,
+trusting `webpki-roots`. ring because the overlay registry carries a fork of it
+(`ring 0.17.14+wasix.1`); rustls's default provider, aws-lc-rs, has none and is
+a much larger C build. Under Wasmer 7.5.0 with `--net`:
+
+```
+[tls] tcp connected to github.com:443
+[tls] handshake done: Some(TLSv1_3) Some(TLS13_AES_128_GCM_SHA256)
+[tls] status: HTTP/1.1 200 OK
+[tls] 582933 bytes in 181.717ms
+```
+
+`example.com`, `www.google.com`, `github.com` and `login.example.com` all
+handshake TLS 1.3 and return 200, so the reference site's certificate chains to a
+public root. A site signed by a private CA needs its root in a PEM file named by
+`WHB_EXTRA_CA_CERTS` (a path list, like `NODE_EXTRA_CA_CERTS`).
+
+The engine module grew from 1.6 MB to 2.3 MB with TLS.
+
+The probe has no lockfile of its own committed. To build it for WASIX, re-pin
+the forks first:
+
+```bash
+cd experiments/tls
+cargo wasix init
+cargo update -p libc -p cc -p ring -p getrandom
+cargo wasix build --release
+wasmer run --net target/wasm32-wasmer-wasi/release/tls-probe.wasm -- example.com
+```
 
 ## Commands
 

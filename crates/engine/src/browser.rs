@@ -1074,13 +1074,13 @@ mod tests {
     #[test]
     fn a_failed_navigation_becomes_an_error_page_not_a_failure() {
         let mut engine = HtmlEngine::new("t");
-        engine.load("https://example.com/");
-        // HTTPS is not implemented, so the engine reports that as page content
+        // Nothing listens on port 1. The engine reports that as page content
         // the client can read rather than as a protocol failure.
-        assert!(engine.last_error.as_deref().unwrap_or("").contains("TLS"));
+        engine.load("http://127.0.0.1:1/");
+        assert!(engine.last_error.as_deref().unwrap_or("").contains("connect"));
         assert_eq!(engine.info().title, "Navigation failed");
         let doc = engine.doc();
-        assert!(doc.text_content(doc.document_id()).contains("TLS"));
+        assert!(doc.text_content(doc.document_id()).contains("connect"));
     }
 
     #[test]

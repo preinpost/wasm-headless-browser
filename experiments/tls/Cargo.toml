@@ -1,0 +1,19 @@
+[package]
+name = "tls-probe"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Probe: does a TLS client run inside WASIX? See docs/wasix.md."
+
+[dependencies]
+# ring is the provider because the WASIX registry carries a fork of it
+# (0.17.14+wasix.1). aws-lc-rs, rustls's default, is a large C build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+
+[[bin]]
+name = "tls-probe"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"

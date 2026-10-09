@@ -1,19 +1,26 @@
 //! Fetching a page.
 //!
-//! Plain HTTP over `std::net`, by hand. No async runtime and no HTTP client
+//! HTTP over `std::net`, by hand. No async runtime and no HTTP client
 //! dependency, because the WASIX socket path is the one that matters and it is
 //! exercised more directly this way.
 //!
-//! HTTPS is deliberately absent. TLS would have to terminate inside the guest,
-//! which means shipping a TLS stack into the sandbox; that is its own piece of
-//! work. Until then `https` reports itself clearly instead of failing obscurely.
+//! HTTPS terminates inside the guest, with rustls and the ring provider. ring
+//! is the one crypto backend the WASIX registry carries a fork of, and the
+//! probe in `experiments/tls` showed it handshaking TLS 1.3 under Wasmer.
+//! Trust comes from the Mozilla roots in `webpki-roots`, plus any PEM files
+//! listed in `WHB_EXTRA_CA_CERTS`, for internal sites signed by a private CA.
 //!
 //! `data:` URLs are supported because they let the engine be pointed at inline
 //! markup, which keeps tests and the harness free of a network.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_BODY: usize = 16 * 1024 * 1024;
@@ -103,14 +110,9 @@ impl Url {
             return Err(FetchError::BadUrl(input.to_string()));
         };
         let scheme = scheme.to_ascii_lowercase();
-        if scheme != "http" {
-            return Err(FetchError::Unsupported(match scheme.as_str() {
-                "https" => "https is not available yet: TLS would have to run inside the \
-                            sandbox, which is not implemented"
-                    .to_string(),
-                other => format!("unsupported scheme: {other}"),
-            }));
-        }
+        let Some(default_port) = default_port(&scheme) else {
+            return Err(FetchError::Unsupported(format!("unsupported scheme: {scheme}")));
+        };
 
         let (authority, path) = match rest.find('/') {
             Some(pos) => (&rest[..pos], &rest[pos..]),
@@ -123,9 +125,9 @@ impl Url {
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) => match p.parse::<u16>() {
                 Ok(port) => (h.to_string(), port),
-                Err(_) => (authority.to_string(), 80),
+                Err(_) => (authority.to_string(), default_port),
             },
-            None => (authority.to_string(), 80),
+            None => (authority.to_string(), default_port),
         };
         if host.is_empty() {
             return Err(FetchError::BadUrl(input.to_string()));
@@ -162,15 +164,29 @@ impl Url {
     }
 
     pub fn origin(&self) -> String {
-        if self.port == 80 {
-            format!("{}://{}", self.scheme, self.host)
+        format!("{}://{}", self.scheme, self.authority())
+    }
+
+    /// `host`, or `host:port` when the port is not the scheme's default. This
+    /// is also the `Host` header.
+    pub fn authority(&self) -> String {
+        if Some(self.port) == default_port(&self.scheme) {
+            self.host.clone()
         } else {
-            format!("{}://{}:{}", self.scheme, self.host, self.port)
+            format!("{}:{}", self.host, self.port)
         }
     }
 
     pub fn to_string_with_path(&self) -> String {
         format!("{}{}", self.origin(), self.path)
+    }
+}
+
+fn default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
     }
 }
 
@@ -190,9 +206,14 @@ pub fn get(url: &str) -> Result<Response, FetchError> {
         });
     }
 
+    get_with(url, &tls_config())
+}
+
+/// [`get`], trusting the roots in `tls` for `https`.
+pub fn get_with(url: &str, tls: &Arc<ClientConfig>) -> Result<Response, FetchError> {
     let mut current = Url::parse(url)?;
     for _ in 0..=MAX_REDIRECTS {
-        let response = get_once(&current)?;
+        let response = get_once(&current, tls)?;
         if (300..400).contains(&response.status) {
             if let Some(location) = response.header("location") {
                 current = current.join(location)?;
@@ -204,12 +225,95 @@ pub fn get(url: &str) -> Result<Response, FetchError> {
     Err(FetchError::TooManyRedirects)
 }
 
-fn get_once(url: &Url) -> Result<Response, FetchError> {
+/// The client configuration every `https` fetch shares. Built once, because
+/// parsing the root store is not free.
+pub fn tls_config() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+            // A file that cannot be read is skipped rather than fatal: the
+            // public roots still work, and a site that needed the missing CA
+            // fails its handshake with a message that names the problem.
+            if let Some(paths) = std::env::var_os("WHB_EXTRA_CA_CERTS") {
+                for path in std::env::split_paths(&paths) {
+                    let Ok(certs) = CertificateDer::pem_file_iter(&path) else { continue };
+                    for cert in certs.flatten() {
+                        let _ = roots.add(cert);
+                    }
+                }
+            }
+            Arc::new(client_config(roots))
+        })
+        .clone()
+}
+
+/// A client configuration trusting exactly `roots`.
+pub fn client_config(roots: RootCertStore) -> ClientConfig {
+    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+}
+
+/// A plain or TLS connection, read and written the same way.
+enum Connection {
+    Plain(TcpStream),
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+impl Read for Connection {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Connection::Plain(s) => s.read(buf),
+            Connection::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Connection {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Connection::Plain(s) => s.write(buf),
+            Connection::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Connection::Plain(s) => s.flush(),
+            Connection::Tls(s) => s.flush(),
+        }
+    }
+}
+
+fn connect(url: &Url, tls: &Arc<ClientConfig>) -> Result<Connection, FetchError> {
     let address = format!("{}:{}", url.host, url.port);
     let mut stream = TcpStream::connect(&address)
         .map_err(|e| FetchError::Io(format!("connect to {address} failed: {e}")))?;
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
+    if url.scheme != "https" {
+        return Ok(Connection::Plain(stream));
+    }
+    let name = ServerName::try_from(url.host.clone())
+        .map_err(|e| FetchError::BadUrl(format!("{}: {e}", url.host)))?;
+    let mut session = ClientConnection::new(Arc::clone(tls), name)
+        .map_err(|e| FetchError::Io(format!("TLS setup for {address} failed: {e}")))?;
+    // Done here rather than on the first write, so that a certificate the
+    // engine does not trust is reported as that and not as a failed write.
+    while session.is_handshaking() {
+        session
+            .complete_io(&mut stream)
+            .map_err(|e| FetchError::Io(format!("TLS handshake with {address} failed: {e}")))?;
+    }
+    Ok(Connection::Tls(Box::new(StreamOwned::new(session, stream))))
+}
+
+fn get_once(url: &Url, tls: &Arc<ClientConfig>) -> Result<Response, FetchError> {
+    let address = format!("{}:{}", url.host, url.port);
+    let mut stream = connect(url, tls)?;
 
     // `Connection: close` means the response length is delimited by EOF, so a
     // Content-Length is a fast path rather than a requirement.
@@ -222,7 +326,7 @@ fn get_once(url: &Url) -> Result<Response, FetchError> {
          Accept-Language: en\r\n\
          Connection: close\r\n\r\n",
         url.path,
-        if url.port == 80 { url.host.clone() } else { format!("{}:{}", url.host, url.port) }
+        url.authority()
     );
     stream
         .write_all(request.as_bytes())
@@ -230,9 +334,14 @@ fn get_once(url: &Url) -> Result<Response, FetchError> {
     let _ = stream.flush();
 
     let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .map_err(|e| FetchError::Io(format!("read from {address} failed: {e}")))?;
+    match stream.read_to_end(&mut raw) {
+        Ok(_) => {}
+        // Many servers close a TLS connection without close_notify. With
+        // `Connection: close` the body is delimited by the close anyway, so
+        // what was read is the response.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !raw.is_empty() => {}
+        Err(e) => return Err(FetchError::Io(format!("read from {address} failed: {e}"))),
+    }
 
     parse_response(&raw, &url.to_string_with_path())
 }
@@ -430,10 +539,83 @@ mod tests {
     }
 
     #[test]
-    fn refuses_https_with_a_reason() {
-        let err = Url::parse("https://example.com/").unwrap_err();
+    fn parses_https_urls_with_their_own_default_port() {
+        let url = Url::parse("https://example.com/a").unwrap();
+        assert_eq!(url.port, 443);
+        assert_eq!(url.origin(), "https://example.com");
+        assert_eq!(url.authority(), "example.com");
+
+        let url = Url::parse("https://example.com:8443/").unwrap();
+        assert_eq!(url.origin(), "https://example.com:8443");
+        // Port 80 is not the default for https, so it is spelled out.
+        assert_eq!(Url::parse("https://example.com:80/").unwrap().authority(), "example.com:80");
+    }
+
+    #[test]
+    fn refuses_other_schemes_with_a_reason() {
+        let err = Url::parse("ftp://example.com/").unwrap_err();
         assert!(matches!(err, FetchError::Unsupported(_)));
-        assert!(err.to_string().contains("TLS"), "message should say why: {err}");
+        assert!(err.to_string().contains("ftp"), "message should say which: {err}");
+    }
+
+    /// Serves one canned response over TLS, with a certificate for
+    /// `localhost` that only the returned client configuration trusts.
+    fn serve_tls_once(response: String) -> (String, Arc<ClientConfig>) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate");
+        let cert_der = cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+            .expect("private key");
+
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .expect("server config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let session = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+                let mut tls = StreamOwned::new(session, stream);
+                let mut buf = [0u8; 2048];
+                if tls.read(&mut buf).is_ok() {
+                    let _ = tls.write_all(response.as_bytes());
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                }
+            }
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).expect("trust the test certificate");
+        (format!("https://localhost:{port}/"), Arc::new(client_config(roots)))
+    }
+
+    #[test]
+    fn fetches_over_tls() {
+        let (url, tls) = serve_tls_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 6\r\n\r\nsecure".to_string(),
+        );
+        let got = get_with(&url, &tls).expect("fetch over TLS");
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body, b"secure");
+        assert_eq!(got.url, url);
+    }
+
+    #[test]
+    fn an_untrusted_certificate_is_reported_as_a_handshake_failure() {
+        // The default configuration trusts public roots only, and the test
+        // server's certificate is self-signed.
+        let (url, _) = serve_tls_once("HTTP/1.1 200 OK\r\n\r\n".to_string());
+        let err = get(&url).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("TLS handshake"), "message: {message}");
+        assert!(message.to_ascii_lowercase().contains("certificate"), "message: {message}");
     }
 
     #[test]

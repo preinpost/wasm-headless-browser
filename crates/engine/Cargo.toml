@@ -20,3 +20,12 @@ base64.workspace = true
 # for wasm32-wasmer-wasi and its fallback looks them up by exact target triple.
 # See docs/quickjs.md.
 rquickjs = { version = "0.14", features = ["bindgen"] }
+
+# TLS inside the guest. ring, not rustls's default aws-lc-rs, because ring is
+# the backend the WASIX registry carries a fork of. See experiments/tls.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+# Self-signed certificates for a local TLS server in the fetch tests.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

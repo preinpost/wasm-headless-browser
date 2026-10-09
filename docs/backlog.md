@@ -94,7 +94,9 @@ DOM은 가두지 않았습니다. `Arc<Mutex<Document>>`로 엔진과 공유하�
 | 호스트 페이지에서 안으로 들어오는 경로(E3)는 필요 없다. 설령 되더라도 HTTP 전용이라 CDP의 WebSocket 업그레이드는 지나가지 못한다 | [harness/README.md](../harness/README.md) |
 | 브라우저 샌드박스에서 외부 TCP·HTTPS가 된다. WISP 릴레이를 쓴다 (E4·E5) | 이 문서의 §3 |
 | QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다. 엔진에서는 `full-wasi`를 쓸 수 없다 (§6) | [docs/quickjs.md](quickjs.md) |
-| QuickJS를 넣은 WASIX 모듈은 1.6MB다 | 이 문서의 §1.5 |
+| QuickJS를 넣은 WASIX 모듈은 1.6MB다. TLS를 넣으면 2.3MB다 | 이 문서의 §1.5, [docs/wasix.md](wasix.md) |
+| WASIX에서 rustls + ring이 TLS 1.3으로 동작한다. 참조 사이트 인증서는 공개 루트로 검증된다 | [docs/wasix.md](wasix.md) |
+| example.com은 이제 본문이 문단 하나와 `<script src=/s.js>`뿐이다. 외부 스크립트 없이는 제목과 링크가 없다 | 2026-10-09 측정 |
 | `Context::full`이 죽는 원인은 sysroot 불일치 하나다. `CLOCK_MONOTONIC`이 포인터 인코딩(1058440)으로 컴파일되고 WASIX는 정수 1을 기대한다 | 같은 문서 |
 | 참조 사이트 사이트는 SPA 셸만 돌려준다. HTML만 받아서는 아무것도 얻을 수 없다 | 이 문서의 §3 |
 
@@ -124,6 +126,25 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 머신에서 열린 TCP 연결이므로 송신 IP가 같은 것은 당연합니다.
 
 ## 4. 다음 작업
+
+### 4.0 진행 순서: 로그인 흐름 하나를 끝까지
+
+목표는 화면을 읽고, 클릭하고, 아이디와 비밀번호를 넣어 제출하는 것입니다.
+마일스톤 순서대로 하지 않고 이 흐름이 요구하는 순서로 합니다.
+
+1. **네트워크 기반.** HTTPS(M1.11), POST와 쿠키 저장소(M3.2)
+2. **JS가 화면을 그린다.** 외부 스크립트(M2.7), 이벤트 루프와 Promise(M2.6),
+   `fetch`/XHR(M2.9)
+3. **입력과 제출.** `Input.insertText`가 포커스된 입력란을 바꾸고 이벤트를 낸다
+   (M2.8). 엔터와 제출 버튼이 폼 제출로 이어진다. `callFunctionOn`을 실제 JS로
+   (M2.4)
+4. **클릭.** 실제 화면을 측정(M1.6)한 뒤 레이아웃과 히트테스트(M1.4),
+   마우스 이벤트(M2.5)
+5. **자격증명.** 비밀번호가 어디로도 새지 않게 한다 (M4). 3단계부터 염두에 둔다
+
+검증은 로컬 로그인 픽스처로 합니다. 쿠키를 발급하는 작은 서버와 JS로
+그려지는 로그인 화면을 두고, agent-browser로 open → fill → click → 로그인 후
+화면까지 자동 검사합니다. 참조 사이트는 마지막에 확인합니다.
 
 ### 4.1 밀린 정리 (P0, 짧음)
 
@@ -159,6 +180,10 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       네이티브와 WASIX 양쪽에서 동작하고, 브라우저 샌드박스에서는 E4·E5로
       확인한 대로 WISP가 자동으로 처리한다. **WISP를 인지하는 코드는 필요 없다.**
       HTTPS는 TLS를 게스트로 가져와야 하므로 별도 조각으로 둔다.
+- [x] M1.11 HTTPS. rustls + ring + `webpki-roots`로 TLS를 게스트 안에서
+      처리한다. 사설 CA는 `WHB_EXTRA_CA_CERTS`로 추가한다. WASIX에서
+      example.com과 참조 사이트가 TLS 1.3으로 열린다. 근거는
+      [docs/wasix.md](wasix.md)의 "TLS inside the guest".
 - [ ] M1.9 UTF-8이 아닌 문자셋을 디코딩한다. 지금은 헤더가 UTF-8이 아니면
       손실 변환하고 그 사실을 `last_error`에 남긴다.
 - [ ] M1.10 `select.rs`가 의사 클래스와 자손 외 결합자를 지원하지 않는다.
@@ -192,6 +217,7 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       `objectId`로 객체를 참조하므로 필요하다. 지금 `call_function`은 함수
       문자열을 보고 추측한다. 실제 JS로 바꿔야 한다.
 - [ ] M2.7 외부 스크립트(`src`)와 모듈을 실행한다. 지금은 건너뛴다.
+- [ ] M2.9 `fetch`와 `XMLHttpRequest`. 엔진의 네트워크와 쿠키 저장소를 쓴다.
 - [ ] M2.8 `input.value`에 setter를 붙인다. 비밀번호 필드를 어떻게 다룰지
       M4와 함께 정해야 해서 이번에는 넣지 않았다.
 - [ ] M2.5 클릭 자동화를 연결한다. `Input.dispatchMouseEvent`와 히트테스트가
@@ -252,11 +278,12 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 - **`cargo-wasix`가 `.cargo/config.toml`을 쓴다.** crates.io를 WASIX 오버레이
   레지스트리로 바꿔치기하므로 gitignore에 두었다.
 - **`Cargo.lock` 하나로 두 레지스트리를 다 맞출 수 없다.** WASIX 레지스트리에는
-  `libc`와 `cc`의 `+wasix` 빌드만 있고 crates.io에는 그것이 없다. 그래서
-  서로의 락파일에서 해석에 실패한다. 커밋하는 락파일은 crates.io용이다.
-  `scripts/wasix-build.sh`가 빌드 동안만 그 두 패키지를 다시 고정하고, 끝나면
-  락파일을 되돌리고 `.cargo/config.toml`을 지운다. 그 파일이 남아 있으면
-  네이티브 빌드가 깨지기 때문이다.
+  `libc`·`cc`·`ring`·`getrandom`의 `+wasix` 빌드가 있고 crates.io에는 그것이
+  없다. 그래서 서로의 락파일에서 해석에 실패한다. 커밋하는 락파일은 crates.io용이다.
+  `scripts/wasix-build.sh`가 빌드 동안만 `WASIX_FORKS`의 패키지를 다시 고정하고,
+  끝나면 락파일을 되돌리고 `.cargo/config.toml`을 지운다. 그 파일이 남아 있으면
+  네이티브 빌드가 깨지기 때문이다. 새 의존성이 "candidate versions found which
+  didn't match: X+wasix.1"로 실패하면 X를 `WASIX_FORKS`에 추가한다.
 - **엔진에서 `rquickjs`의 `full-wasi`를 쓰면 WASIX 빌드가 깨진다.**
   `full-wasi`가 `rquickjs-macro`를 끌어오는데, WASIX 툴체인의 rustc가
   cargo가 만든 그 proc-macro를 읽지 못한다 (E0463 "can't find crate").
