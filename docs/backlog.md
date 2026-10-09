@@ -3,82 +3,116 @@
 작업 기록입니다. 이미 측정으로 확정한 사실과, 아직 남은 일을 나눠 적었습니다.
 문서가 영어로 된 다른 파일들과 섞이지만, 이 문서는 작업용이라 한국어로 씁니다.
 
-마지막 갱신: BL-010 검증 완료. M2의 엔진 연결부가 네이티브와 WASIX 양쪽에서 동작한다.
+마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
+자격증명)를 모두 마쳤다. 다음 후보는 §0.4.
 
-## 1. 현재 위치
+## 0. 다음 세션 시작하기
 
-| 단계 | 내용 | 상태 |
-|---|---|---|
-| M0 | CDP 프로토콜 경로와 엔진 경계 확정 | 완료 |
-| — | WASIX 네이티브 실행 (loopback, 검증 16건) | 완료 |
-| — | 브라우저 샌드박스 loopback (E0·E1·E2) | 완료 |
-| — | 브라우저 샌드박스 외부 통신 (E4·E5) | 완료 |
-| — | QuickJS 실행 가능성 확인 | 완료 |
-| M1 | 실제 엔진: HTML 파싱, DOM, 접근성 트리, 근사 레이아웃 | 진행 중 (레이아웃 제외 완료) |
-| M2 | JavaScript 엔진과 DOM 바인딩 | 진행 중 (M2.1–M2.3 완료) |
-| M3 | 네트워크 이벤트, 쿠키·스토리지, 스크린샷 | 착수 전 |
-| M4 | 자격증명을 메모리로만 다루기 | 착수 전 |
+### 0.1 지금 어디인가
 
-`--engine html`로 실제 페이지를 가져와 파싱하고, 그 문서에서 접근성 트리를
-만들어 냅니다. `agent-browser`로 열고 스냅샷을 뜨면 진짜 페이지가 나옵니다.
+`--engine html`은 실제 브라우저 엔진이다. HTTP(S)로 가져오고(TLS는 게스트 안),
+HTML을 파싱하고, 페이지 JS를 QuickJS로 돌리고, 스타일시트를 적용하고, 배치하고,
+그 결과로 CDP에 답한다. agent-browser로 읽고, 채우고, 클릭하고, 제출할 수 있다.
+세션은 메모리 전용 쿠키 저장소에 남는다. 자격증명은 자리표시자로 입력하고
+클라이언트에게 돌아가지 않는다(`docs/credentials.md`).
 
-페이지의 인라인 스크립트가 QuickJS로 실행되고, 그 결과가 접근성 트리에
-반영됩니다. `Runtime.evaluate`도 실제 JS입니다. 외부 스크립트(`src`)와
-모듈은 아직 실행하지 않습니다.
+참조 사이트(`https://login.example.com`, React SPA)의 로그인 화면이 약 5초에
+열리고, 800×600에서 Chrome과 1px 안팎으로 같은 자리에 배치되며, `fill`·`click`·
+`press Enter`가 된다. 가짜 계정으로 실패 응답까지 확인했다. 실제 계정 로그인은
+사용자가 `--secret`으로 직접 한다(README의 "Running it").
 
-아직 없는 것은 레이아웃입니다. **흉내 내지 않고 이유를 말합니다.**
-스크린샷과 입력은 "레이아웃이 없다"는 오류를 돌려줍니다.
+### 0.2 환경 준비 (재부팅하면 다시 해야 함)
 
-## 1.5 BL-010 검증 결과
+검증에 쓰는 도구 두 개는 전역 설치가 너무 오래되어 `/tmp`에 따로 받아 썼다.
+`/tmp`는 재부팅하면 사라진다.
 
-검증한 것:
+```bash
+npm install --prefix /tmp/ab-0.38.2 agent-browser@0.38.2        # 전역은 0.16.3, 쓸 수 없음
+tag=$(curl -s https://api.github.com/repos/wasmerio/wasmer/releases/latest | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')
+mkdir -p /tmp/wasmer-new && curl -sSL "https://github.com/wasmerio/wasmer/releases/download/$tag/wasmer-darwin-arm64.tar.gz" | tar -xz -C /tmp/wasmer-new
+export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전역 wasmer는 4.2.6, 쓸 수 없음
+```
 
-- 워크스페이스 전체 `cargo test`: 엔진 92개, `cdp-wire` 3개 통과
-- `./scripts/verify-m0.sh`: 16개 통과
-- `./scripts/verify-m1.sh`: 26개 통과. 픽스처에 인라인 스크립트를 넣고
-  스크립트가 만든 제목, `eval` 결과, 스크립트가 남긴 전역을 검사 4개로 확인한다
-- `MODE=wasix ./scripts/verify-m0.sh`: 16개 통과. 연달아 실행해도 통과한다
-- WASIX 모듈 크기는 1.6MB다 (QuickJS 이전에는 272KB)
-- WASIX에서 `--engine html`로 픽스처를 열어 인라인 스크립트, `eval`, DOM
-  읽기, `Date`가 동작하는 것을 손으로 확인했다
+`cargo-wasix`와 `~/.wasixcc`는 설치되어 있다. Chrome 비교용 headless shell은
+`~/Library/Caches/ms-playwright/chromium_headless_shell-1228/`에 있다(§6).
 
-검증하면서 고친 것:
+### 0.3 확인 명령
 
-- **`textContent`에 setter가 없었다.** rquickjs는 기본이 strict 모드라
-  대입하면 "no setter for property" 예외가 났다. setter를 붙이고,
-  `id`·`className`·`title`·`href` 같은 속성 반영 프로퍼티에도 setter를 붙였다
-- **평가를 sloppy 모드로 바꿨다.** 브라우저의 일반 `<script>`와
-  `Runtime.evaluate`는 sloppy다. strict면 선언 없는 대입 같은 흔한 페이지
-  코드가 예외를 던진다
-- **DOM 객체가 클래스 이름을 `Object`로 냈다.** 래퍼에 `Symbol.toStringTag`를
-  붙여 `HTMLParagraphElement` 같은 인터페이스 이름을 낸다.
-  `DOM.resolveNode`와 같은 `class_for` 표를 쓴다
-- **정수가 `42.0`으로 나갔다.** Chrome처럼 `42`로 낸다
-- **테스트 6개가 스스로 교착했다.** `engine.doc().find_id(engine.doc()...)`가
-  한 문장에서 같은 뮤텍스를 두 번 잡는다. 엔진 코드의 문제가 아니라 테스트의
-  문제였다
-- **`full-wasi` feature를 뺐다.** §6의 `rquickjs-macro` 항목 참조
+모두 통과하는 상태에서 세션을 끝냈다.
 
-남은 것: `Runtime.callFunctionOn`은 아직 실제 JS가 아니다. 함수 선언 문자열에
-`textContent`나 `value`가 들어 있는지만 본다. M2.4에서 원격 객체 핸들과 함께
-바꾼다.
+| 명령 | 검사 수 |
+|---|---|
+| `cargo test` | 엔진 157, browser-core 1, cdp-wire 3 |
+| `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
+| `./scripts/verify-m1.sh` | 39 |
+| `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 23 |
+| `WHB_PROBE_URL=https://login.example.com/ cargo test --release -p engine probe_a_url -- --ignored --nocapture` | 오류 없이 `#/login`까지 |
 
-### 설계상 알아둘 것
+WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다린다(§6).
 
-`rquickjs::Runtime`은 `Send`가 아닙니다. `Send`가 열리는 `parallel` feature가
-tokio의 멀티스레드 런타임을 끌어오기 때문입니다. 그래서 JS 런타임을
-**전용 스레드에 가두고 채널로 통신**합니다(`ScriptHost`). 엔진은 `Sender`만
-들고 있으므로 `Engine: Send`가 유지됩니다.
+### 0.4 다음 후보
 
-DOM은 가두지 않았습니다. `Arc<Mutex<Document>>`로 엔진과 공유하므로 페이지
-스크립트가 만든 변경이 접근성 트리에 즉시 반영됩니다. 다만 **JS를 호출할 때
-문서 잠금을 잡고 있으면 안 됩니다.** 스크립트 스레드가 같은 뮤텍스를 잡으므로
-교착합니다. `load()` 류가 잠금 안에서 값을 모아 두었다가 잠금을 놓은 뒤
-필드에 대입하는 이유가 이것입니다.
+- **스크린샷 (M1.5).** 남은 가장 큰 빈칸. 레이아웃이 있으니 박스·글자를 대략
+  그릴 수 있다. 비밀번호 칸은 점으로 그려야 한다(M4.3).
+- **로딩 시간 (M2.13).** 참조 사이트 약 5초. 스타일시트와 청크를 병렬로 받으면 준다.
+- **`Network.*` 이벤트 (M3.1).** HAR과 `route`. 요청 본문의 비밀번호는 가리기 층이
+  자동으로 덮는다.
+- **콘솔 (`Runtime.consoleAPICalled`).** 지금은 `probe_a_url`로만 본다.
+- **스크롤.** `scrollIntoView`가 아무것도 안 한다. 뷰포트 밖 요소의 클릭은 되지만
+  `elementFromPoint`는 뷰포트 안만 본다.
+- **ES 모듈 (M2.11).**
 
-또 하나: 매크로로 원시 접근자를 생성하려 하면 **매크로 위생 때문에 실패합니다.**
-호출부의 `doc`은 함수 인자(참조)로 해석되어 클로저가 `'static`이 되지 못합니다.
-그래서 `put_reads`/`put_content`/`put_mutations`는 명시적으로 써 두었습니다.
+### 0.5 이번 세션의 커밋 (오래된 것부터)
+
+| 커밋 | 내용 |
+|---|---|
+| `7794b8e` | BL-010: M2 엔진 연결 검증. `textContent` setter, sloppy 평가, 락파일 정리 |
+| `9ecfa0e` | HTTPS: rustls + ring을 게스트 안에서 (M1.11) |
+| `84e6ff8` | 쿠키 저장소, POST, 히스토리, 문서마다 새 JS 컨텍스트 (M3.2) |
+| `c30f103` | DOM 프렐류드 재작성(`prelude/*.js`), 외부 스크립트, 이벤트 루프, fetch/XHR (M2.6·M2.7·M2.9) |
+| `77494d7` | QuickJS 패치(`Function.caller`), 스택 32MB. 참조 사이트 로그인 화면이 뜸 (M2.10) |
+| `4862ea2` | 원격 객체, 글자·키 입력, keep-alive 연결 풀, `WHB_TRACE_CDP` (M2.4·M2.8·M2.14) |
+| `10820d2` | 추적 로그에서 입력 글자 가리기 |
+| `f2771cc` | 인라인 스타일로 숨긴 요소를 접근성 트리에서 제외 (M1.4a) |
+| `8f1ad7f` | 선택자 엔진 재작성 (M1.10) |
+| `bffaf73` | CSS 파서와 캐스케이드 계산 (M1.4b) |
+| `0cf68cb` | 캐스케이드를 페이지에 연결: 시트 수집, 캐시, 접근성 트리, `getComputedStyle` |
+| `8abfeaa` | 레이아웃(taffy), 히트 테스트, 마우스 입력 (M1.4·M2.5) |
+| `d9c4296` | 자격증명: stdin, 자리표시자, CDP 출력 가리기 (M4) |
+
+## 1. 엔진 구조
+
+`crates/engine/src/`:
+
+| 파일 | 하는 일 |
+|---|---|
+| `browser.rs` | `HtmlEngine`. CDP 메서드, 로드 순서(가져오기 → 스타일시트 → 스크립트), 히스토리. 맨 바깥 `impl Engine`이 모든 출력에서 비밀을 가린다 |
+| `fetch.rs` | HTTP/1.1 클라이언트. TLS, keep-alive 풀, 리다이렉트, 쿠키 |
+| `cookies.rs` | RFC 6265 쿠키 저장소. 메모리 전용, 모든 타깃이 공유 |
+| `dom.rs`, `parse.rs` | 아레나 DOM과 html5ever 싱크. 폼 상태(`Control`), 변경 버전, 스타일·레이아웃 캐시 |
+| `select.rs` | 선택자 파서·매처·명시도 |
+| `css.rs`, `style.rs` | 시트 파싱, 캐스케이드, 계산 스타일 (`document_styles`) |
+| `layout.rs` | taffy 위의 배치, 칠하는 순서, 히트 테스트 (`document_layout`) |
+| `ax.rs` | 접근성 트리 |
+| `js.rs` | `ScriptHost`: QuickJS를 전용 스레드(32MB 스택)에 가두고 채널로 부른다. 가상 시계 작업 큐, CDP용 평가 |
+| `bindings.rs` | JS에 주는 원시 함수(`__dom`)와 `PRELUDE` 조립 |
+| `prelude/*.js` | JS 쪽 DOM과 웹 플랫폼. 번호 순서로 이어 붙여 함수 하나가 된다. `90-cdp.js`는 원격 객체와 입력 |
+| `secrets.rs` | 자격증명 보관, 자리표시자 치환, 출력 가리기 |
+| `test_server.rs` | 테스트용 HTTP 서버 |
+
+설계상 알아둘 것:
+
+- `rquickjs::Runtime`은 `Send`가 아니다. 그래서 **전용 스레드에 가두고 채널로 통신**한다
+  (`ScriptHost`). 엔진은 `Sender`만 들고 있어 `Engine: Send`가 유지된다.
+- DOM은 `Arc<Mutex<Document>>`로 엔진과 공유한다. **JS를 부르는 동안 문서 잠금을
+  잡고 있으면 교착한다.** `replace_document` 류가 잠금 안에서 값을 모았다가 놓은
+  뒤 대입하는 이유다.
+- 스타일과 레이아웃은 문서에 캐시되고 `Document::version`이 바뀔 때만 다시 계산된다.
+  노드를 바꾸는 `dom.rs`의 모든 함수가 버전을 올린다. 새 변경 함수를 만들면 `touch()`를 부른다.
+- CDP 출력은 `impl Engine for HtmlEngine` 한 곳을 지난다. 새 메서드는 `dispatch_raw`에
+  넣으면 가리기가 저절로 적용된다.
+- 원시 접근자는 매크로로 만들면 매크로 위생 때문에 실패한다. 그래서 `bindings.rs`의
+  `put_*` 함수는 명시적으로 쓴다.
 
 ## 2. 측정으로 확정한 사실
 
@@ -94,23 +128,22 @@ DOM은 가두지 않았습니다. `Arc<Mutex<Document>>`로 엔진과 공유하�
 | 호스트 페이지에서 안으로 들어오는 경로(E3)는 필요 없다. 설령 되더라도 HTTP 전용이라 CDP의 WebSocket 업그레이드는 지나가지 못한다 | [harness/README.md](../harness/README.md) |
 | 브라우저 샌드박스에서 외부 TCP·HTTPS가 된다. WISP 릴레이를 쓴다 (E4·E5) | 이 문서의 §3 |
 | QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다. 엔진에서는 `full-wasi`를 쓸 수 없다 (§6) | [docs/quickjs.md](quickjs.md) |
-| QuickJS를 넣은 WASIX 모듈은 1.6MB다. TLS를 넣으면 2.3MB다 | 이 문서의 §1.5, [docs/wasix.md](wasix.md) |
+| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB | [docs/wasix.md](wasix.md), 커밋 기록 |
 | WASIX에서 rustls + ring이 TLS 1.3으로 동작한다. 참조 사이트 인증서는 공개 루트로 검증된다 | [docs/wasix.md](wasix.md) |
 | example.com은 이제 본문이 문단 하나와 `<script src=/s.js>`뿐이다. 외부 스크립트 없이는 제목과 링크가 없다 | 2026-10-09 측정 |
 | 참조 사이트 로그인 화면을 800×600에서 Chrome(Playwright headless shell)과 비교하면 입력란·`.login-form`·`#wrap`·저작권 문구의 위치와 크기가 같거나 1px 차이다. 체크박스만 x가 8px 다르다. 아이디 입력란 클릭은 포커스를, "체크박스" 글자 클릭은 체크를 두 엔진에서 똑같이 바꾸고, 숨은 체크박스를 ref로 누르면 두 엔진 모두 빗나간다(`div.login-background`가 맞는다) | 2026-10-09 |
-| WASIX 모듈은 레이아웃까지 넣어 3.3MB다 | 같은 날 |
 | 캐스케이드를 넣은 뒤 참조 사이트 "다음" 버튼의 계산 스타일은 `display: block`, `cursor: pointer`, `width: 100%`, `height: 54px`, 배경 `#00aaff`(`a CSS variable`에서), 13.33px이다. 전체 스냅샷은 23줄이다 | 2026-10-09 |
 | 참조 사이트의 숨은 화면(추가 인증 선택, OTP, 실패 대화상자)은 CSS 클래스가 아니라 인라인 `style="display: none"`으로 숨는다. 인라인 스타일만 반영해도 로그인 화면의 인터랙티브 스냅샷이 25개 넘던 것에서 4개(첫 입력란, 아이디, 다음, 체크박스)로 준다 | 2026-10-09 측정 (M1.6) |
 | 참조 사이트에 가짜 계정으로 로그인하면 실패가 화면에 나온다. Enter 한 번에 아이디 단계(`POST /api/login-step`, a result code), 버튼이 "로그인"으로 바뀐 뒤 Enter 한 번 더에 인증(a result code "실패 문구")이고, 그 문구가 폼 아래 문단과 확인 대화상자로 스냅샷에 나온다. 클릭 없이 Enter만으로 된다 | 2026-10-09, 사용자 승인 아래 가짜 계정 `nonexistent-test-account`로 |
 | 참조 사이트의 React 입력란에 agent-browser `fill`이 동작한다. 아이디는 스냅샷에 나오고 비밀번호는 나오지 않는다 | 2026-10-09 agent-browser |
-| 참조 사이트의 로그인 화면이 WASIX에서 그려진다. 첫 입력란·아이디·비밀번호 입력란과 "다음" 버튼이 스냅샷에 나온다. CSS로 숨긴 추가 인증 화면들도 함께 나온다(캐스케이드 없음) | 2026-10-09 agent-browser |
+| 참조 사이트의 로그인 화면이 WASIX에서 그려진다. 숨은 화면을 빼면 첫 단계 스냅샷은 첫 입력란·아이디·"다음"·체크박스뿐이고, 비밀번호 칸은 "다음" 뒤에 나온다 | 2026-10-09 agent-browser |
 | QuickJS 호출은 V8보다 네이티브 스택을 훨씬 많이 쓴다. 기본 한도 1MB로는 React 렌더링이 넘친다. 스크립트 스레드는 32MB 스택에 한도 24MB로 돈다 | 같은 측정 |
 | 참조 사이트는 React 번들 3개와 the grid library·jQuery·lottie를 싣는다. jQuery는 초기화 때 `createHTMLDocument`를, lottie는 캔버스 2D 컨텍스트를 요구하고, the grid library는 `Function.caller`를 요구한다 | 2026-10-09 `probe_a_url` |
 | agent-browser의 `back`·`forward`는 CDP 메서드가 아니라 `Runtime.evaluate("history.back()")`이다 | [docs/capture/required-expressions.txt](capture/required-expressions.txt) |
 | `Context::full`이 죽는 원인은 sysroot 불일치 하나다. `CLOCK_MONOTONIC`이 포인터 인코딩(1058440)으로 컴파일되고 WASIX는 정수 1을 기대한다 | 같은 문서 |
 | 참조 사이트 사이트는 SPA 셸만 돌려준다. HTML만 받아서는 아무것도 얻을 수 없다 | 이 문서의 §3 |
 
-## 3. 방금 확인한 것 (E4·E5)
+## 3. 브라우저 샌드박스의 외부 통신 (E4·E5)
 
 `harness`에 아웃바운드 프로브 두 개를 추가했습니다.
 
@@ -190,11 +223,9 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       `engine-fake`가 냈던 로그인 페이지 결과를 그대로 재현하는 테스트가 있다.
 - [x] M1.3 엔진이 직접 페이지를 가져온다. `crates/engine/src/fetch.rs`가
       `std::net`으로 평문 HTTP를 열고, 청크 인코딩과 리다이렉트와 `data:` URL을
-      처리한다. HTTPS는 TLS를 게스트로 가져와야 하므로 아직 없고, 그 사실을
-      메시지로 밝힌다. `std::net`으로 평문 HTTP를 열면
-      네이티브와 WASIX 양쪽에서 동작하고, 브라우저 샌드박스에서는 E4·E5로
-      확인한 대로 WISP가 자동으로 처리한다. **WISP를 인지하는 코드는 필요 없다.**
-      HTTPS는 TLS를 게스트로 가져와야 하므로 별도 조각으로 둔다.
+      처리한다. `std::net`으로 열면 네이티브와 WASIX 양쪽에서 동작하고, 브라우저
+      샌드박스에서는 E4·E5로 확인한 대로 WISP가 자동으로 처리한다. **WISP를
+      인지하는 코드는 필요 없다.** HTTPS는 M1.11, keep-alive는 M2.13 참조.
 - [x] M1.11 HTTPS. rustls + ring + `webpki-roots`로 TLS를 게스트 안에서
       처리한다. 사설 CA는 `WHB_EXTRA_CA_CERTS`로 추가한다. WASIX에서
       example.com과 참조 사이트가 TLS 1.3으로 열린다. 근거는
@@ -222,19 +253,16 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       칠하는 순서는 쌓임 단계·레이어·문서 순서다. 박스와 히트 테스트가 같은
       레이아웃을 써서, 요소가 보고하는 자리를 누르면 그 요소가 눌린다.
       남은 근사: 기준선 정렬 없음, 스크롤 없음(`scrollIntoView`는 아무것도 안 함),
-      회전·확대 무시, 쌓임 맥락은 한 단계로 평평하게. 목표는 픽셀이 아니라
-      `getBoundingClientRect`가 0이 아닌 사각형을 돌려주고 가시성을 판정하는
-      것이다. 최소 CSS 캐스케이드(태그·클래스·인라인)가 함께 필요하다.
-- [ ] M1.6 측정은 참조 사이트 로그인 화면으로 했다(아래 §2 표). 다른 화면은 아직이다.
+      회전·확대 무시, 쌓임 맥락은 한 단계로 평평하게.
 - [ ] M1.5 `engine-fake`의 PNG 렌더러를 실제 레이아웃에 연결한다. 현재는
       저장 방식 deflate라 결과가 큽니다. `miniz_oxide` 도입을 검토한다.
-- [ ] M1.6 같은 캡처 방식으로 CDP 표면을 다시 측정한다. 실제 사이트를
-      대상으로 어떤 메서드가 더 필요해지는지 확인한다.
+- [ ] M1.6 실제 사이트로 다시 측정한다. 참조 사이트 로그인 화면은 레이아웃까지
+      Chrome과 비교했다(§2). 로그인 뒤 화면과 CDP 표면 재캡처는 아직이다.
 - [x] M1.7 `browser` 바이너리에 `--engine fake|html` 플래그를 넣었다.
       가짜 엔진이 기본값이라 `verify-m0.sh`는 그대로 통과한다.
-- [x] M1.8 `scripts/verify-m1.sh`. 픽스처를 HTTP로 서빙하고, 가져와 파싱한 뒤,
-      접근성 트리의 역할·이름·상태를 22개 검사로 판정한다. 스크린샷이 조용히
-      빈 이미지를 내지 않고 이유를 말하는지도 검사한다.
+- [x] M1.8 `scripts/verify-m1.sh`. 픽스처를 HTTP로 서빙하고 접근성 트리, 인라인
+      스크립트, `eval`, 히스토리, 쿠키, 클릭과 가시성을 39개 검사로 판정한다.
+      스크린샷이 조용히 빈 이미지를 내지 않고 이유를 말하는지도 검사한다.
 
 ### 4.3 M2 JavaScript (P0, 큼)
 
@@ -243,8 +271,8 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 - [x] M2.2 DOM 바인딩을 만든다. `document`, `window`, `querySelector`,
       `getComputedStyle`, `getBoundingClientRect`, `focus`, `scrollIntoView`,
       `elementFromPoint`가 필요하다. 앞의 다섯 개는 `agent-browser`가 실제로
-      호출하는 것을 캡처로 확인했다. 레이아웃이 없으므로 사각형은 0이고
-      `elementFromPoint`는 `null`이다.
+      호출하는 것을 캡처로 확인했다. 지금은 사각형과 `elementFromPoint`가
+      레이아웃(M1.4)에서 나온다.
 - [x] M2.3 `Runtime.evaluate`가 규칙표가 아니라 진짜 JS를 실행하게 한다.
       `crates/engine`의 규칙표는 삭제했다. `engine-fake/src/eval.rs`는 M0의
       가짜 엔진이 쓰므로 남겨 두었다.
@@ -273,12 +301,10 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       `this._super.caller`로 부모 메서드를 찾는데 QuickJS는 늘 `undefined`를 줬다.
       rquickjs-sys를 `vendor/`에 들여와 QuickJS를 패치했다
       ([vendor/README.md](../vendor/README.md)).
-- [ ] M2.13 참조 사이트를 여는 데 3.5초, 스타일시트 6개(2.8MB)를 받고 파싱하게 된
-      뒤로는 5.6초 걸린다. 시트를 병렬로 받거나 스크립트와 겹쳐 받으면 줄어든다.
-      이전 기록: 3.5초. 12초 중 9초는 요청 69개가 매번
-      새로 맺는 TCP·TLS였고, keep-alive 연결 풀로 줄였다. 남은 시간은 대부분
-      7MB 남짓한 번들의 파싱이다(the largest bundle 0.75초, main 0.54초, the grid library 0.43초).
-      청크를 병렬로 받으면 조금 더 줄 수 있다.
+- [ ] M2.13 참조 사이트를 여는 시간. 처음 12초 중 9초는 요청 69개가 매번 새로 맺는
+      TCP·TLS였고, keep-alive 연결 풀로 3.5초가 됐다. 그 뒤 스타일시트 6개(2.8MB)를
+      받아 파싱하게 되면서 약 5초다. 남은 시간은 번들 파싱(the largest bundle 0.75초, main 0.54초,
+      the grid library 0.43초)과 순차 다운로드다. 시트와 청크를 병렬로 받으면 줄어든다.
 - [ ] M2.11 ES 모듈(`type=module`)과 `import()`.
 - [ ] M2.12 `popstate`. 지금은 `pushState`로 만든 항목으로 뒤로 가면 그 URL을
       새로 읽는다.
@@ -301,10 +327,11 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       `Secure`·`HttpOnly`를 지킨다. `fetch::Client`가 리다이렉트 응답의 쿠키까지
       저장하고, POST 뒤 302·303은 GET으로 바꾼다. CDP의 쿠키 메서드와
       `document.cookie`가 같은 저장소를 쓴다. 공개 접미사 목록은 없다.
-- [ ] M3.5 `localStorage`를 출처별로 나눈다. 지금은 문서마다 새로 만들어지는
-      JS 맵이라 페이지를 옮기면 사라진다.
+- [x] M3.5 `localStorage`·`sessionStorage`는 출처별로 나뉘어 엔진 메모리(`DomState`)에
+      있어 페이지를 옮겨도 남는다. 디스크에는 쓰지 않는다. 다만 탭(타깃)마다 따로라
+      `localStorage`가 탭 사이에 공유되지 않는다. 쿠키는 공유된다.
 - [ ] M3.3 요청 가로채기를 구현한다. `agent-browser network route`.
-- [ ] M3.4 `Page.captureScreenshot`을 실제 렌더 결과에 연결한다.
+- [ ] M3.4 `Page.captureScreenshot`. M1.5와 같은 일이다.
 
 ### 4.5 M4 자격증명 (P1, 목표의 핵심)
 
@@ -327,10 +354,9 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       패치는 `vendor/patches/`에 diff로도 둔다. `Context::full` 문제(sysroot)도
       이제 같은 자리에서 고칠 수 있다.
 
-- [ ] **wasixcc를 설치할지.** 설치하면 `Context::full`이 살아나고
-      `performance.now()`가 동작하며 QuickJS 빌드 우회가 사라진다. 대신
-      `~/.wasixcc`에 LLVM·binaryen을 받고 셸 rc 파일을 수정한다. 지금 상태로도
-      JS 엔진은 쓸 수 있으므로 블로커가 아니다.
+- [ ] **`Context::full`을 살릴지.** `wasixcc`는 이미 설치되어 있고, QuickJS도 이제
+      `vendor/`에서 직접 패치할 수 있다. 하지만 `performance`는 프렐류드가 가상 시계로
+      제공하므로 급하지 않다.
 - [ ] **클라이언트를 무엇으로 할지.** 세 후보다.
       `agent-browser`는 Rust CLI라 `cargo wasix`로 WASIX에 올릴 수 있고,
       `inno-creed`를 올린 경로와 같다. Playwright는 Node 기반이고 페이지 JS에
