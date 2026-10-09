@@ -13,6 +13,7 @@
 //! `data:` URLs are supported because they let the engine be pointed at inline
 //! markup, which keeps tests and the harness free of a network.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -226,15 +227,22 @@ impl Request {
 pub struct Client {
     tls: Arc<ClientConfig>,
     cookies: Arc<Mutex<CookieJar>>,
+    /// Idle keep-alive connections, by `scheme://host:port`, shared by every
+    /// clone. A page load is dozens of requests to one host; a new TCP and
+    /// TLS handshake for each cost about 100 ms apiece on the reference site.
+    idle: Arc<Mutex<HashMap<String, Vec<Connection>>>>,
 }
+
+/// Idle connections kept per host, as browsers bound theirs.
+const MAX_IDLE_PER_HOST: usize = 6;
 
 impl Client {
     pub fn new(cookies: Arc<Mutex<CookieJar>>) -> Self {
-        Client { tls: tls_config(), cookies }
+        Self::with_tls(cookies, tls_config())
     }
 
     pub fn with_tls(cookies: Arc<Mutex<CookieJar>>, tls: Arc<ClientConfig>) -> Self {
-        Client { tls, cookies }
+        Client { tls, cookies, idle: Arc::new(Mutex::new(HashMap::new())) }
     }
 
     pub fn cookies(&self) -> &Arc<Mutex<CookieJar>> {
@@ -256,7 +264,7 @@ impl Client {
         let mut current = Url::parse(&request.url)?;
         for _ in 0..=MAX_REDIRECTS {
             let cookie = self.jar().header(&current, cookies::now());
-            let response = send_once(&current, &method, &headers, cookie.as_deref(), &body, &self.tls)?;
+            let response = self.send_once(&current, &method, &headers, cookie.as_deref(), &body)?;
             {
                 let mut jar = self.jar();
                 let now = cookies::now();
@@ -285,6 +293,57 @@ impl Client {
             return Ok(response);
         }
         Err(FetchError::TooManyRedirects)
+    }
+
+    /// One request and its response, on an idle connection when there is
+    /// one. A connection the server closed while it sat idle fails before any
+    /// of the response arrives; the request is then sent again on a fresh
+    /// connection, as browsers do.
+    fn send_once(
+        &self,
+        url: &Url,
+        method: &str,
+        headers: &[(String, String)],
+        cookie: Option<&str>,
+        body: &[u8],
+    ) -> Result<Response, FetchError> {
+        let key = format!("{}://{}:{}", url.scheme, url.host, url.port);
+        let request = request_bytes(url, method, headers, cookie, body);
+        let idle = self.idle_pool().get_mut(&key).and_then(Vec::pop);
+        if let Some(mut connection) = idle {
+            match exchange(&mut connection, &request, method, url) {
+                Ok((response, reusable)) => {
+                    if reusable {
+                        self.keep(key, connection);
+                    }
+                    return Ok(response);
+                }
+                Err(Exchange::Stale(_)) => {}
+                Err(Exchange::Failed(e)) => return Err(e),
+            }
+        }
+        let mut connection = connect(url, &self.tls)?;
+        match exchange(&mut connection, &request, method, url) {
+            Ok((response, reusable)) => {
+                if reusable {
+                    self.keep(key, connection);
+                }
+                Ok(response)
+            }
+            Err(Exchange::Stale(e) | Exchange::Failed(e)) => Err(e),
+        }
+    }
+
+    fn keep(&self, key: String, connection: Connection) {
+        let mut idle = self.idle_pool();
+        let slot = idle.entry(key).or_default();
+        if slot.len() < MAX_IDLE_PER_HOST {
+            slot.push(connection);
+        }
+    }
+
+    fn idle_pool(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<Connection>>> {
+        self.idle.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn jar(&self) -> std::sync::MutexGuard<'_, CookieJar> {
@@ -410,19 +469,13 @@ fn connect(url: &Url, tls: &Arc<ClientConfig>) -> Result<Connection, FetchError>
 /// Headers a caller may not set, because the client owns them.
 const RESERVED: [&str; 4] = ["host", "connection", "content-length", "cookie"];
 
-fn send_once(
+fn request_bytes(
     url: &Url,
     method: &str,
     headers: &[(String, String)],
     cookie: Option<&str>,
     body: &[u8],
-    tls: &Arc<ClientConfig>,
-) -> Result<Response, FetchError> {
-    let address = format!("{}:{}", url.host, url.port);
-    let mut stream = connect(url, tls)?;
-
-    // `Connection: close` means the response length is delimited by EOF, so a
-    // Content-Length is a fast path rather than a requirement.
+) -> Vec<u8> {
     let mut head = format!("{method} {} HTTP/1.1\r\nHost: {}\r\n", url.path, url.authority());
     let has = |name: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
     if !has("user-agent") {
@@ -449,26 +502,121 @@ fn send_once(
     if !body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH") {
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
-    head.push_str("Connection: close\r\n\r\n");
-
+    head.push_str("Connection: keep-alive\r\n\r\n");
     let mut request = head.into_bytes();
     request.extend_from_slice(body);
-    stream
-        .write_all(&request)
-        .map_err(|e| FetchError::Io(format!("write to {address} failed: {e}")))?;
-    let _ = stream.flush();
+    request
+}
 
-    let mut raw = Vec::new();
-    match stream.read_to_end(&mut raw) {
-        Ok(_) => {}
-        // Many servers close a TLS connection without close_notify. With
-        // `Connection: close` the body is delimited by the close anyway, so
-        // what was read is the response.
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !raw.is_empty() => {}
-        Err(e) => return Err(FetchError::Io(format!("read from {address} failed: {e}"))),
+/// How one exchange on a connection failed.
+enum Exchange {
+    /// Nothing of the response arrived. On a reused connection this means
+    /// the server had closed it, and the request is safe to send again.
+    Stale(FetchError),
+    Failed(FetchError),
+}
+
+/// Writes `request` and reads one response. Returns the response and whether
+/// the connection can carry another.
+fn exchange(
+    connection: &mut Connection,
+    request: &[u8],
+    method: &str,
+    url: &Url,
+) -> Result<(Response, bool), Exchange> {
+    let address = format!("{}:{}", url.host, url.port);
+    if let Err(e) = connection.write_all(request).and_then(|()| connection.flush()) {
+        return Err(Exchange::Stale(FetchError::Io(format!("write to {address} failed: {e}"))));
     }
+    let mut raw = Vec::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = match connection.read(&mut buffer) {
+            Ok(n) => n,
+            // Many servers close a TLS connection without close_notify.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+            Err(e) => {
+                let error = FetchError::Io(format!("read from {address} failed: {e}"));
+                return Err(if raw.is_empty() { Exchange::Stale(error) } else { Exchange::Failed(error) });
+            }
+        };
+        if read == 0 {
+            if raw.is_empty() {
+                return Err(Exchange::Stale(FetchError::Io(format!(
+                    "{address} closed the connection without responding"
+                ))));
+            }
+            // The close delimited the response, and ended the connection.
+            let response = parse_response(&raw, &url.to_string_with_path()).map_err(Exchange::Failed)?;
+            return Ok((response, false));
+        }
+        raw.extend_from_slice(&buffer[..read]);
+        if let Some(reusable) = response_complete(&raw, method) {
+            let response = parse_response(&raw, &url.to_string_with_path()).map_err(Exchange::Failed)?;
+            return Ok((response, reusable));
+        }
+        if raw.len() > MAX_BODY + 64 * 1024 {
+            return Err(Exchange::Failed(FetchError::Io(format!("the response from {address} is too large"))));
+        }
+    }
+}
 
-    parse_response(&raw, &url.to_string_with_path())
+/// Whether `raw` holds a whole response, and if so whether the connection
+/// can carry another. `None` while more is needed, which includes a
+/// response that ends when the connection closes.
+fn response_complete(raw: &[u8], method: &str) -> Option<bool> {
+    let (head_end, body_start) = find_header_end(raw)?;
+    let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+    let mut lines = head.lines();
+    let status_line = lines.next()?;
+    let status: u16 = status_line.split(' ').nth(1)?.trim().parse().ok()?;
+    let fields: Vec<(&str, &str)> =
+        lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim(), v.trim())).collect();
+    let field = |name: &str| fields.iter().find(|(k, _)| *k == name).map(|(_, v)| *v);
+    let reusable = status_line.starts_with("http/1.1") && !field("connection").is_some_and(|v| v.contains("close"));
+    let body = &raw[body_start..];
+    if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
+        return Some(reusable);
+    }
+    if field("transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+        return chunked_complete(body).then_some(reusable);
+    }
+    let length = field("content-length")?.parse::<usize>().ok()?;
+    (body.len() >= length).then_some(reusable)
+}
+
+/// Whether a chunked body has reached its last chunk and trailer.
+fn chunked_complete(mut body: &[u8]) -> bool {
+    loop {
+        let Some(line_end) = body.iter().position(|b| *b == b'\n') else { return false };
+        let size_text = String::from_utf8_lossy(&body[..line_end]);
+        let Ok(size) = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16) else {
+            return false;
+        };
+        body = &body[line_end + 1..];
+        if size == 0 {
+            // Trailer fields, then an empty line.
+            loop {
+                let Some(end) = body.iter().position(|b| *b == b'\n') else { return false };
+                let line = &body[..end];
+                body = &body[end + 1..];
+                if line.is_empty() || line == b"\r" {
+                    return true;
+                }
+            }
+        }
+        if body.len() < size + 1 {
+            return false;
+        }
+        body = &body[size..];
+        if body.starts_with(b"\r\n") {
+            body = &body[2..];
+        } else if body.starts_with(b"\n") {
+            body = &body[1..];
+        } else {
+            return false;
+        }
+    }
 }
 
 /// Splits the status line, headers and body, then decodes the body.
@@ -685,6 +833,57 @@ mod tests {
         assert!(home.contains("Cookie: sid=abc123\r\n"), "{home}");
         assert!(!home.contains("Content-Type"), "{home}");
         assert!(!home.contains("user=kim"), "{home}");
+    }
+
+    #[test]
+    fn requests_to_one_host_share_a_connection() {
+        // One accepted connection answers both requests, chunked then sized.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = tx.send(crate::test_server::read_request(&mut stream));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n0\r\n\r\n")
+                .unwrap();
+            let _ = tx.send(crate::test_server::read_request(&mut stream));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo").unwrap();
+            // A second connection would wait here forever.
+            let _ = listener.accept();
+        });
+        let client = client();
+        assert_eq!(client.get(&format!("http://127.0.0.1:{port}/a")).unwrap().body, b"one");
+        assert_eq!(client.get(&format!("http://127.0.0.1:{port}/b")).unwrap().body, b"two");
+        assert!(rx.recv().unwrap().contains("Connection: keep-alive\r\n"));
+        assert!(rx.recv().unwrap().starts_with("GET /b "));
+    }
+
+    #[test]
+    fn a_connection_the_server_closed_is_replaced() {
+        // serve_script answers one request per connection and closes it, so
+        // the second request finds its pooled connection dead.
+        let (base, _requests) = serve_script(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n1".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n2".to_string(),
+        ]);
+        let client = client();
+        assert_eq!(client.get(&format!("{base}/")).unwrap().body, b"1");
+        assert_eq!(client.get(&format!("{base}/")).unwrap().body, b"2");
+    }
+
+    #[test]
+    fn knows_when_a_response_is_complete() {
+        assert_eq!(response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx", "GET"), None);
+        assert_eq!(response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nxy", "GET"), Some(true));
+        assert_eq!(
+            response_complete(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", "GET"),
+            Some(false)
+        );
+        assert_eq!(response_complete(b"HTTP/1.1 200 OK\r\n\r\nuntil close", "GET"), None);
+        assert_eq!(response_complete(b"HTTP/1.1 304 Not Modified\r\n\r\n", "GET"), Some(true));
+        assert!(!chunked_complete(b"3\r\none\r\n"));
+        assert!(chunked_complete(b"3\r\none\r\n0\r\nX-Trailer: 1\r\n\r\n"));
     }
 
     #[test]

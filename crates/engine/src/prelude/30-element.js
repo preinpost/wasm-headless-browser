@@ -574,16 +574,24 @@ function focusedElement() {
 }
 
 // Moves focus, firing blur/focusout on the old element and focus/focusin on
-// the new, in a browser's order.
+// the new, in a browser's order. A text control whose value changed while it
+// had focus fires `change` as it loses it, before `blur`.
+const valueAtFocus = new WeakMap();
 function moveFocus(el) {
   const previous = focusedElement();
   if (previous === el) return;
   api.setFocus(el ? own(el) : undefined);
   if (previous) {
+    if (valueAtFocus.has(previous)) {
+      const before = valueAtFocus.get(previous);
+      valueAtFocus.delete(previous);
+      if (before !== currentValue(previous)) fire(previous, 'change', { bubbles: true });
+    }
     dispatch(previous, new FocusEvent('blur', { relatedTarget: el, view: globalThis }));
     dispatch(previous, new FocusEvent('focusout', { bubbles: true, relatedTarget: el, view: globalThis }));
   }
   if (el) {
+    if (isTextControl(el)) valueAtFocus.set(el, currentValue(el));
     dispatch(el, new FocusEvent('focus', { relatedTarget: previous, view: globalThis }));
     dispatch(el, new FocusEvent('focusin', { bubbles: true, relatedTarget: previous, view: globalThis }));
   }

@@ -149,6 +149,67 @@ impl JsRuntime {
         }
     }
 
+    /// `Runtime.evaluate`: evaluates `source` as a global script and describes
+    /// the result, or the exception, as CDP JSON. The description is built by
+    /// the prelude (`prelude/90-cdp.js`), which also keeps the handles.
+    pub fn cdp_evaluate(&self, source: &str, by_value: bool, await_promise: bool) -> String {
+        let first = self.context.with(|ctx| {
+            let describe: rquickjs::Function = match ctx.globals().get("__cdpResult") {
+                Ok(f) => f,
+                Err(_) => return cdp_error("the DOM prelude is not installed"),
+            };
+            let mut options = EvalOptions::default();
+            options.strict = false;
+            let (value, threw) = match ctx.eval_with_options::<Value, _>(source, options) {
+                Ok(value) => (value, false),
+                Err(rquickjs::Error::Exception) => (ctx.catch(), true),
+                Err(e) => return cdp_error(&e.to_string()),
+            };
+            describe
+                .call::<_, String>((value, threw, by_value, await_promise))
+                .unwrap_or_else(|e| cdp_error(&e.to_string()))
+        });
+        self.run_microtasks();
+        self.settle(first)
+    }
+
+    /// Evaluates a prelude call that answers in CDP JSON, such as
+    /// `__cdpCall(...)`, and waits for a promise it parked.
+    pub fn cdp_expression(&self, expression: &str) -> String {
+        let first = match self.evaluate(expression) {
+            Ok(JsValue::String(json)) => json,
+            Ok(other) => cdp_error(&format!("the prelude answered {other:?}")),
+            Err(e) => cdp_error(&e.message),
+        };
+        self.settle(first)
+    }
+
+    /// A promise the client asked to await is parked by the prelude under a
+    /// token. The page runs until it settles, up to 30 virtual seconds at a
+    /// time; when nothing is due within that, nothing will settle it, and
+    /// that is reported rather than waited on.
+    fn settle(&self, first: String) -> String {
+        let token = serde_json::from_str::<serde_json::Value>(&first)
+            .ok()
+            .and_then(|v| v.get("pending").and_then(|t| t.as_u64()));
+        let Some(token) = token else { return first };
+        let check = format!("__cdpSettled({token})");
+        for _ in 0..PROMISE_TURNS {
+            if let Ok(JsValue::String(done)) = self.evaluate(&check) {
+                if !done.is_empty() {
+                    return done;
+                }
+            }
+            if self.run_tasks(PROMISE_HORIZON_MS, 1_000) == 0 {
+                break;
+            }
+        }
+        match self.evaluate(&check) {
+            Ok(JsValue::String(done)) if !done.is_empty() => done,
+            _ => cdp_error("the promise did not settle: nothing the page has scheduled resolves it"),
+        }
+    }
+
     /// Runs the prelude's task queue: timers, animation frames and network
     /// completions, in due order on a virtual clock, with a microtask
     /// checkpoint after each. Stops when nothing is due within `budget_ms`
@@ -255,6 +316,16 @@ fn new_context(runtime: &Runtime, console: &Arc<Mutex<ConsoleLog>>) -> Result<Co
         globals.set("console", console_object).map_err(map_error).expect("install console");
     });
     Ok(context)
+}
+
+/// How far ahead, in virtual time, an awaited promise's page looks for work,
+/// and how many such turns it gets.
+const PROMISE_HORIZON_MS: f64 = 30_000.0;
+const PROMISE_TURNS: usize = 10;
+
+/// A failure of the CDP plumbing itself, as opposed to a page exception.
+fn cdp_error(message: &str) -> String {
+    serde_json::json!({ "error": message }).to_string()
 }
 
 fn to_js_value(value: &Value<'_>) -> JsValue {
@@ -532,6 +603,8 @@ enum Request {
     /// A fresh context with the bindings reinstalled, for a new document.
     Reset { reply: Sender<Result<(), JsError>> },
     RunTasks { budget_ms: f64, max_tasks: usize, reply: Sender<usize> },
+    CdpEvaluate { source: String, by_value: bool, await_promise: bool, reply: Sender<String> },
+    CdpExpression { expression: String, reply: Sender<String> },
     Shutdown,
 }
 
@@ -578,6 +651,12 @@ impl ScriptHost {
                         }
                         Request::RunTasks { budget_ms, max_tasks, reply } => {
                             let _ = reply.send(js.run_tasks(budget_ms, max_tasks));
+                        }
+                        Request::CdpEvaluate { source, by_value, await_promise, reply } => {
+                            let _ = reply.send(js.cdp_evaluate(&source, by_value, await_promise));
+                        }
+                        Request::CdpExpression { expression, reply } => {
+                            let _ = reply.send(js.cdp_expression(&expression));
                         }
                         Request::Reset { reply } => {
                             thread_state.reset_page();
@@ -629,6 +708,28 @@ impl ScriptHost {
         reply_rx.recv().map_err(|_| JsError {
             message: "the script thread stopped while resetting".to_string(),
         })?
+    }
+
+    /// See [`JsRuntime::cdp_evaluate`].
+    pub fn cdp_evaluate(&self, source: &str, by_value: bool, await_promise: bool) -> serde_json::Value {
+        let (reply, answer) = channel();
+        let request = Request::CdpEvaluate { source: source.to_string(), by_value, await_promise, reply };
+        self.cdp_round_trip(request, answer)
+    }
+
+    /// See [`JsRuntime::cdp_expression`].
+    pub fn cdp_expression(&self, expression: &str) -> serde_json::Value {
+        let (reply, answer) = channel();
+        self.cdp_round_trip(Request::CdpExpression { expression: expression.to_string(), reply }, answer)
+    }
+
+    fn cdp_round_trip(&self, request: Request, answer: std::sync::mpsc::Receiver<String>) -> serde_json::Value {
+        let text = if self.requests.send(request).is_ok() {
+            answer.recv().unwrap_or_else(|_| cdp_error("the script thread stopped while evaluating"))
+        } else {
+            cdp_error("the script thread is gone")
+        };
+        serde_json::from_str(&text).unwrap_or_else(|e| serde_json::json!({ "error": format!("unreadable answer: {e}") }))
     }
 
     /// See [`JsRuntime::run_tasks`]. Returns how many tasks ran.

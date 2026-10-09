@@ -18,7 +18,7 @@ use crate::cookies::{self, Cookie, CookieJar};
 use crate::dom::{Document, NodeData, NodeId};
 use crate::fetch::{self, Request};
 use crate::bindings::Navigation;
-use crate::js::{JsError, JsValue, ScriptHost};
+use crate::js::{JsValue, ScriptHost};
 use crate::parse::{parse_html, parse_html_bytes};
 use crate::select;
 
@@ -52,7 +52,6 @@ pub struct HtmlEngine {
     frame_id: String,
     loader_id: String,
     context_id: u64,
-    objects: Vec<NodeId>,
     history: Vec<String>,
     history_index: usize,
     viewport: (f64, f64),
@@ -82,7 +81,6 @@ impl HtmlEngine {
             frame_id: ids::token(&mut counter),
             loader_id: ids::token(&mut counter),
             context_id: 1,
-            objects: Vec::new(),
             history: vec!["about:blank".to_string()],
             history_index: 0,
             viewport,
@@ -377,28 +375,6 @@ impl HtmlEngine {
         }
     }
 
-    /// Registers a DOM node as a remote object and returns its handle.
-    ///
-    /// Handles are not interned, so two handles to the same node are two
-    /// objects. `Runtime.callFunctionOn` only needs to resolve one back to a
-    /// node, so that is enough for now.
-    fn store_object(&mut self, dom: NodeId) -> Value {
-        self.objects.push(dom);
-        let index = self.objects.len() - 1;
-        let object_id = format!("{index}");
-        let doc = self.doc();
-        json!({
-            "type": "object",
-            "className": class_for(&doc, dom),
-            "description": describe_node(&doc, dom),
-            "objectId": object_id,
-        })
-    }
-
-    fn node_of(&self, object_id: &str) -> Option<NodeId> {
-        object_id.parse::<usize>().ok().and_then(|index| self.objects.get(index).copied())
-    }
-
     /// Remote-object id for a raw DOM index, matching `backendDOMNodeId`.
     fn backend_id(dom: NodeId) -> usize {
         dom + 1
@@ -408,46 +384,69 @@ impl HtmlEngine {
         backend.checked_sub(1)
     }
 
-    fn evaluate(&self, source: &str) -> Value {
-        let Some(script) = &self.script else {
-            return json!({
-                "result": { "type": "undefined" },
-                "exceptionDetails": {
-                    "text": "the JavaScript engine is not available in this process",
-                }
-            });
+    /// The node a DOM method names, by `nodeId` or `backendNodeId` (the same
+    /// numbers here) or by a remote `objectId`. Without any, the document.
+    fn node_param(&self, params: &Value) -> Result<NodeId, CdpError> {
+        let numbered = ["nodeId", "backendNodeId"].iter().find_map(|k| params.get(*k).and_then(|v| v.as_u64()));
+        let node = if let Some(n) = numbered {
+            Self::dom_from_backend(n as usize)
+        } else if let Some(object_id) = params.get("objectId").and_then(|v| v.as_str()) {
+            let id = self.cdp(&format!("__cdpNodeId({})", js_string(object_id)))?;
+            id.as_i64().filter(|n| *n >= 0).map(|n| n as NodeId)
+        } else {
+            return Ok(self.doc().document_id());
         };
-        match script.evaluate(source) {
-            Ok(value) => json!({ "result": cdp_result(value) }),
-            Err(JsError { message }) => json!({
-                "result": { "type": "object", "subtype": "error", "description": "Error" },
-                "exceptionDetails": { "text": message, "exception": { "type": "object", "subtype": "error", "description": message } },
-            }),
+        match node {
+            Some(id) if id < self.doc().len() => Ok(id),
+            _ => Err(CdpError { code: -32000, message: "No node with given id found".into() }),
         }
     }
 
-    fn call_function(&self, object_id: &str, declaration: &str) -> Value {
-        let Some(dom) = self.node_of(object_id) else {
-            return json!({ "type": "undefined" });
+    /// A prelude call answering in CDP JSON. A `{ "error": ... }` answer, a
+    /// failure of the plumbing rather than of page script, becomes a protocol
+    /// error.
+    fn cdp(&self, expression: &str) -> Result<Value, CdpError> {
+        let Some(script) = &self.script else {
+            return Err(not_yet("Runtime", "the JavaScript engine is not available in this process"));
         };
-        let doc = self.doc();
-        if declaration.contains("textContent") || declaration.contains("innerText") {
-            return json!({ "type": "string", "value": doc.text_content(dom).trim() });
+        let answer = script.cdp_expression(expression);
+        cdp_answer(answer)
+    }
+
+    /// `Runtime.evaluate`.
+    fn evaluate(&self, source: &str, by_value: bool, await_promise: bool) -> Result<Value, CdpError> {
+        let Some(script) = &self.script else {
+            return Err(not_yet("Runtime.evaluate", "the JavaScript engine is not available in this process"));
+        };
+        cdp_answer(script.cdp_evaluate(source, by_value, await_promise))
+    }
+
+    /// After script ran on a client's behalf: let what it set in motion run
+    /// (a handler's timers, a request's completion), then act on a navigation
+    /// or history move it asked for, outside the runtime.
+    fn after_script(&mut self, out: &mut EngineEmit) {
+        if let Some(script) = &self.script {
+            script.run_tasks(EVALUATE_BUDGET_MS, MAX_TASKS);
         }
-        if declaration.contains("outerHTML") || declaration.contains("innerHTML") {
-            return json!({ "type": "string", "value": serialize(&doc, dom) });
-        }
-        if declaration.contains("value") {
-            // A password field's value is not readable from script either.
-            if doc.attr(dom, "type") == Some("password") {
-                return json!({ "type": "string", "value": "" });
+        let moved = self.sync_script_url();
+        let (requested, steps) = match &self.script {
+            Some(script) => (script.state().take_requested_navigation(), script.state().take_requested_history()),
+            None => (None, 0),
+        };
+        if let Some(requested) = requested {
+            if self.script_navigation(requested) {
+                self.follow_script_navigation();
+                self.push_history();
+                self.emit_lifecycle(out);
             }
-            return json!({
-                "type": "string",
-                "value": doc.attr(dom, "value").unwrap_or("").to_string(),
-            });
+        } else if steps != 0 && self.go(steps) {
+            self.emit_lifecycle(out);
+        } else if let Some(url) = moved {
+            out(
+                "Page.navigatedWithinDocument",
+                json!({ "frameId": self.frame_id, "url": url, "navigationType": "historyApi" }),
+            );
         }
-        json!({ "type": "undefined" })
     }
 
     /// Moves `steps` entries through history, as `history.go(steps)` does.
@@ -635,60 +634,41 @@ impl Engine for HtmlEngine {
             }
             "Runtime.disable" | "Runtime.runIfWaitingForDebugger" => Ok(json!({})),
             "Runtime.releaseObject" => {
-                // Handles are append-only indices; releasing one is a no-op
-                // rather than a correctness issue.
+                if let Some(id) = params.get("objectId").and_then(|v| v.as_str()) {
+                    self.cdp(&format!("(__cdpRelease({}), '{{}}')", js_string(id)))?;
+                }
                 Ok(json!({}))
             }
+            // Groups are not tracked; a document's handles go with its context.
+            "Runtime.releaseObjectGroup" => Ok(json!({})),
 
-            // Real JavaScript, from a real engine.
+            // Real JavaScript, from a real engine. `back` in agent-browser is
+            // `history.back()` evaluated this way, which `after_script` acts on.
             "Runtime.evaluate" => {
-                let source =
-                    params.get("expression").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let result = self.evaluate(&source);
-                // Whatever the expression set in motion, a click handler's
-                // timers or a request's completion, gets to run.
-                if let Some(script) = &self.script {
-                    script.run_tasks(EVALUATE_BUDGET_MS, MAX_TASKS);
-                }
-
-                // A script may have asked to navigate or to move through
-                // history; act on it after the evaluation has finished rather
-                // than re-entering the runtime. `back` in agent-browser is
-                // `history.back()` evaluated this way.
-                let moved = self.sync_script_url();
-                let (requested, steps) = match &self.script {
-                    Some(script) => (
-                        script.state().take_requested_navigation(),
-                        script.state().take_requested_history(),
-                    ),
-                    None => (None, 0),
-                };
-                if let Some(requested) = requested {
-                    if self.script_navigation(requested) {
-                        self.follow_script_navigation();
-                        self.push_history();
-                        self.emit_lifecycle(out);
-                    }
-                } else if steps != 0 && self.go(steps) {
-                    self.emit_lifecycle(out);
-                } else if let Some(url) = moved {
-                    out(
-                        "Page.navigatedWithinDocument",
-                        json!({ "frameId": self.frame_id, "url": url, "navigationType": "historyApi" }),
-                    );
-                }
+                let source = params.get("expression").and_then(|v| v.as_str()).unwrap_or("");
+                let flag = |k: &str| params.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+                let result = self.evaluate(source, flag("returnByValue"), flag("awaitPromise"))?;
+                self.after_script(out);
                 Ok(result)
             }
 
             "Runtime.callFunctionOn" => {
-                let object_id =
-                    params.get("objectId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let declaration = params
-                    .get("functionDeclaration")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Ok(json!({ "result": self.call_function(&object_id, &declaration) }))
+                let flag = |k: &str| params.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+                let object_id = match params.get("objectId").and_then(|v| v.as_str()) {
+                    Some(id) => js_string(id),
+                    None => "null".to_string(),
+                };
+                let declaration = params.get("functionDeclaration").and_then(|v| v.as_str()).unwrap_or("");
+                let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!([])).to_string();
+                let result = self.cdp(&format!(
+                    "__cdpCall({object_id}, {}, {}, {}, {})",
+                    js_string(declaration),
+                    js_string(&arguments),
+                    flag("returnByValue"),
+                    flag("awaitPromise"),
+                ))?;
+                self.after_script(out);
+                Ok(result)
             }
 
             "Runtime.getIsolateId" => Ok(json!({ "id": "m1" })),
@@ -734,21 +714,27 @@ impl Engine for HtmlEngine {
             }
 
             "DOM.describeNode" => {
-                let node = params
-                    .get("nodeId")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|n| Self::dom_from_backend(n as usize))
-                    .unwrap_or_else(|| self.doc().document_id());
+                let node = self.node_param(params)?;
                 Ok(json!({ "node": self.describe(node) }))
             }
 
+            "DOM.requestNode" => {
+                let node = self.node_param(params)?;
+                Ok(json!({ "nodeId": Self::backend_id(node) }))
+            }
+
             "DOM.resolveNode" => {
-                let node = params
-                    .get("nodeId")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|n| Self::dom_from_backend(n as usize))
-                    .unwrap_or_else(|| self.doc().document_id());
-                Ok(json!({ "object": self.store_object(node) }))
+                let node = self.node_param(params)?;
+                Ok(json!({ "object": self.cdp(&format!("__cdpNode({node})"))? }))
+            }
+
+            "DOM.focus" => {
+                let node = self.node_param(params)?;
+                let object = self.cdp(&format!("__cdpNode({node})"))?;
+                let id = object.get("objectId").and_then(|v| v.as_str()).unwrap_or("");
+                self.cdp(&format!("__cdpCall({}, 'function () {{ this.focus(); }}', '[]', false, false)", js_string(id)))?;
+                self.after_script(out);
+                Ok(json!({}))
             }
 
             "DOM.getOuterHTML" => {
@@ -828,10 +814,22 @@ impl Engine for HtmlEngine {
             }
 
             // ---- Input ---------------------------------------------------
-            "Input.dispatchMouseEvent"
-            | "Input.dispatchKeyEvent"
-            | "Input.insertText"
-            | "Input.dispatchTouchEvent" => Err(not_yet(
+            // Keys and text go to the focused element, which needs no layout.
+            "Input.insertText" => {
+                let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                self.cdp(&format!("(__insertText({}), '{{}}')", js_string(text)))?;
+                self.after_script(out);
+                Ok(json!({}))
+            }
+            "Input.dispatchKeyEvent" => {
+                self.cdp(&format!("(__dispatchKey({}), '{{}}')", js_string(&params.to_string())))?;
+                self.after_script(out);
+                Ok(json!({}))
+            }
+
+            // A pointer lands on whatever is drawn at a point, and nothing is
+            // drawn without layout.
+            "Input.dispatchMouseEvent" | "Input.dispatchTouchEvent" => Err(not_yet(
                 method,
                 "input needs hit testing, which needs layout",
             )),
@@ -882,34 +880,17 @@ fn cookie_json(cookie: &Cookie) -> Value {
     value
 }
 
-/// Maps a JavaScript value onto the CDP shapes clients read.
-fn cdp_result(value: JsValue) -> Value {
-    match value {
-        JsValue::Undefined => json!({ "type": "undefined" }),
-        JsValue::Null => json!({ "type": "object", "subtype": "null", "value": Value::Null }),
-        JsValue::Bool(b) => json!({ "type": "boolean", "value": b }),
-        JsValue::Number(n) => json!({
-            "type": "number",
-            "value": number_json(n),
-            "description": if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n}") },
-        }),
-        JsValue::String(s) => json!({ "type": "string", "value": s }),
-        JsValue::Object { class, is_function } => json!({
-            "type": if is_function { "function" } else { "object" },
-            "className": class,
-            "description": class,
-        }),
-    }
+/// A JavaScript string literal for `text`. JSON's string syntax is a subset
+/// of JavaScript's.
+fn js_string(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
 }
 
-/// A whole number goes out as `42`, the way Chrome sends it, not `42.0`.
-/// `-0` stays a float so its sign survives.
-fn number_json(n: f64) -> Value {
-    let whole = n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0;
-    if whole && !(n == 0.0 && n.is_sign_negative()) {
-        json!(n as i64)
-    } else {
-        json!(n)
+/// A prelude answer, or the protocol error it carries.
+fn cdp_answer(answer: Value) -> Result<Value, CdpError> {
+    match answer.get("error").and_then(|e| e.as_str()) {
+        Some(message) => Err(CdpError { code: -32000, message: message.to_string() }),
+        None => Ok(answer),
     }
 }
 
@@ -979,18 +960,6 @@ pub(crate) fn class_for(doc: &Document, node: NodeId) -> &'static str {
         Some("audio") => "HTMLAudioElement",
         Some("dialog") => "HTMLDialogElement",
         _ => "HTMLElement",
-    }
-}
-
-fn describe_node(doc: &Document, node: NodeId) -> String {
-    match (&doc.node(node).data, doc.tag(node)) {
-        (NodeData::Text, _) => "#text".to_string(),
-        (NodeData::Document, _) => "#document".to_string(),
-        (_, Some(tag)) => {
-            let id = doc.attr(node, "id").map(|i| format!("#{i}")).unwrap_or_default();
-            format!("{tag}{id}")
-        }
-        _ => "node".to_string(),
     }
 }
 
@@ -1086,7 +1055,7 @@ mod tests {
     }
 
     fn evaluate(engine: &mut HtmlEngine, expression: &str) -> Value {
-        engine.evaluate(expression)
+        engine.evaluate(expression, false, false).expect(expression)
     }
 
     #[test]
@@ -1350,27 +1319,111 @@ mod tests {
     }
 
     #[test]
-    fn call_function_reads_text_from_the_real_document() {
-        let mut engine = engine_with("<body><p id='p'>hello there</p></body>");
+    fn an_evaluated_node_comes_back_as_a_handle_the_client_can_call() {
+        // agent-browser resolves a CSS selector this way, then focuses and
+        // reads through callFunctionOn.
+        let mut engine = engine_with("<body><p id='p' class='a b'>hello there</p></body>");
         let object = evaluate(&mut engine, "document.querySelector('#p')");
-        // Evaluate returns a description, not a handle; resolve through DOM.
+        assert_eq!(object["result"]["subtype"], "node");
         assert_eq!(object["result"]["className"], "HTMLParagraphElement");
+        assert_eq!(object["result"]["description"], "p#p.a.b");
+        let id = object["result"]["objectId"].as_str().expect("a handle").to_string();
 
-        let node = { let doc = engine.doc(); doc.find_id(doc.document_id(), "p") }.unwrap();
-        let handle = engine.store_object(node);
-        let id = handle["objectId"].as_str().unwrap().to_string();
-        let text = engine.call_function(&id, "function() { return this.textContent; }");
-        assert_eq!(text["value"], "hello there");
+        let text = dispatch(
+            &mut engine,
+            "Runtime.callFunctionOn",
+            json!({ "objectId": id, "functionDeclaration": "function(suffix) { return this.textContent + suffix; }",
+                    "arguments": [{ "value": "!" }], "returnByValue": true }),
+        );
+        assert_eq!(text["result"]["value"], "hello there!");
+
+        // The same node through DOM.resolveNode is the same handle.
+        let backend = { let doc = engine.doc(); doc.find_id(doc.document_id(), "p").unwrap() + 1 };
+        let resolved = dispatch(&mut engine, "DOM.resolveNode", json!({ "backendNodeId": backend }));
+        assert_eq!(resolved["object"]["objectId"], json!(id));
+        let described = dispatch(&mut engine, "DOM.describeNode", json!({ "objectId": id }));
+        assert_eq!(described["node"]["backendNodeId"], json!(backend));
     }
 
     #[test]
-    fn call_function_does_not_leak_a_password() {
-        let mut engine = engine_with("<body><input type='password' id='pw' value='secret'></body>");
-        let node = { let doc = engine.doc(); doc.find_id(doc.document_id(), "pw") }.unwrap();
-        let handle = engine.store_object(node);
-        let id = handle["objectId"].as_str().unwrap().to_string();
-        let value = engine.call_function(&id, "function() { return this.value; }");
-        assert_eq!(value["value"], "");
+    fn values_come_back_by_value_and_promises_are_awaited() {
+        let engine = engine_with("<body>x</body>");
+        let by_value = engine.evaluate("({ a: [1, 'two'] })", true, false).unwrap();
+        assert_eq!(by_value["result"]["value"], json!({ "a": [1, "two"] }));
+        let awaited =
+            engine.evaluate("new Promise((r) => setTimeout(() => r(7), 2000))", true, true).unwrap();
+        assert_eq!(awaited["result"]["value"], json!(7));
+        let rejected = engine.evaluate("Promise.reject(new Error('no'))", true, true).unwrap();
+        assert!(rejected["exceptionDetails"]["text"].as_str().unwrap().contains("no"), "{rejected}");
+        let never = engine.evaluate("new Promise(() => {})", true, true);
+        assert!(never.unwrap_err().message.contains("did not settle"));
+    }
+
+    #[test]
+    fn fill_types_into_a_react_style_controlled_input() {
+        // React tracks a controlled input's value through a property it
+        // defines on the element, and fires onChange only when the value the
+        // element reports differs from the one it tracked. This mimics that
+        // tracker, then fills the field the way agent-browser does.
+        let mut engine = engine_with(
+            "<body><form><input id='user' name='user'></form>\
+             <script></script></body>",
+        );
+        evaluate(
+            &mut engine,
+            "const input = document.getElementById('user');\
+             const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');\
+             let tracked = '';\
+             Object.defineProperty(input, 'value', { configurable: true,\
+               get() { return native.get.call(this); },\
+               set(v) { tracked = '' + v; native.set.call(this, v); } });\
+             globalThis.changes = [];\
+             input.addEventListener('input', () => { if (input.value !== tracked) { tracked = input.value; changes.push(tracked); } });",
+        );
+        let object = evaluate(&mut engine, "document.getElementById('user')");
+        let id = object["result"]["objectId"].as_str().unwrap().to_string();
+        dispatch(&mut engine, "Runtime.callFunctionOn", json!({ "objectId": id, "functionDeclaration": "function() { this.focus(); }" }));
+        dispatch(&mut engine, "Input.insertText", json!({ "text": "kim" }));
+        dispatch(&mut engine, "Input.dispatchKeyEvent", json!({ "type": "keyDown", "key": "Backspace", "code": "Backspace", "windowsVirtualKeyCode": 8 }));
+        dispatch(&mut engine, "Input.dispatchKeyEvent", json!({ "type": "keyDown", "key": "a", "code": "KeyA", "text": "a" }));
+        assert_eq!(evaluate(&mut engine, "changes.join(',')")["result"]["value"], "kim,ki,kia");
+        assert_eq!(evaluate(&mut engine, "document.getElementById('user').value")["result"]["value"], "kia");
+    }
+
+    #[test]
+    fn enter_in_a_field_submits_its_form() {
+        let (base, requests) = crate::test_server::serve_script(vec![
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 74\r\n\r\n\
+             <form action='/login' method='post'><input name='user'><button>go</button></form>"
+                .to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 22\r\n\r\n<title>welcome</title>"
+                .to_string(),
+        ]);
+        let mut engine = HtmlEngine::new("t");
+        engine.load(&format!("{base}/"));
+        evaluate(&mut engine, "document.querySelector('input').focus()");
+        dispatch(&mut engine, "Input.insertText", json!({ "text": "kim" }));
+        dispatch(&mut engine, "Input.dispatchKeyEvent", json!({ "type": "keyDown", "key": "Enter", "code": "Enter", "text": "\r", "windowsVirtualKeyCode": 13 }));
+        assert_eq!(engine.info().title, "welcome");
+        let _ = requests.recv().unwrap();
+        let login = requests.recv().unwrap();
+        assert!(login.starts_with("POST /login HTTP/1.1\r\n"), "{login}");
+        assert!(login.ends_with("\r\n\r\nuser=kim"), "{login}");
+    }
+
+    #[test]
+    fn a_typed_password_stays_out_of_the_tree_and_node_descriptions() {
+        // Page script reads it, as it must to log in, and so can a client
+        // calling into the page, as in Chrome. The accessibility tree and
+        // DOM.describeNode, which clients log and snapshot, never carry it.
+        let mut engine = engine_with("<body><input type='password' id='pw' aria-label='Password'></body>");
+        evaluate(&mut engine, "document.getElementById('pw').focus()");
+        dispatch(&mut engine, "Input.insertText", json!({ "text": "hunter2" }));
+        let tree = dispatch(&mut engine, "Accessibility.getFullAXTree", json!({}));
+        assert!(!tree.to_string().contains("hunter2"), "{tree}");
+        let backend = { let doc = engine.doc(); doc.find_id(doc.document_id(), "pw").unwrap() + 1 };
+        let described = dispatch(&mut engine, "DOM.describeNode", json!({ "backendNodeId": backend }));
+        assert!(!described.to_string().contains("hunter2"), "{described}");
     }
 
     #[test]

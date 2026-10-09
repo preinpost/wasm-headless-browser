@@ -165,7 +165,10 @@ impl Browser {
         session_id
     }
 
-    /// Handles one decoded CDP message. Returns the response, if the message
+    /// Handles one decoded CDP message.
+    ///
+    /// With `WHB_TRACE_CDP` set, every method, its parameters and its result
+    /// go to stderr, truncated. That is how to find out what a client sends. Returns the response, if the message
     /// expected one. Events go out through `out` before the response.
     pub fn handle(&mut self, msg: &Value, out: &mut BrowserEmit) -> Option<Value> {
         let id = msg.get("id").cloned();
@@ -177,6 +180,14 @@ impl Browser {
             Some(session_id) => self.handle_in_session(session_id, &method, &params, out),
             None => self.handle_at_browser(&method, &params, out),
         };
+
+        if trace_enabled() {
+            let shown = |v: &Value| v.to_string().chars().take(300).collect::<String>();
+            match &result {
+                Ok(value) => eprintln!("cdp {method} {} -> {}", shown(&params), shown(value)),
+                Err(e) => eprintln!("cdp {method} {} -> error {}", shown(&params), e.message),
+            }
+        }
 
         let id = id?;
         Some(match (result, session) {
@@ -334,4 +345,9 @@ impl Browser {
             _ => Ok(json!({})),
         }
     }
+}
+
+fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WHB_TRACE_CDP").is_some())
 }

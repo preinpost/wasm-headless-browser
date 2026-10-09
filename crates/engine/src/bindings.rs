@@ -46,6 +46,7 @@ const PRELUDE: &str = concat!(
     include_str!("prelude/65-fetch.js"),
     include_str!("prelude/70-window.js"),
     include_str!("prelude/80-global.js"),
+    include_str!("prelude/90-cdp.js"),
     "\n})();\n"
 );
 
