@@ -109,6 +109,7 @@ pub struct Document {
     viewport: (f64, f64),
     /// Computed styles and the parsed sheets behind them. See `style.rs`.
     pub(crate) style_cache: crate::style::StyleCache,
+    pub(crate) layout_cache: crate::layout::LayoutCache,
 }
 
 impl Default for Document {
@@ -129,6 +130,7 @@ impl Document {
             cssom: HashMap::new(),
             viewport: (800.0, 600.0),
             style_cache: Default::default(),
+            layout_cache: Default::default(),
         }
     }
 

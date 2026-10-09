@@ -25,6 +25,7 @@ pub mod css;
 pub mod dom;
 pub mod fetch;
 pub mod js;
+pub mod layout;
 pub mod parse;
 pub mod select;
 pub mod style;

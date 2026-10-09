@@ -644,15 +644,26 @@ class HTMLElement extends Element {
     return boxOf(this).height;
   }
   get offsetTop() {
-    return boxOf(this).top;
+    const parent = this.offsetParent;
+    return boxOf(this).top - (parent ? boxOf(parent).top : 0);
   }
   get offsetLeft() {
-    return boxOf(this).left;
+    const parent = this.offsetParent;
+    return boxOf(this).left - (parent ? boxOf(parent).left : 0);
   }
-  // No layout, so no element is rendered, and an unrendered element has no
-  // offset parent. jQuery's `:visible` reads this.
+  // The nearest positioned ancestor, or the body. An element that is not
+  // rendered, or is fixed, has none. jQuery's `:visible` reads this.
   get offsetParent() {
-    return null;
+    const id = own(this);
+    if (!api.isConnected(id) || this === document.body || this === document.documentElement) return null;
+    for (let n = id; n !== undefined; n = api.parent(n)) {
+      if (isElementId(n) && api.computedValue(n, 'display') === 'none') return null;
+    }
+    if (api.computedValue(id, 'position') === 'fixed') return null;
+    for (let p = api.parent(id); p !== undefined && isElementId(p); p = api.parent(p)) {
+      if (api.computedValue(p, 'position') !== 'static' || api.tagName(p) === 'body') return wrap(p);
+    }
+    return document.body;
   }
   click() {
     if (clicking.has(this) || isDisabled(this)) return;

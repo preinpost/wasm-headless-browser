@@ -12,7 +12,8 @@
 # `press Enter` submits through the page's own handler, the session survives
 # a reload, and the password never shows up in a snapshot or an error.
 #
-# Not covered: `click`, which needs hit testing, which needs layout.
+# The wrong password is submitted by clicking the button, the right one by
+# pressing Enter, so both paths are covered.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -121,7 +122,7 @@ check "the submit button is there" 'button "Sign in"' "$snap"
 echo "a wrong password"
 ab fill "@$(ref_of User "$snap")" kim >/dev/null
 ab fill "@$(ref_of Password "$snap")" wrong-password >/dev/null
-ab press Enter >/dev/null
+check "clicking the button submits" "Done" "$(ab click "@$(grep -o 'button "Sign in" \[ref=e[0-9]*' <<<"$snap" | grep -o 'e[0-9]*$')")"
 check "the page reports the failure" 'alert.*Invalid credentials\|Invalid credentials' "$(ab snapshot)"
 check_absent "the failed attempt left no sid" "sid=" "$(ab cookies get)"
 

@@ -528,6 +528,39 @@ impl HtmlEngine {
         self.jar().set(cookie, cookies::now())
     }
 
+    /// `DOM.getBoxModel`'s model: the border box from the layout, and the
+    /// content, padding and margin boxes from the computed widths around it.
+    fn box_model(&self, node: NodeId) -> Option<Value> {
+        let doc = self.doc();
+        let rect = crate::layout::document_layout(&doc).rect(node)?;
+        let styles = crate::style::document_styles(&doc);
+        let style = styles.get(node);
+        let px = |name: &str| -> f64 {
+            style
+                .and_then(|s| crate::style::length_px(s.get(name), s.font_size(), 16.0, rect.width))
+                .unwrap_or(0.0)
+        };
+        let border = |side: &str| -> f64 {
+            let none = style.is_none_or(|s| matches!(s.get(&format!("border-{side}-style")), "none" | "hidden"));
+            if none { 0.0 } else { px(&format!("border-{side}-width")) }
+        };
+        let side = |f: &dyn Fn(&str) -> f64| [f("top"), f("right"), f("bottom"), f("left")];
+        let [bt, br, bb, bl] = side(&border);
+        let [pt, pr, pb, pl] = side(&|s| px(&format!("padding-{s}")));
+        let [mt, mr, mb, ml] = side(&|s| px(&format!("margin-{s}")));
+        let (x, y, w, h) = (rect.x, rect.y, rect.width, rect.height);
+        let padding = (x + bl, y + bt, w - bl - br, h - bt - bb);
+        let content = (padding.0 + pl, padding.1 + pt, padding.2 - pl - pr, padding.3 - pt - pb);
+        Some(json!({
+            "content": quad(content.0, content.1, content.2.max(0.0), content.3.max(0.0)),
+            "padding": quad(padding.0, padding.1, padding.2.max(0.0), padding.3.max(0.0)),
+            "border": quad(x, y, w, h),
+            "margin": quad(x - ml, y - mt, w + ml + mr, h + mt + mb),
+            "width": w.round() as i64,
+            "height": h.round() as i64,
+        }))
+    }
+
     /// `DOM.describeNode`-shaped output for one node.
     fn describe(&self, node: NodeId) -> Value {
         let doc = self.doc();
@@ -654,7 +687,7 @@ impl Engine for HtmlEngine {
 
             "Page.captureScreenshot" => Err(not_yet(
                 method,
-                "there is no layout or rasterizer yet, so a screenshot would be blank",
+                "there is no rasterizer yet, so a screenshot would be blank",
             )),
 
             // ---- Runtime -------------------------------------------------
@@ -758,6 +791,29 @@ impl Engine for HtmlEngine {
                 Ok(json!({ "object": self.cdp(&format!("__cdpNode({node})"))? }))
             }
 
+            // Boxes from the layout. agent-browser clicks a snapshot ref at
+            // the centre of its content quad.
+            "DOM.getBoxModel" => {
+                let node = self.node_param(params)?;
+                let model = self.box_model(node).ok_or_else(|| CdpError {
+                    code: -32000,
+                    message: "Could not compute box model.".into(),
+                })?;
+                Ok(json!({ "model": model }))
+            }
+            "DOM.getContentQuads" => {
+                let node = self.node_param(params)?;
+                let doc = self.doc();
+                let quads: Vec<Value> = crate::layout::document_layout(&doc)
+                    .rect(node)
+                    .filter(|r| r.width > 0.0 && r.height > 0.0)
+                    .map(|r| vec![json!(quad(r.x, r.y, r.width, r.height))])
+                    .unwrap_or_default();
+                Ok(json!({ "quads": quads }))
+            }
+            // Nothing scrolls yet; everything is where it is.
+            "DOM.scrollIntoViewIfNeeded" => Ok(json!({})),
+
             "DOM.focus" => {
                 let node = self.node_param(params)?;
                 let object = self.cdp(&format!("__cdpNode({node})"))?;
@@ -857,12 +913,13 @@ impl Engine for HtmlEngine {
                 Ok(json!({}))
             }
 
-            // A pointer lands on whatever is drawn at a point, and nothing is
-            // drawn without layout.
-            "Input.dispatchMouseEvent" | "Input.dispatchTouchEvent" => Err(not_yet(
-                method,
-                "input needs hit testing, which needs layout",
-            )),
+            // The pointer lands on what the layout puts at the point.
+            "Input.dispatchMouseEvent" => {
+                self.cdp(&format!("(__dispatchMouse({}), '{{}}')", js_string(&params.to_string())))?;
+                self.after_script(out);
+                Ok(json!({}))
+            }
+            "Input.dispatchTouchEvent" => Err(not_yet(method, "touch input is not implemented")),
 
             // ---- Emulation -----------------------------------------------
             "Emulation.setDeviceMetricsOverride" => {
@@ -909,6 +966,11 @@ fn cookie_json(cookie: &Cookie) -> Value {
         value["sameSite"] = json!(same_site);
     }
     value
+}
+
+/// A CDP quad: the four corners, clockwise from the top left.
+fn quad(x: f64, y: f64, width: f64, height: f64) -> Vec<f64> {
+    vec![x, y, x + width, y, x + width, y + height, x, y + height]
 }
 
 /// A JavaScript string literal for `text`. JSON's string syntax is a subset
@@ -1443,6 +1505,38 @@ mod tests {
     }
 
     #[test]
+    fn the_mouse_clicks_what_is_at_the_point() {
+        let mut engine = engine_with(
+            "<style>body { margin: 0 } button { display: block; width: 100px; height: 40px }\
+             #cover { position: fixed; top: 100px; left: 0; width: 200px; height: 50px; z-index: 5 }</style>\
+             <body><button id='a'>A</button><button id='b'>B</button><div id='cover'></div>\
+             <button id='c' style='margin-top: 30px'>C</button></body>",
+        );
+        evaluate(
+            &mut engine,
+            "globalThis.log = []; for (const id of ['a', 'b', 'c', 'cover']) \
+               document.getElementById(id).addEventListener('click', () => log.push(id));\
+             document.getElementById('b').addEventListener('mousedown', () => log.push('down'));",
+        );
+        let click = |engine: &mut HtmlEngine, x: f64, y: f64| {
+            for kind in ["mousePressed", "mouseReleased"] {
+                dispatch(engine, "Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 }));
+            }
+        };
+        click(&mut engine, 50.0, 60.0);
+        assert_eq!(evaluate(&mut engine, "document.activeElement.id")["result"]["value"], "b");
+        // The fixed cover sits over C, and takes its click; pressing
+        // something that cannot take focus takes it away.
+        click(&mut engine, 50.0, 120.0);
+        assert_eq!(evaluate(&mut engine, "log.join(',')")["result"]["value"], "down,b,cover");
+        assert_eq!(evaluate(&mut engine, "document.activeElement.tagName")["result"]["value"], "BODY");
+        // What the client measures is what it hits.
+        let rect = evaluate(&mut engine, "JSON.stringify(document.getElementById('a').getBoundingClientRect())");
+        assert_eq!(rect["result"]["value"], r#"{"x":0,"y":0,"width":100,"height":40,"top":0,"right":100,"bottom":40,"left":0}"#);
+        assert_eq!(evaluate(&mut engine, "document.elementFromPoint(50, 20).id")["result"]["value"], "a");
+    }
+
+    #[test]
     fn a_typed_password_stays_out_of_the_tree_and_node_descriptions() {
         // Page script reads it, as it must to log in, and so can a client
         // calling into the page, as in Chrome. The accessibility tree and
@@ -1497,7 +1591,7 @@ mod tests {
     fn methods_that_would_lie_return_an_error_instead() {
         let mut engine = engine_with("<body>x</body>");
         let mut events = Vec::new();
-        for method in ["Page.captureScreenshot", "Input.dispatchMouseEvent"] {
+        for method in ["Page.captureScreenshot", "Input.dispatchTouchEvent"] {
             let mut sink = |m: &str, p: Value| events.push((m.to_string(), p));
             let error = engine.dispatch(method, &Value::Null, &mut sink).expect_err(method);
             assert!(

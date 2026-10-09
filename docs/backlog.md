@@ -97,6 +97,8 @@ DOM은 가두지 않았습니다. `Arc<Mutex<Document>>`로 엔진과 공유하�
 | QuickJS를 넣은 WASIX 모듈은 1.6MB다. TLS를 넣으면 2.3MB다 | 이 문서의 §1.5, [docs/wasix.md](wasix.md) |
 | WASIX에서 rustls + ring이 TLS 1.3으로 동작한다. 참조 사이트 인증서는 공개 루트로 검증된다 | [docs/wasix.md](wasix.md) |
 | example.com은 이제 본문이 문단 하나와 `<script src=/s.js>`뿐이다. 외부 스크립트 없이는 제목과 링크가 없다 | 2026-10-09 측정 |
+| 참조 사이트 로그인 화면을 800×600에서 Chrome(Playwright headless shell)과 비교하면 입력란·`.login-form`·`#wrap`·저작권 문구의 위치와 크기가 같거나 1px 차이다. 체크박스만 x가 8px 다르다. 아이디 입력란 클릭은 포커스를, "체크박스" 글자 클릭은 체크를 두 엔진에서 똑같이 바꾸고, 숨은 체크박스를 ref로 누르면 두 엔진 모두 빗나간다(`div.login-background`가 맞는다) | 2026-10-09 |
+| WASIX 모듈은 레이아웃까지 넣어 3.3MB다 | 같은 날 |
 | 캐스케이드를 넣은 뒤 참조 사이트 "다음" 버튼의 계산 스타일은 `display: block`, `cursor: pointer`, `width: 100%`, `height: 54px`, 배경 `#00aaff`(`a CSS variable`에서), 13.33px이다. 전체 스냅샷은 23줄이다 | 2026-10-09 |
 | 참조 사이트의 숨은 화면(추가 인증 선택, OTP, 실패 대화상자)은 CSS 클래스가 아니라 인라인 `style="display: none"`으로 숨는다. 인라인 스타일만 반영해도 로그인 화면의 인터랙티브 스냅샷이 25개 넘던 것에서 4개(첫 입력란, 아이디, 다음, 체크박스)로 준다 | 2026-10-09 측정 (M1.6) |
 | 참조 사이트에 가짜 계정으로 로그인하면 실패가 화면에 나온다. Enter 한 번에 아이디 단계(`POST /api/login-step`, a result code), 버튼이 "로그인"으로 바뀐 뒤 Enter 한 번 더에 인증(a result code "실패 문구")이고, 그 문구가 폼 아래 문단과 확인 대화상자로 스냅샷에 나온다. 클릭 없이 Enter만으로 된다 | 2026-10-09, 사용자 승인 아래 가짜 계정 `nonexistent-test-account`로 |
@@ -150,7 +152,8 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
    `press Enter` → 로그인 후 화면 → 새로고침 뒤 세션 유지까지 네이티브와 WASIX에서
    검사한다(18개). 참조 사이트에서는 `fill`까지 확인했고, 실제 제출은 하지 않았다
 4. **클릭.** 실제 화면을 측정(M1.6)한 뒤 레이아웃과 히트테스트(M1.4),
-   마우스 이벤트(M2.5)
+   마우스 이벤트(M2.5). **완료.** 참조 사이트 로그인 화면이 Chrome과 거의 같은
+   자리에 배치되고, 클릭 결과도 같다
 5. **자격증명.** 비밀번호가 어디로도 새지 않게 한다 (M4). 3단계부터 염두에 둔다
 
 검증은 로컬 로그인 픽스처로 합니다. 쿠키를 발급하는 작은 서버와 JS로
@@ -211,9 +214,17 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       CSSOM의 `insertRule`에서 온다. 문서 버전이 그대로면 캐시를 쓰고, 시트는 텍스트가
       바뀔 때만 다시 파싱한다. 접근성 트리와 `getComputedStyle`이 이것을 쓴다.
       `:focus` 규칙은 캐스케이드에 들어가지 않는다(포커스가 스크립트 쪽 상태라서).
-- [ ] M1.4 `taffy`로 블록·플렉스 레이아웃을 근사한다. 목표는 픽셀이 아니라
+- [x] M1.4 레이아웃(`layout.rs`). taffy 0.14가 블록·플렉스·그리드·float를 맡고,
+      그 위에 근사한다: 인라인 흐름은 줄바꿈하는 행으로, 글자 폭은 글꼴 크기로
+      (한글·CJK는 1em), 폼 컨트롤은 Chrome 기본 크기로, `absolute`는 가까운 위치
+      지정 조상에, `fixed`는 뷰포트에, `transform`은 이동만, `calc()`는 퍼센트만.
+      칠하는 순서는 쌓임 단계·레이어·문서 순서다. 박스와 히트 테스트가 같은
+      레이아웃을 써서, 요소가 보고하는 자리를 누르면 그 요소가 눌린다.
+      남은 근사: 기준선 정렬 없음, 스크롤 없음(`scrollIntoView`는 아무것도 안 함),
+      회전·확대 무시, 쌓임 맥락은 한 단계로 평평하게. 목표는 픽셀이 아니라
       `getBoundingClientRect`가 0이 아닌 사각형을 돌려주고 가시성을 판정하는
       것이다. 최소 CSS 캐스케이드(태그·클래스·인라인)가 함께 필요하다.
+- [ ] M1.6 측정은 참조 사이트 로그인 화면으로 했다(아래 §2 표). 다른 화면은 아직이다.
 - [ ] M1.5 `engine-fake`의 PNG 렌더러를 실제 레이아웃에 연결한다. 현재는
       저장 방식 deflate라 결과가 큽니다. `miniz_oxide` 도입을 검토한다.
 - [ ] M1.6 같은 캡처 방식으로 CDP 표면을 다시 측정한다. 실제 사이트를
@@ -270,8 +281,11 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 - [ ] M2.11 ES 모듈(`type=module`)과 `import()`.
 - [ ] M2.12 `popstate`. 지금은 `pushState`로 만든 항목으로 뒤로 가면 그 URL을
       새로 읽는다.
-- [ ] M2.5 클릭 자동화를 연결한다. `Input.dispatchMouseEvent`와 히트테스트가
-      만나야 비로소 `click`이 동작한다.
+- [x] M2.5 마우스. `Input.dispatchMouseEvent`가 히트 테스트로 대상을 찾고
+      pointer/mouse over·out·enter·leave·move·down·up, 포커스 이동, `click`과 그
+      기본 동작, `dblclick`, `contextmenu`, `wheel`을 브라우저 순서로 낸다. 누른
+      요소와 뗀 요소가 다르면 공통 조상이 클릭된다. `DOM.getBoxModel`·
+      `getContentQuads`가 같은 레이아웃에서 나와서 agent-browser의 ref 클릭이 된다.
 - [x] M2.6 이벤트 루프. 스크립트마다 마이크로태스크 체크포인트를 돌고,
       타이머·애니메이션 프레임·네트워크 완료는 **가상 시계** 위의 작업 큐로 돈다.
       다음 작업이 미래면 시계를 건너뛰므로 5초 타이머가 5초를 쓰지 않는다.
@@ -386,6 +400,12 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
   찍어서 참조 사이트 시험 때 가짜 비밀번호가 stderr에 남았다. 이제 입력 텍스트와 키
   이벤트의 글자는 길이만 남는다. 다른 메서드는 보낸 그대로 찍으므로, 표현식에 비밀을
   넣는 클라이언트는 거기서 드러난다.
+- **taffy 0.14는 잎 노드의 배치 전체를 측정 함수에 맡긴다.** 측정 함수는
+  `taffy::compute_leaf_layout`에 내용 크기만 넘겨야 한다. 그렇지 않으면 자식 없는
+  `div`의 `height: 50px`가 무시되고 0×0이 된다.
+- **Chrome과 레이아웃을 비교하려면** `~/Library/Caches/ms-playwright`의 headless
+  shell을 `agent-browser --executable-path`로 띄운다. 사용자의 Chrome 프로필을
+  건드리지 않는다. 둘 다 `set viewport 800 600`으로 맞춘다.
 - **클라이언트가 무엇을 보내는지는 `WHB_TRACE_CDP=1`로 본다.** 모든 CDP 요청과
   응답이 잘려서 stderr로 나온다. 예를 들어 agent-browser의 `fill`은
   `DOM.resolveNode` → `callFunctionOn(focus)` → `callFunctionOn(값 지우기)` →

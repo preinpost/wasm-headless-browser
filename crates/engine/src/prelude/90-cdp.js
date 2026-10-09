@@ -363,7 +363,108 @@ function dispatchKey(json) {
   keyDefault(target, init.key, init);
 }
 
+// ---- the mouse --------------------------------------------------------------
+
+const mouse = { hover: null, pressed: null, pressedButton: -1 };
+const BUTTONS = { left: 0, middle: 1, right: 2, back: 3, forward: 4 };
+
+function commonAncestor(a, b) {
+  for (let n = a; n; n = n.parentNode) if (n.contains(b)) return n;
+  return null;
+}
+
+// `Input.dispatchMouseEvent`. The target is whatever the layout puts at the
+// point, the events come in a browser's order, and a press then release
+// on the same element (or inside the same ancestor) is a click, with the
+// click's default action: follow a link, submit a form, toggle a checkbox.
+function dispatchMouse(json) {
+  const p = JSON.parse(json);
+  const x = Number(p.x) || 0;
+  const y = Number(p.y) || 0;
+  const target = wrap(api.hitTest(x, y)[0]) ?? document.documentElement;
+  if (!target) return;
+  const modifiers = p.modifiers | 0;
+  const button = BUTTONS[p.button] ?? 0;
+  const init = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: globalThis,
+    clientX: x,
+    clientY: y,
+    screenX: x,
+    screenY: y,
+    button: p.button === 'none' ? 0 : button,
+    buttons: p.buttons | 0,
+    altKey: !!(modifiers & 1),
+    ctrlKey: !!(modifiers & 2),
+    metaKey: !!(modifiers & 4),
+    shiftKey: !!(modifiers & 8),
+    detail: p.clickCount | 0,
+    pointerId: 1,
+    pointerType: 'mouse',
+    isPrimary: true,
+  };
+
+  // Every event at a point first moves the pointer there.
+  if (mouse.hover !== target) {
+    const previous = mouse.hover;
+    if (previous && previous.isConnected) {
+      dispatch(previous, new PointerEvent('pointerout', { ...init, relatedTarget: target }));
+      dispatch(previous, new MouseEvent('mouseout', { ...init, relatedTarget: target }));
+      dispatch(previous, new PointerEvent('pointerleave', { ...init, bubbles: false, cancelable: false, relatedTarget: target }));
+      dispatch(previous, new MouseEvent('mouseleave', { ...init, bubbles: false, cancelable: false, relatedTarget: target }));
+    }
+    mouse.hover = target;
+    dispatch(target, new PointerEvent('pointerover', { ...init, relatedTarget: previous }));
+    dispatch(target, new MouseEvent('mouseover', { ...init, relatedTarget: previous }));
+    dispatch(target, new PointerEvent('pointerenter', { ...init, bubbles: false, cancelable: false, relatedTarget: previous }));
+    dispatch(target, new MouseEvent('mouseenter', { ...init, bubbles: false, cancelable: false, relatedTarget: previous }));
+  }
+
+  switch (p.type) {
+    case 'mouseMoved':
+      dispatch(target, new PointerEvent('pointermove', init));
+      dispatch(target, new MouseEvent('mousemove', init));
+      return;
+    case 'mousePressed': {
+      dispatch(target, new PointerEvent('pointerdown', init));
+      const proceed = dispatch(target, new MouseEvent('mousedown', init));
+      mouse.pressed = target;
+      mouse.pressedButton = button;
+      // A press moves focus to what was pressed, or away from whatever had it.
+      if (proceed && button === 0) {
+        let focusTarget = target;
+        while (focusTarget && focusTarget.nodeType === 1 && !focusable(focusTarget)) focusTarget = focusTarget.parentElement;
+        if (focusTarget && focusTarget.nodeType === 1) focusTarget.focus();
+        else if (focusedElement()) moveFocus(null);
+      }
+      if (button === 2) dispatch(target, new MouseEvent('contextmenu', init));
+      return;
+    }
+    case 'mouseReleased': {
+      dispatch(target, new PointerEvent('pointerup', init));
+      dispatch(target, new MouseEvent('mouseup', init));
+      const pressed = mouse.pressed;
+      mouse.pressed = null;
+      if (!pressed || mouse.pressedButton !== button) return;
+      const clicked = pressed === target ? target : commonAncestor(pressed, target);
+      if (!clicked) return;
+      if (button === 0) {
+        if (!isDisabled(clicked)) activate(clicked, new PointerEvent('click', { ...init, detail: Math.max(1, init.detail) }));
+        if (init.detail === 2) dispatch(clicked, new MouseEvent('dblclick', { ...init, detail: 2 }));
+      } else if (button === 1) {
+        dispatch(clicked, new PointerEvent('auxclick', init));
+      }
+      return;
+    }
+    case 'mouseWheel':
+      dispatch(target, new WheelEvent('wheel', { ...init, deltaX: Number(p.deltaX) || 0, deltaY: Number(p.deltaY) || 0 }));
+  }
+}
+
 for (const [name, fn] of Object.entries({
+  __dispatchMouse: dispatchMouse,
   __cdpResult: cdpResult,
   __cdpSettled: cdpSettled,
   __cdpCall: cdpCall,

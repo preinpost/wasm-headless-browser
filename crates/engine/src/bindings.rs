@@ -614,9 +614,31 @@ fn put_mutations<'js>(
 }
 
 fn put_geometry<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -> Result<(), JsError> {
-    // No layout yet, so every box is zero-sized. That makes every element "not
-    // visible" to a client, which is the safe direction to be wrong in.
-    install_fn!(ctx, api, "rect", |_id: usize| { vec![0.0f64, 0.0, 0.0, 0.0] });
+    // Boxes and hit testing share one layout (layout.rs), so the box an
+    // element reports is where a click on it lands. An element without a
+    // box (not rendered, or not in the document) reports zeroes.
+    {
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "rect", move |id: usize| {
+            with_doc(&doc, |d| {
+                crate::layout::document_layout(d)
+                    .rect(id)
+                    .map(|r| vec![r.x, r.y, r.width, r.height])
+                    .unwrap_or_else(|| vec![0.0; 4])
+            })
+            .unwrap_or_else(|| vec![0.0; 4])
+        });
+    }
+    {
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "hitTest", move |x: f64, y: f64| {
+            with_doc(&doc, |d| {
+                let styles = crate::style::document_styles(d);
+                crate::layout::document_layout(d).hits(&styles, x, y)
+            })
+            .unwrap_or_default()
+        });
+    }
 
     {
         // The cascade's answer for one property, or its initial value.
@@ -1033,13 +1055,15 @@ mod tests {
     }
 
     #[test]
-    fn geometry_is_zero_because_there_is_no_layout() {
-        let (js, _) = host("<body><p>x</p></body>");
-        assert_eq!(text(&js, "document.body.getBoundingClientRect().width"), "0");
-        assert_eq!(text(&js, "document.body.getBoundingClientRect().width > 0"), "false");
+    fn geometry_comes_from_the_layout() {
+        let (js, _) = host("<body><p id='p'>x</p></body>");
+        // 800 wide, less the body's 8px margins.
+        assert_eq!(text(&js, "document.body.getBoundingClientRect().width"), "784");
+        assert_eq!(text(&js, "document.getElementById('p').getBoundingClientRect().height > 0"), "true");
+        assert_eq!(text(&js, "document.getElementById('p').offsetParent === document.body"), "true");
         assert_eq!(
-            text(&js, "JSON.stringify(document.body.getBoundingClientRect())"),
-            r#"{"x":0,"y":0,"width":0,"height":0,"top":0,"right":0,"bottom":0,"left":0}"#
+            text(&js, "Object.keys(document.body.getBoundingClientRect().toJSON()).join()"),
+            "x,y,width,height,top,right,bottom,left"
         );
     }
 

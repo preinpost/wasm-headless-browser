@@ -179,14 +179,16 @@ class Document extends Node {
     if (node.parentNode) removeNode(node);
     return node;
   }
-  // No layout, so there is nothing at any point. `null` reads as "no
-  // blocker", which lets a client's click path proceed; the input methods
-  // themselves refuse until layout exists.
-  elementFromPoint() {
-    return null;
+  // The engine's hit test, which is what a click at the point would land
+  // on. Points outside the viewport have nothing, as the specification says.
+  elementFromPoint(x, y) {
+    return this.elementsFromPoint(x, y)[0] ?? null;
   }
-  elementsFromPoint() {
-    return [];
+  elementsFromPoint(x, y) {
+    x = Number(x);
+    y = Number(y);
+    if (!(x >= 0 && y >= 0 && x < api.viewportWidth() && y < api.viewportHeight())) return [];
+    return wrapAll(api.hitTest(x, y));
   }
   caretRangeFromPoint() {
     return null;

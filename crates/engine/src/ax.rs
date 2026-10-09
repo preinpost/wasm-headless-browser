@@ -390,8 +390,10 @@ fn control_value(doc: &Document, id: NodeId) -> Option<String> {
             Some(doc.current_value(id))
         }
         "checkbox" | "radio" | "switch" => {
-            let checked = (doc.is_tag(id, "input") && doc.current_checked(id))
-                || matches!(doc.attr(id, "aria-checked"), Some("true") | Some("mixed"));
+            if doc.attr(id, "aria-checked") == Some("mixed") {
+                return Some("mixed".to_string());
+            }
+            let checked = (doc.is_tag(id, "input") && doc.current_checked(id)) || doc.attr(id, "aria-checked") == Some("true");
             Some(if checked { "true" } else { "false" }.to_string())
         }
         _ => None,
@@ -596,13 +598,22 @@ pub fn to_cdp(nodes: &[AxNode]) -> Value {
         if !node.name.is_empty() {
             entry["name"] = json!({ "type": "computedString", "value": node.name });
         }
+        let mut properties = Vec::new();
         if let Some(level) = node.level {
-            entry["properties"] = json!([
-                { "name": "level", "value": { "type": "integer", "value": level } }
-            ]);
+            properties.push(json!({ "name": "level", "value": { "type": "integer", "value": level } }));
         }
-        if let Some(value) = &node.value {
-            entry["value"] = json!({ "type": "string", "value": value });
+        // A toggle's state is the `checked` property, as Chrome reports it,
+        // not a value.
+        let toggle = matches!(node.role, "checkbox" | "radio" | "switch" | "menuitemcheckbox" | "menuitemradio");
+        match &node.value {
+            Some(state) if toggle => {
+                properties.push(json!({ "name": "checked", "value": { "type": "tristate", "value": state } }));
+            }
+            Some(value) => entry["value"] = json!({ "type": "string", "value": value }),
+            None => {}
+        }
+        if !properties.is_empty() {
+            entry["properties"] = json!(properties);
         }
         out.push(entry);
     }
@@ -771,10 +782,12 @@ mod tests {
         let nodes = build(&doc);
         let values: Vec<Option<String>> =
             nodes.iter().filter(|n| n.role == "checkbox").map(|n| n.value.clone()).collect();
-        assert_eq!(
-            values,
-            vec![Some("true".into()), Some("false".into()), Some("true".into())]
-        );
+        assert_eq!(values, vec![Some("true".into()), Some("false".into()), Some("mixed".into())]);
+        // As Chrome reports it: a `checked` property, not a value.
+        let cdp = to_cdp(&nodes);
+        let first = cdp["nodes"].as_array().unwrap().iter().find(|n| n["role"]["value"] == "checkbox").unwrap();
+        assert_eq!(first["properties"][0], serde_json::json!({ "name": "checked", "value": { "type": "tristate", "value": "true" } }));
+        assert!(first.get("value").is_none());
     }
 
     #[test]

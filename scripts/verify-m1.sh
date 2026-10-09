@@ -10,8 +10,10 @@
 # The fixture carries an inline script, so the page's own JavaScript runs too,
 # and `eval` goes through the real engine.
 #
-# Not covered, and asserted as such: layout. Screenshots and input are expected
-# to fail with a message that says why.
+# Layout is approximate, so clicks and visibility are checked, not pixels.
+#
+# Not covered, and asserted as such: screenshots, which need a rasterizer.
+# They are expected to fail with a message that says why.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -95,7 +97,7 @@ check "link names come from text" 'link "Docs"' "$snap"
 check "headings report their level" 'heading "Real Page Fixture" \[level=1' "$snap"
 check "a label names its textbox" 'textbox "Search terms"' "$snap"
 check "a password field is a textbox" 'textbox "Password"' "$snap"
-check "a checkbox reports its state" 'checkbox "Remember me".*: true' "$snap"
+check "a checkbox reports its state" 'checkbox "Remember me".*checked=true' "$snap"
 check "a button name from content" 'button "Go"' "$snap"
 check "aria-label names a button" 'button "Close dialog"' "$snap"
 check "list items" 'listitem "first item"' "$snap"
@@ -121,6 +123,14 @@ check "the page's script runs again after back" 'heading "Added by page script"'
 check "forward goes to the second page" "page=2" \
   "$(agent-browser --cdp "$BASE" forward >/dev/null 2>&1; agent-browser --cdp "$BASE" get url 2>&1 || true)"
 
+echo "layout and clicks"
+check "a visible field is visible" "true" "$(agent-browser --cdp "$BASE" is visible '#q' 2>&1 || true)"
+check "a hidden element is not" "false" "$(agent-browser --cdp "$BASE" is visible 'div[hidden]' 2>&1 || true)"
+check "click lands on the checkbox" "Done" "$(agent-browser --cdp "$BASE" click '#remember' 2>&1 || true)"
+check "and toggles it" "false" "$(agent-browser --cdp "$BASE" eval "document.getElementById('remember').checked" 2>&1 || true)"
+check "clicking its label toggles it back" "true" \
+  "$(agent-browser --cdp "$BASE" click 'label[for=remember]' >/dev/null 2>&1; agent-browser --cdp "$BASE" eval "document.getElementById('remember').checked" 2>&1 || true)"
+
 echo "cookies"
 check "a cookie can be set" "Done" "$(agent-browser --cdp "$BASE" cookies set whb_token abc 2>&1 || true)"
 check "the jar returns it" "whb_token=abc" "$(agent-browser --cdp "$BASE" cookies get 2>&1 || true)"
@@ -135,8 +145,8 @@ check_absent "hidden subtrees are excluded" "you should not see this" "$snap"
 
 echo "what must be reported rather than faked"
 shot="$(agent-browser --cdp "$BASE" screenshot /tmp/whb-m1-shot.png 2>&1 || true)"
-check "screenshot explains that layout is missing" "not implemented yet" "$shot"
-check "screenshot mentions layout" "no layout" "$shot"
+check "screenshot explains that it is missing" "not implemented yet" "$shot"
+check "screenshot says why" "no rasterizer" "$shot"
 if [[ -f /tmp/whb-m1-shot.png ]]; then
   printf '  FAIL a screenshot file was written despite the error\n'
   fail=$((fail + 1))
