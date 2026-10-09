@@ -12,8 +12,8 @@
 #
 # Layout is approximate, so clicks and visibility are checked, not pixels.
 #
-# Not covered, and asserted as such: screenshots, which need a rasterizer.
-# They are expected to fail with a message that says why.
+# Screenshots are checked for what they are, PNGs of the right size, not for
+# their pixels; the engine's own tests look at pixels.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -143,18 +143,17 @@ check_absent "clear empties the jar" "whb_" "$(agent-browser --cdp "$BASE" cooki
 echo "what must stay out"
 check_absent "hidden subtrees are excluded" "you should not see this" "$snap"
 
-echo "what must be reported rather than faked"
-shot="$(agent-browser --cdp "$BASE" screenshot /tmp/whb-m1-shot.png 2>&1 || true)"
-check "screenshot explains that it is missing" "not implemented yet" "$shot"
-check "screenshot says why" "no rasterizer" "$shot"
-if [[ -f /tmp/whb-m1-shot.png ]]; then
-  printf '  FAIL a screenshot file was written despite the error\n'
-  fail=$((fail + 1))
-  rm -f /tmp/whb-m1-shot.png
-else
-  printf '  ok   no screenshot file was written\n'
-  pass=$((pass + 1))
-fi
+echo "screenshots"
+SHOTS="$(mktemp -d)"
+png_size() {
+  python3 -c 'import struct,sys; d=open(sys.argv[1],"rb").read(24); print("PNG %dx%d" % struct.unpack(">II", d[16:24]) if d[:8]==b"\x89PNG\r\n\x1a\n" else "not a PNG")' "$1" 2>&1
+}
+check "a screenshot is saved" "Screenshot saved" "$(agent-browser --cdp "$BASE" screenshot "$SHOTS/view.png" 2>&1 || true)"
+check "it is the viewport, as PNG" "PNG 800x600" "$(png_size "$SHOTS/view.png")"
+agent-browser --cdp "$BASE" screenshot --full "$SHOTS/full.png" >/dev/null 2>&1 || true
+check "a full-page one is as wide" "PNG 800x" "$(png_size "$SHOTS/full.png")"
+check "annotation labels the refs" "\[[0-9]*\] @e[0-9]* " "$(agent-browser --cdp "$BASE" screenshot --annotate "$SHOTS/annotated.png" 2>&1 || true)"
+rm -rf "$SHOTS"
 
 echo
 if ((fail > 0)); then

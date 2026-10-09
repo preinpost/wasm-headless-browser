@@ -149,7 +149,7 @@ fn border(style: &ComputedStyle, side: &str, basis: Basis) -> LengthPercentage {
 }
 
 /// The used line height in px.
-fn line_height(style: &ComputedStyle) -> f64 {
+pub(crate) fn line_height(style: &ComputedStyle) -> f64 {
     let font = style.font_size();
     let value = style.get("line-height").trim();
     if value == "normal" || value.is_empty() {
@@ -415,22 +415,9 @@ enum Content {
     Replaced { width: f64, height: f64 },
 }
 
+/// The advance of `c`, from the font text is painted with (`crate::font`).
 fn char_width(c: char, font: f64, monospace: bool) -> f64 {
-    if monospace {
-        return font * 0.6;
-    }
-    let wide = matches!(c as u32,
-        0x1100..=0x11FF | 0x2E80..=0x9FFF | 0xA960..=0xA97F | 0xAC00..=0xD7FF
-        | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x1F300..=0x1FAFF);
-    if wide {
-        font
-    } else if c.is_ascii_uppercase() || c.is_ascii_digit() {
-        font * 0.62
-    } else if matches!(c, 'i' | 'l' | 'j' | 't' | 'f' | 'r' | '.' | ',' | ':' | ';' | '\'' | '|' | '!') {
-        font * 0.3
-    } else {
-        font * 0.52
-    }
+    crate::font::advance(c, font, monospace)
 }
 
 fn text_content(text: &str, style: &ComputedStyle) -> Content {
@@ -442,7 +429,7 @@ fn text_content(text: &str, style: &ComputedStyle) -> Content {
         .split_whitespace()
         .map(|w| w.chars().map(|c| char_width(c, font, monospace)).sum())
         .collect();
-    Content::Text { words, space: char_width(' ', font, monospace) * 0.55, line: line_height(style), wrap }
+    Content::Text { words, space: char_width(' ', font, monospace), line: line_height(style), wrap }
 }
 
 impl Content {
@@ -476,19 +463,34 @@ impl Content {
 
 /// Lines needed to set `words` greedily in `width`.
 fn wrap_lines(words: &[f64], space: f64, width: f64) -> usize {
-    let mut lines = 1;
+    line_starts(words, space, width).len()
+}
+
+/// Where each line starts, as an index into `words`, when they are set
+/// greedily in `width`. Painting breaks text with this too, so the lines it
+/// draws are the lines layout measured.
+pub(crate) fn line_starts(words: &[f64], space: f64, width: f64) -> Vec<usize> {
+    let mut starts = vec![0];
     let mut used: Option<f64> = None;
-    for w in words {
+    for (i, w) in words.iter().enumerate() {
         used = Some(match used {
             None => *w,
             Some(u) if u + space + w > width + 0.5 => {
-                lines += 1;
+                starts.push(i);
                 *w
             }
             Some(u) => u + space + w,
         });
     }
-    lines
+    starts
+}
+
+/// The advance of every character in `text`, and of a space, as layout
+/// measures them for `style`.
+pub(crate) fn measure_with(style: &ComputedStyle) -> impl Fn(char) -> f64 {
+    let font = style.font_size();
+    let monospace = style.get("font-family").contains("monospace");
+    move |c| char_width(c, font, monospace)
 }
 
 /// Chrome's default size for a replaced element or form control.
@@ -548,6 +550,22 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Elements with a box, back to front.
+    pub fn paint_order(&self) -> &[NodeId] {
+        &self.paint
+    }
+
+    /// The ancestors whose `overflow` clips `id`.
+    pub fn clips_of(&self, id: NodeId) -> &[NodeId] {
+        self.clips.get(&id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// How far boxes reach right and down: the page's scrollable size, at
+    /// least the viewport's.
+    pub fn content_size(&self, viewport: (f64, f64)) -> (f64, f64) {
+        self.boxes.values().fold(viewport, |(w, h), r| (w.max(r.x + r.width), h.max(r.y + r.height)))
+    }
+
     /// The element's border box, or a text node's box.
     pub fn rect(&self, id: NodeId) -> Option<Rect> {
         self.boxes.get(&id).copied()
@@ -649,7 +667,10 @@ impl Builder<'_> {
             }
             self.tree.new_leaf_with_context(taffy, Content::Replaced { width, height }).expect("taffy leaf")
         } else {
-            let inline_flow = outer == Outer::Inline && inner == Inner::Flow;
+            // A button's content is centred vertically in it, whatever its
+            // height, as Chrome lays it out: a column of line boxes, centred.
+            let button = self.doc.is_tag(id, "button") && inner == Inner::Flow;
+            let inline_flow = outer == Outer::Inline && inner == Inner::Flow && !button;
             taffy.display = match inner {
                 Inner::Flow if inline_flow => Display::Flex,
                 Inner::Flow => Display::Block,
@@ -661,6 +682,13 @@ impl Builder<'_> {
                 taffy.flex_direction = FlexDirection::Row;
                 taffy.flex_wrap = FlexWrap::Wrap;
                 taffy.align_items = Some(AlignItems::FLEX_START);
+            }
+            if button {
+                taffy.display = Display::Flex;
+                taffy.flex_direction = FlexDirection::Column;
+                taffy.flex_wrap = FlexWrap::NoWrap;
+                taffy.justify_content = Some(JustifyContent::CENTER);
+                taffy.align_items = Some(AlignItems::STRETCH);
             }
             let node = self.tree.new_leaf(taffy).expect("taffy node");
             let clips_inside: Vec<NodeId> = if style.get("overflow-x") != "visible" || style.get("overflow-y") != "visible" {
@@ -1058,12 +1086,13 @@ mod tests {
     }
 
     #[test]
-    fn wide_characters_take_a_full_em() {
+    fn text_is_measured_with_the_font() {
         let (doc, _, layout) = lay(
             "<style>body { margin: 0; font-size: 10px } span { white-space: nowrap }</style>\
              <body><span id='k'>로그인</span><br><span id='l'>abc</span></body>",
         );
-        assert_eq!(rect(&doc, &layout, "k").width, 30.0);
+        // Noto Sans KR sets Hangul at 0.92em: 27.6px, rounded up.
+        assert_eq!(rect(&doc, &layout, "k").width, 28.0);
         assert!(rect(&doc, &layout, "l").width < 20.0);
     }
 }

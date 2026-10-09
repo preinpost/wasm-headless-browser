@@ -91,5 +91,5 @@ The M4.3 list, and where each stands.
 | Engine stderr, including `WHB_TRACE_CDP` | Never written | `verify-login.sh` runs traced and checks stderr |
 | Disk | Never written | The engine has no file writes |
 | Console output from the page | Kept in memory, not sent | Will be scrubbed with everything else once `Runtime.consoleAPICalled` is emitted |
-| Screenshots | Not applicable yet | There is no rasterizer. When there is, a password field must paint bullets |
+| Screenshots | A password field paints a bullet per character; other text is scrubbed before it is painted, so a username shows as its placeholder | An engine test paints the secret and a same-length other value and compares the images, and paints a page showing the username against one showing the placeholder |
 | Crash output | Not checked | Values are not part of any panic message the engine raises, but a panic in a dependency is not controlled |

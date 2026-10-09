@@ -5,7 +5,7 @@
 
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
-이벤트를 낸다(M3.1). 다음 후보는 §0.4.
+이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -43,18 +43,22 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 164, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 174, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
-| `./scripts/verify-m1.sh` | 39 |
-| `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 31 |
+| `./scripts/verify-m1.sh` | 40 |
+| `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
+| `WAIT_FOR='#first-field' ./scripts/compare-layout.sh https://login.example.com/` | Chrome과 비교. 13개 중 8개가 2px 안, 평균 1.4px |
 | `WHB_PROBE_URL=https://login.example.com/ cargo test --release -p engine probe_a_url -- --ignored --nocapture` | 오류 없이 `#/login`까지 |
 
 WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다린다(§6).
 
 ### 0.4 다음 후보
 
-- **스크린샷 (M1.5).** 남은 가장 큰 빈칸. 레이아웃이 있으니 박스·글자를 대략
-  그릴 수 있다. 비밀번호 칸은 점으로 그려야 한다(M4.3).
+- **이미지.** 스크린샷의 가장 큰 빈칸. `<img>`와 `background-image`를 가져오지도
+  디코딩하지도 않는다. 참조 사이트는 화면 전체에 배경 이미지를 깔고 그 위에 흰
+  글자를 쓰므로 왼쪽 절반이 비어 보인다. PNG는 miniz_oxide로 풀 수 있고 JPEG는
+  순수 Rust 디코더가 필요하다. 스크린샷을 찍을 때만 가져오면 로딩 시간은 그대로다.
+- **그라디언트.** `linear-gradient`도 칠하지 않는다.
 - **요청 가로채기 (M3.3).** agent-browser `network route`. `Fetch.requestPaused`는
   엔진이 요청 도중 클라이언트의 답을 기다려야 해서 구조가 바뀐다(§4.4).
 - **콘솔 (`Runtime.consoleAPICalled`).** 지금은 `probe_a_url`로만 본다.
@@ -84,6 +88,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `d9c4296` | 자격증명: stdin, 자리표시자, CDP 출력 가리기 (M4) |
 | `ee1a18c` | 백로그 정리 |
 | `f7b8e6c` | 하위 리소스 병렬 다운로드 (M2.13) |
+| `a38c09f` | `Network.*` 이벤트, 인코딩된 비밀 가리기 (M3.1) |
 
 ## 1. 엔진 구조
 
@@ -99,6 +104,8 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `select.rs` | 선택자 파서·매처·명시도 |
 | `css.rs`, `style.rs` | 시트 파싱, 캐스케이드, 계산 스타일 (`document_styles`) |
 | `layout.rs` | taffy 위의 배치, 칠하는 순서, 히트 테스트 (`document_layout`) |
+| `font.rs` | 내장 글꼴(`fonts/NotoSansKR-subset.otf`). 레이아웃의 글자 폭과 그리기의 글리프가 여기서 나온다 |
+| `paint.rs`, `color.rs`, `png.rs` | 스크린샷: 레이아웃을 칠하고 PNG로 |
 | `ax.rs` | 접근성 트리 |
 | `js.rs` | `ScriptHost`: QuickJS를 전용 스레드(32MB 스택)에 가두고 채널로 부른다. 가상 시계 작업 큐, CDP용 평가 |
 | `bindings.rs` | JS에 주는 원시 함수(`__dom`)와 `PRELUDE` 조립 |
@@ -134,7 +141,9 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | 호스트 페이지에서 안으로 들어오는 경로(E3)는 필요 없다. 설령 되더라도 HTTP 전용이라 CDP의 WebSocket 업그레이드는 지나가지 못한다 | [harness/README.md](../harness/README.md) |
 | 브라우저 샌드박스에서 외부 TCP·HTTPS가 된다. WISP 릴레이를 쓴다 (E4·E5) | 이 문서의 §3 |
 | QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다. 엔진에서는 `full-wasi`를 쓸 수 없다 (§6) | [docs/quickjs.md](quickjs.md) |
-| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB | [docs/wasix.md](wasix.md), 커밋 기록 |
+| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 자격증명 무렵 4.1MB, 글꼴과 래스터라이저까지 5.1MB | [docs/wasix.md](wasix.md), 커밋 기록 |
+| 참조 사이트는 `Noto Sans KR, ...`으로 Noto Sans KR 웹 글꼴을 쓴다. 왼쪽 절반은 화면 전체에 깔린 배경 이미지와 그 위의 흰 글자이고, 로그인 상자는 그 위의 80% 흰색이다 | 2026-10-09 CSS와 Chrome 스크린샷 |
+| 참조 사이트 로그인 상자는 오른쪽에서 미끄러져 들어온다. Chrome에서 열자마자 재면 x가 수십 px 다르다 | 같은 날 |
 | WASIX에서 rustls + ring이 TLS 1.3으로 동작한다. 참조 사이트 인증서는 공개 루트로 검증된다 | [docs/wasix.md](wasix.md) |
 | example.com은 이제 본문이 문단 하나와 `<script src=/s.js>`뿐이다. 외부 스크립트 없이는 제목과 링크가 없다 | 2026-10-09 측정 |
 | 참조 사이트 로그인 화면을 800×600에서 Chrome(Playwright headless shell)과 비교하면 입력란·`.login-form`·`#wrap`·저작권 문구의 위치와 크기가 같거나 1px 차이다. 체크박스만 x가 8px 다르다. 아이디 입력란 클릭은 포커스를, "체크박스" 글자 클릭은 체크를 두 엔진에서 똑같이 바꾸고, 숨은 체크박스를 ref로 누르면 두 엔진 모두 빗나간다(`div.login-background`가 맞는다) | 2026-10-09 |
@@ -262,15 +271,29 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       레이아웃을 써서, 요소가 보고하는 자리를 누르면 그 요소가 눌린다.
       남은 근사: 기준선 정렬 없음, 스크롤 없음(`scrollIntoView`는 아무것도 안 함),
       회전·확대 무시, 쌓임 맥락은 한 단계로 평평하게.
-- [ ] M1.5 `engine-fake`의 PNG 렌더러를 실제 레이아웃에 연결한다. 현재는
-      저장 방식 deflate라 결과가 큽니다. `miniz_oxide` 도입을 검토한다.
+- [x] M1.5 스크린샷(`paint.rs`). 레이아웃의 칠하는 순서대로 캔버스 배경(루트,
+      없으면 body), 배경색, 둥근 모서리와 변마다 색이 다른 테두리, 글자, 폼 컨트롤
+      (꾸미지 않았으면 Chrome 모양, 값·자리표시자·비밀번호 점·체크), 목록 기호,
+      불투명도, `overflow` 자르기를 칠한다. 글꼴은 Noto Sans KR을 한글 11,172자와
+      라틴·기호로 줄여 넣었다(1.15MB, OFL, `scripts/make-font.sh`). 참조 사이트가
+      웹 글꼴로 쓰는 글꼴이기도 하다. **레이아웃도 이 글꼴의 실제 폭을 쓴다**: 그려진
+      글자가 보고된 박스에 꼭 맞고, 참조 사이트를 Chrome과 비교한 평균 오차가 3.6px에서
+      1.4px로 줄었다(버튼 내용 세로 가운데 정렬도 이때 고침). `clip`·`scale`·
+      `captureBeyondViewport`를 받고 PNG만 낸다(다른 형식은 이유를 밝힌 오류).
+      `Page.getLayoutMetrics`가 실제 콘텐츠 크기를 내서 `screenshot --full`이 된다.
+      `--annotate`는 agent-browser가 페이지에 넣은 라벨을 그대로 그린다. 한 장에 약
+      55ms(WASIX 0.2초). 그리지 않는 것: 이미지, 그라디언트, 그림자, 외곽선, 회전·확대,
+      다른 글꼴(굵게는 번지게, 기울임은 똑바로). 비밀: 비밀번호 칸은 글자 수만큼 점이고,
+      다른 글자는 그리기 전에 가린다. 레이아웃은 실제 값으로 쟀으므로 자리표시자가
+      더 길면 그만큼 줄 폭을 늘려 줄을 나눈다(줄을 먼저 나누고 가리면 줄에 걸친
+      비밀이 조각으로 샌다). WASIX 모듈은 4.1MB에서 5.1MB가 됐다.
 - [ ] M1.6 실제 사이트로 다시 측정한다. 참조 사이트 로그인 화면은 레이아웃까지
       Chrome과 비교했다(§2). 로그인 뒤 화면과 CDP 표면 재캡처는 아직이다.
 - [x] M1.7 `browser` 바이너리에 `--engine fake|html` 플래그를 넣었다.
       가짜 엔진이 기본값이라 `verify-m0.sh`는 그대로 통과한다.
 - [x] M1.8 `scripts/verify-m1.sh`. 픽스처를 HTTP로 서빙하고 접근성 트리, 인라인
-      스크립트, `eval`, 히스토리, 쿠키, 클릭과 가시성을 39개 검사로 판정한다.
-      스크린샷이 조용히 빈 이미지를 내지 않고 이유를 말하는지도 검사한다.
+      스크립트, `eval`, 히스토리, 쿠키, 클릭과 가시성, 스크린샷(뷰포트·전체·
+      `--annotate`)을 40개 검사로 판정한다.
 
 ### 4.3 M2 JavaScript (P0, 큼)
 
@@ -368,7 +391,7 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       명령 하나를 처리하는 동안 다음 명령을 받지 않으므로, 페이지 로드 중에 멈춘
       요청이 그 답을 기다리면 교착한다. 로드를 디스패치 밖으로 빼거나, 규칙을
       엔진에 미리 넘기는 방식이 필요하다.
-- [ ] M3.4 `Page.captureScreenshot`. M1.5와 같은 일이다.
+- [x] M3.4 `Page.captureScreenshot`. M1.5 참조.
 
 ### 4.5 M4 자격증명 (P1, 목표의 핵심)
 
@@ -380,9 +403,9 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       되돌린다. 값은 해제될 때 덮어쓴다. [docs/credentials.md](credentials.md).
 - [x] M4.2 agent-browser의 auth vault는 쓰지 않는다. 자리표시자로 대신한다.
 - [x] M4.3 유출 경로 점검. CDP 결과·오류·이벤트, 접근성 트리, 추적을 켠 엔진
-      stderr, 디스크는 확인했다(`verify-login.sh` 23개, 네이티브·WASIX). 콘솔은
-      아직 내보내지 않고, 스크린샷은 아직 없으며, 의존성의 panic 메시지는 통제하지
-      못한다. 악의적인 클라이언트는 한 글자씩 빼낼 수 있다(문서에 명시).
+      stderr, 디스크는 확인했다(`verify-login.sh`, 네이티브·WASIX). `Network.*`와
+      스크린샷은 M3.1·M1.5에서 막았다. 콘솔은 아직 내보내지 않고, 의존성의 panic
+      메시지는 통제하지 못한다. 악의적인 클라이언트는 한 글자씩 빼낼 수 있다(문서에 명시).
 
 ## 5. 미결 사항
 
@@ -468,9 +491,12 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 - **taffy 0.14는 잎 노드의 배치 전체를 측정 함수에 맡긴다.** 측정 함수는
   `taffy::compute_leaf_layout`에 내용 크기만 넘겨야 한다. 그렇지 않으면 자식 없는
   `div`의 `height: 50px`가 무시되고 0×0이 된다.
-- **Chrome과 레이아웃을 비교하려면** `~/Library/Caches/ms-playwright`의 headless
-  shell을 `agent-browser --executable-path`로 띄운다. 사용자의 Chrome 프로필을
-  건드리지 않는다. 둘 다 `set viewport 800 600`으로 맞춘다.
+- **Chrome과 레이아웃을 비교하려면** `scripts/compare-layout.sh URL`. Playwright의
+  headless shell을 따로 띄우므로 사용자의 Chrome 프로필을 건드리지 않는다. SPA는
+  `WAIT_FOR=선택자`를 주고, 애니메이션이 끝나도록 `SETTLE_MS`(기본 2.5초)를 기다린다.
+  이걸 안 기다리면 참조 사이트 로그인 상자가 들어오는 도중을 재서 46px 다르게 나온다.
+- **글꼴을 바꾸면 레이아웃이 바뀐다.** 글자 폭이 `font.rs`에서 나오기 때문이다.
+  `scripts/make-font.sh`로 다시 만든 뒤에는 `compare-layout.sh`로 확인한다.
 - **Wasmer에서는 게스트의 stdin이 늘 터미널로 보인다.** 파이프로 넣어도 그렇다.
   그래서 브라우저는 WASI 타깃에서 터미널 검사를 하지 않고, `wasix-run.sh`가 호스트에서
   한다. 값 자체는 파이프로 제대로 전달된다. 또 Wasmer는 호스트의 환경 변수를 넘기지

@@ -33,6 +33,11 @@ taffy = { version = "0.14", default-features = false, features = ["std", "taffy_
 # WHATWG URL parsing, for `URL`, `<script src>` and request URLs. Pure Rust.
 url = "2"
 
+# Screenshots: glyph outlines rasterised from the embedded font (CFF included),
+# and deflate for the PNG. Both pure Rust. See paint.rs and font.rs.
+ab_glyph = "0.2"
+miniz_oxide = "0.8"
+
 [dev-dependencies]
 # Self-signed certificates for a local TLS server in the fetch tests.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

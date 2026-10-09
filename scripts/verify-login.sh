@@ -155,6 +155,10 @@ check "the url moved with pushState" "$SITE/home" "$(ab get url)"
 check "the session cookie is in the jar" "sid=" "$(ab cookies get)"
 check_absent "page script cannot see the HttpOnly cookie" "sid=" "$(ab eval 'document.cookie')"
 
+shot_dir="$HAR_DIR/shot.png"
+check "a screenshot of the signed-in page is saved" "Screenshot saved" "$(ab screenshot "$shot_dir")"
+check "and is a PNG" "PNG" "$(file "$shot_dir" 2>&1)"
+
 echo "the network log"
 requests="$(ab network requests)"
 check "the document is in it" "GET $SITE/ (Document) 200" "$requests"

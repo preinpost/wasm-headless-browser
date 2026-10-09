@@ -551,6 +551,7 @@ pub fn initial_value(name: &str) -> &'static str {
         n if n.starts_with("margin-") || n.starts_with("padding-") => "0px",
         n if n.starts_with("border-") && n.ends_with("-width") => "0px",
         n if n.starts_with("border-") && n.ends_with("-style") => "none",
+        n if n.starts_with("border-") && n.ends_with("-color") => "currentcolor",
         _ => "",
     }
 }
@@ -582,28 +583,36 @@ fn expand_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
         "inset" => four("", ""),
         "border-width" => four("border-", "-width"),
         "border-style" => four("border-", "-style"),
+        "border-color" => four("border-", "-color"),
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
             let sides: Vec<&str> = match name {
                 "border" => vec!["top", "right", "bottom", "left"],
                 other => vec![other.trim_start_matches("border-")],
             };
-            let (mut width, mut style) = ("medium".to_string(), "none".to_string());
+            let (mut width, mut style, mut color) = ("medium".to_string(), "none".to_string(), "currentcolor".to_string());
             if is_keyword(value.trim()) {
                 width = value.trim().to_string();
                 style = value.trim().to_string();
+                color = value.trim().to_string();
             } else {
                 for part in &parts {
                     if is_border_style(part) {
                         style = part.to_string();
                     } else if part.starts_with(|c: char| c.is_ascii_digit() || c == '.') || matches!(*part, "thin" | "medium" | "thick") {
                         width = part.to_string();
+                    } else {
+                        color = part.to_string();
                     }
                 }
             }
             sides
                 .iter()
                 .flat_map(|side| {
-                    [(format!("border-{side}-width"), width.clone()), (format!("border-{side}-style"), style.clone())]
+                    [
+                        (format!("border-{side}-width"), width.clone()),
+                        (format!("border-{side}-style"), style.clone()),
+                        (format!("border-{side}-color"), color.clone()),
+                    ]
                 })
                 .collect()
         }

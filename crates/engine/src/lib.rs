@@ -19,14 +19,18 @@
 
 pub mod ax;
 pub mod bindings;
+pub mod color;
 pub mod browser;
 pub mod cookies;
 pub mod css;
 pub mod dom;
 pub mod fetch;
+pub mod font;
 pub mod js;
 pub mod layout;
+pub mod paint;
 pub mod parse;
+pub mod png;
 pub mod network;
 pub mod secrets;
 pub mod select;

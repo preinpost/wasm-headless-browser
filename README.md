@@ -38,8 +38,14 @@ viewport, and takes `fill`, `click` and `press Enter`.
 `Network.*` events are emitted, so `agent-browser network requests` and HAR
 recording work, with the login POST's body showing placeholders.
 
-Not there yet: screenshots (no rasterizer), scrolling, ES modules, and request
-interception (`network route`). The WASIX module is 3.3 MB.
+Screenshots are painted from the same layout, with text in an embedded Noto
+Sans KR (Hangul included), so `agent-browser screenshot`, `--full` and
+`--annotate` work. A password field paints bullets; other secrets paint as
+their placeholders.
+
+Not there yet: images and gradients in screenshots, scrolling, ES modules,
+and request interception (`network route`). The WASIX module is 5.1 MB, the
+font 1.15 MB of it.
 
 ## Why the shape is what it is
 
@@ -105,6 +111,8 @@ scripts/
   verify-m0.sh            M0 acceptance test, native or WASIX.
   verify-m1.sh            M1 acceptance test: fetch, parse, script, snapshot, click.
   verify-login.sh         Login with secrets, with leak checks.
+  compare-layout.sh       Lays a page out here and in Chrome and compares the boxes.
+  make-font.sh            Rebuilds the embedded font subset.
   verify-harness.sh       Runs the browser-sandbox probes and judges them.
   harness-stop.sh         Frees the harness ports if a manual run was abandoned.
   wasix-build.sh          Builds the WASIX module.
@@ -143,7 +151,7 @@ agent-browser --cdp http://127.0.0.1:9222 fill @e3 '{{secret:gw}}'
 | Milestone | Content |
 |---|---|
 | M0 | Protocol plumbing and the engine seam. **Done** |
-| M1 | Real engine: parsing, DOM, fetching over HTTP(S), CSS cascade, layout. **Done**, except screenshots |
+| M1 | Real engine: parsing, DOM, fetching over HTTP(S), CSS cascade, layout, screenshots. **Done**, except images |
 | M2 | JavaScript: QuickJS (patched, see [`vendor/README.md`](vendor/README.md)), a DOM binding, an event loop, `fetch` and XHR, input. **Done**, except ES modules |
 | M3 | Network: cookies and `Network.*` events are **done**; request interception is not |
 | M4 | Credentials held in memory only, typed by placeholder, scrubbed from CDP. **Done** |

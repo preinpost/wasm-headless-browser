@@ -173,6 +173,39 @@ impl HtmlEngine {
         out("Page.loadEventFired", json!({ "timestamp": timestamp }));
     }
 
+    /// `Page.captureScreenshot`: the viewport, or `clip`, painted as PNG.
+    fn screenshot(&self, params: &Value) -> Result<Value, CdpError> {
+        let format = params.get("format").and_then(|v| v.as_str()).unwrap_or("png");
+        if format != "png" {
+            return Err(CdpError::internal(format!(
+                "Page.captureScreenshot: only png is supported here, not {format}"
+            )));
+        }
+        let (w, h) = self.viewport;
+        let clip = params.get("clip");
+        let number = |name: &str, default: f64| {
+            clip.and_then(|c| c.get(name)).and_then(|v| v.as_f64()).unwrap_or(default)
+        };
+        let region = crate::paint::Region {
+            x: number("x", 0.0),
+            y: number("y", 0.0),
+            width: number("width", w),
+            height: number("height", h),
+            scale: number("scale", 1.0),
+        };
+        let pixels = region.width * region.scale * region.height * region.scale;
+        if !(region.width > 0.0 && region.height > 0.0 && region.scale > 0.0) || pixels > MAX_SCREENSHOT_PIXELS {
+            return Err(CdpError::internal(format!(
+                "Page.captureScreenshot: a {}x{} region at scale {} is empty or larger than {} pixels",
+                region.width, region.height, region.scale, MAX_SCREENSHOT_PIXELS
+            )));
+        }
+        let secrets = Arc::clone(&self.secrets);
+        let canvas = crate::paint::paint(&self.doc(), region, &|text| secrets.scrub_str(text));
+        use base64::Engine as _;
+        Ok(json!({ "data": base64::engine::general_purpose::STANDARD.encode(canvas.to_png()) }))
+    }
+
     /// Sends the `Network.*` events recorded since the last call. Requests
     /// run on other threads and inside script, where no emitter is at hand,
     /// so they are recorded and sent from here: before the lifecycle events
@@ -724,12 +757,24 @@ impl HtmlEngine {
                 Ok(json!({ "currentIndex": self.history_index, "entries": entries }))
             }
 
+            // The page does not scroll, so the viewport is always at the top
+            // left; the content size is how far the layout reaches.
             "Page.getLayoutMetrics" => {
                 let (w, h) = self.viewport;
+                let (cw, ch) = crate::layout::document_layout(&self.doc()).content_size(self.viewport);
+                let layout_viewport = json!({ "pageX": 0, "pageY": 0, "clientWidth": w, "clientHeight": h });
+                let visual_viewport = json!({
+                    "offsetX": 0, "offsetY": 0, "pageX": 0, "pageY": 0,
+                    "clientWidth": w, "clientHeight": h, "scale": 1, "zoom": 1,
+                });
+                let content = json!({ "x": 0, "y": 0, "width": cw.ceil(), "height": ch.ceil() });
                 Ok(json!({
-                    "layoutViewport": { "pageX": 0, "pageY": 0, "clientWidth": w, "clientHeight": h },
-                    "visualViewport": { "offsetX": 0, "offsetY": 0, "pageX": 0, "pageY": 0, "clientWidth": w, "clientHeight": h, "scale": 1 },
-                    "contentSize": { "x": 0, "y": 0, "width": w, "height": h },
+                    "layoutViewport": layout_viewport,
+                    "visualViewport": visual_viewport,
+                    "contentSize": content,
+                    "cssLayoutViewport": layout_viewport,
+                    "cssVisualViewport": visual_viewport,
+                    "cssContentSize": content,
                 }))
             }
 
@@ -737,10 +782,7 @@ impl HtmlEngine {
             "Page.addScriptToEvaluateOnNewDocument" => Ok(json!({ "identifier": "1" })),
             "Page.createIsolatedWorld" => Ok(json!({ "executionContextId": self.context_id })),
 
-            "Page.captureScreenshot" => Err(not_yet(
-                method,
-                "there is no rasterizer yet, so a screenshot would be blank",
-            )),
+            "Page.captureScreenshot" => self.screenshot(params),
 
             // ---- Runtime -------------------------------------------------
             "Runtime.enable" => {
@@ -1253,8 +1295,10 @@ fn escape_html(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// The page shown when a navigation fails. A browser shows something; so does
-/// this, because a client reading an empty document learns nothing.
+/// The largest screenshot painted: 64 megapixels, a full-page shot of a long
+/// page at twice the scale. Beyond that the request is refused, not cropped.
+const MAX_SCREENSHOT_PIXELS: f64 = 64.0 * 1024.0 * 1024.0;
+
 /// Whether a space-separated attribute such as `rel` holds `token`.
 fn has_token(value: Option<&str>, token: &str) -> bool {
     value.is_some_and(|v| v.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case(token)))
@@ -1268,6 +1312,8 @@ fn is_classic_script_type(kind: Option<&str>) -> bool {
     kind.is_empty() || kind.contains("javascript") || kind.contains("ecmascript") || kind.contains("jscript")
 }
 
+/// The page shown when a navigation fails. A browser shows something; so does
+/// this, because a client reading an empty document learns nothing.
 fn error_page(url: &str, message: &str) -> String {
     format!(
         "<!doctype html><html><head><title>{title}</title></head>\
@@ -1997,11 +2043,59 @@ mod tests {
         assert_eq!(serialize(&engine.doc(), img), "<img src=\"x.png\" alt=\"a\">");
     }
 
+    fn screenshot_png(engine: &mut HtmlEngine, params: Value) -> Vec<u8> {
+        use base64::Engine as _;
+        let shot = dispatch(engine, "Page.captureScreenshot", params);
+        base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str().unwrap()).unwrap()
+    }
+
+    fn png_size(png: &[u8]) -> (u32, u32) {
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        (u32::from_be_bytes(png[16..20].try_into().unwrap()), u32::from_be_bytes(png[20..24].try_into().unwrap()))
+    }
+
+    #[test]
+    fn screenshots_are_the_viewport_or_the_clip_as_png() {
+        let mut engine = engine_with("<body style='margin:0'><div style='height:1500px;width:1000px'>tall</div></body>");
+        assert_eq!(png_size(&screenshot_png(&mut engine, json!({}))), (800, 600));
+        let clip = json!({ "clip": { "x": 0, "y": 100, "width": 200, "height": 50, "scale": 2 }, "captureBeyondViewport": true });
+        assert_eq!(png_size(&screenshot_png(&mut engine, clip)), (400, 100));
+
+        let metrics = dispatch(&mut engine, "Page.getLayoutMetrics", json!({}));
+        assert_eq!(metrics["cssContentSize"]["height"], 1500.0);
+        assert_eq!(metrics["cssContentSize"]["width"], 1000.0);
+        assert_eq!(metrics["cssLayoutViewport"]["clientWidth"], 800.0);
+
+        let mut sink = |_: &str, _: Value| {};
+        let jpeg = engine.dispatch("Page.captureScreenshot", &json!({ "format": "jpeg" }), &mut sink).unwrap_err();
+        assert!(jpeg.message.contains("only png"), "{}", jpeg.message);
+        let huge = json!({ "clip": { "x": 0, "y": 0, "width": 100000, "height": 100000, "scale": 1 } });
+        assert!(engine.dispatch("Page.captureScreenshot", &huge, &mut sink).is_err());
+    }
+
+    #[test]
+    fn a_screenshot_shows_secrets_as_placeholders_and_passwords_as_bullets() {
+        let page = "<body><p>Welcome, kim.minsu</p><input id=p type=password></body>";
+        let shot = |html: &str, password: &str| {
+            let mut engine = engine_with_secrets(html);
+            evaluate(&mut engine, "document.getElementById('p').focus()");
+            dispatch(&mut engine, "Input.insertText", json!({ "text": password }));
+            screenshot_png(&mut engine, json!({}))
+        };
+        // The secret's value and a same-length other one paint alike: the
+        // image carries only its length.
+        // Compared as booleans: a failing assert_eq would print the PNGs.
+        assert!(shot(page, "{{secret:pw}}") == shot(page, "x".repeat("hunter2-s3cret".len()).as_str()));
+        // The username is painted as its placeholder, as a snapshot shows it.
+        assert!(shot(page, "") == shot("<body><p>Welcome, {{secret:user}}</p><input id=p type=password></body>", ""));
+        assert!(shot(page, "") != shot("<body><p>Welcome, someone.else</p><input id=p type=password></body>", ""));
+    }
+
     #[test]
     fn methods_that_would_lie_return_an_error_instead() {
         let mut engine = engine_with("<body>x</body>");
         let mut events = Vec::new();
-        for method in ["Page.captureScreenshot", "Input.dispatchTouchEvent"] {
+        for method in ["Input.dispatchTouchEvent"] {
             let mut sink = |m: &str, p: Value| events.push((m.to_string(), p));
             let error = engine.dispatch(method, &Value::Null, &mut sink).expect_err(method);
             assert!(
