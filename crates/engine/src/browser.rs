@@ -15,6 +15,7 @@ use browser_core::{ids, CdpError, Engine, EngineEmit, TargetInfo};
 use serde_json::{json, Value};
 
 use crate::cookies::{self, Cookie, CookieJar};
+use crate::secrets::Secrets;
 use crate::dom::{Document, NodeData, NodeId};
 use crate::fetch::{self, Request};
 use crate::bindings::Navigation;
@@ -48,6 +49,9 @@ pub struct HtmlEngine {
     script: Option<ScriptHost>,
     /// Fetches with the jar every target shares.
     client: fetch::Client,
+    /// Credentials, typed only through placeholders and scrubbed from
+    /// everything the engine says. Shared by every target.
+    secrets: Arc<Secrets>,
     url: String,
     frame_id: String,
     loader_id: String,
@@ -66,6 +70,11 @@ impl HtmlEngine {
 
     /// An engine sharing `cookies` with others, as tabs in one browser do.
     pub fn with_cookies(target_id: &str, cookies: Arc<Mutex<CookieJar>>) -> Self {
+        Self::with_shared(target_id, cookies, Arc::new(Secrets::new()))
+    }
+
+    /// An engine sharing a cookie jar and a set of secrets with others.
+    pub fn with_shared(target_id: &str, cookies: Arc<Mutex<CookieJar>>, secrets: Arc<Secrets>) -> Self {
         let mut counter = ids::seed();
         let doc = Arc::new(Mutex::new(Document::new()));
         let viewport = (800.0, 600.0);
@@ -77,6 +86,7 @@ impl HtmlEngine {
             doc,
             script,
             client,
+            secrets,
             url: "about:blank".to_string(),
             frame_id: ids::token(&mut counter),
             loader_id: ids::token(&mut counter),
@@ -90,9 +100,14 @@ impl HtmlEngine {
 
     /// Every target the factory creates shares one cookie jar.
     pub fn factory() -> browser_core::EngineFactory {
+        Self::factory_with_secrets(Arc::new(Secrets::new()))
+    }
+
+    /// [`factory`](Self::factory), with credentials every target can type.
+    pub fn factory_with_secrets(secrets: Arc<Secrets>) -> browser_core::EngineFactory {
         let cookies = Arc::new(Mutex::new(CookieJar::new()));
         Box::new(move |target_id: &str| {
-            Box::new(HtmlEngine::with_cookies(target_id, Arc::clone(&cookies))) as Box<dyn Engine>
+            Box::new(HtmlEngine::with_shared(target_id, Arc::clone(&cookies), Arc::clone(&secrets))) as Box<dyn Engine>
         })
     }
 
@@ -601,8 +616,10 @@ impl HtmlEngine {
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                           (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
-impl Engine for HtmlEngine {
-    fn info(&self) -> TargetInfo {
+/// The CDP surface, before secrets are scrubbed from what it says. The
+/// `Engine` implementation below is the only way out, and it scrubs.
+impl HtmlEngine {
+    fn info_raw(&self) -> TargetInfo {
         let doc = self.doc();
         let mut info = TargetInfo::new(self.target_id.clone());
         info.title = doc.title().unwrap_or_default();
@@ -613,22 +630,13 @@ impl Engine for HtmlEngine {
         info
     }
 
-    fn navigate(&mut self, url: &str, out: &mut EngineEmit) -> Result<(), CdpError> {
+    fn navigate_raw(&mut self, url: &str, out: &mut EngineEmit) -> Result<(), CdpError> {
         self.load(url);
         self.emit_lifecycle(out);
         Ok(())
     }
 
-    fn attach(&mut self, out: &mut EngineEmit) {
-        self.emit_context(out);
-    }
-
-    fn dispatch(
-        &mut self,
-        method: &str,
-        params: &Value,
-        out: &mut EngineEmit,
-    ) -> Result<Value, CdpError> {
+    fn dispatch_raw(&mut self, method: &str, params: &Value, out: &mut EngineEmit) -> Result<Value, CdpError> {
         match method {
             // ---- Page ----------------------------------------------------
             "Page.enable" | "Page.disable" | "Page.bringToFront" => Ok(json!({})),
@@ -901,9 +909,15 @@ impl Engine for HtmlEngine {
 
             // ---- Input ---------------------------------------------------
             // Keys and text go to the focused element, which needs no layout.
+            // `{{secret:NAME}}` becomes the secret here, and only here, and
+            // only on a page from the secret's origin.
             "Input.insertText" => {
                 let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                self.cdp(&format!("(__insertText({}), '{{}}')", js_string(text)))?;
+                let text = self
+                    .secrets
+                    .resolve(text, &self.url)
+                    .map_err(|e| CdpError { code: -32000, message: e.to_string() })?;
+                self.cdp(&format!("(__insertText({}), '{{}}')", js_string(&text)))?;
                 self.after_script(out);
                 Ok(json!({}))
             }
@@ -943,6 +957,56 @@ impl Engine for HtmlEngine {
         }
     }
 }
+
+/// Everything leaving the engine passes through here, and every secret's
+/// value in it becomes its placeholder: results, errors, events, and the
+/// target's title and URL.
+impl Engine for HtmlEngine {
+    fn info(&self) -> TargetInfo {
+        let mut info = self.info_raw();
+        info.title = self.secrets.scrub_str(&info.title);
+        info.url = self.secrets.scrub_str(&info.url);
+        info
+    }
+
+    fn navigate(&mut self, url: &str, out: &mut EngineEmit) -> Result<(), CdpError> {
+        let secrets = Arc::clone(&self.secrets);
+        let mut scrubbed = |method: &str, mut params: Value| {
+            secrets.scrub(&mut params);
+            out(method, params)
+        };
+        self.navigate_raw(url, &mut scrubbed).map_err(|e| scrub_error(&self.secrets, e))
+    }
+
+    fn attach(&mut self, out: &mut EngineEmit) {
+        let secrets = Arc::clone(&self.secrets);
+        let mut scrubbed = |method: &str, mut params: Value| {
+            secrets.scrub(&mut params);
+            out(method, params)
+        };
+        self.emit_context(&mut scrubbed);
+    }
+
+    fn dispatch(&mut self, method: &str, params: &Value, out: &mut EngineEmit) -> Result<Value, CdpError> {
+        let secrets = Arc::clone(&self.secrets);
+        let mut scrubbed = |method: &str, mut params: Value| {
+            secrets.scrub(&mut params);
+            out(method, params)
+        };
+        match self.dispatch_raw(method, params, &mut scrubbed) {
+            Ok(mut value) => {
+                self.secrets.scrub(&mut value);
+                Ok(value)
+            }
+            Err(e) => Err(scrub_error(&self.secrets, e)),
+        }
+    }
+}
+
+fn scrub_error(secrets: &Secrets, error: CdpError) -> CdpError {
+    CdpError { code: error.code, message: secrets.scrub_str(&error.message) }
+}
+
 
 /// A cookie in `Network.Cookie` shape.
 fn cookie_json(cookie: &Cookie) -> Value {
@@ -1534,6 +1598,63 @@ mod tests {
         let rect = evaluate(&mut engine, "JSON.stringify(document.getElementById('a').getBoundingClientRect())");
         assert_eq!(rect["result"]["value"], r#"{"x":0,"y":0,"width":100,"height":40,"top":0,"right":100,"bottom":40,"left":0}"#);
         assert_eq!(evaluate(&mut engine, "document.elementFromPoint(50, 20).id")["result"]["value"], "a");
+    }
+
+    fn engine_with_secrets(html: &str) -> HtmlEngine {
+        let mut secrets = Secrets::new();
+        secrets.add("pw@http://example.test", "hunter2-s3cret".into()).unwrap();
+        secrets.add("user@http://example.test", "kim.minsu".into()).unwrap();
+        let mut engine =
+            HtmlEngine::with_shared("target", Arc::new(Mutex::new(CookieJar::new())), Arc::new(secrets));
+        {
+            let mut doc = engine.doc();
+            *doc = parse_html(html);
+            doc.set_url("http://example.test/page");
+        }
+        engine.url = "http://example.test/page".to_string();
+        engine
+    }
+
+    #[test]
+    fn secrets_are_typed_by_placeholder_and_never_come_back() {
+        let mut engine = engine_with_secrets(
+            "<body><input id='u' aria-label='User'><input id='p' type='password' aria-label='Password'></body>",
+        );
+        for (field, placeholder) in [("u", "{{secret:user}}"), ("p", "{{secret:pw}}")] {
+            evaluate(&mut engine, &format!("document.getElementById('{field}').focus()"));
+            dispatch(&mut engine, "Input.insertText", json!({ "text": placeholder }));
+        }
+        // The page has the real values: it can log in.
+        let check = evaluate(&mut engine, "document.getElementById('p').value === 'hunter2-s3cret' && document.getElementById('u').value.length");
+        assert_eq!(check["result"]["value"], json!(9));
+        // A client reading them gets placeholders, in results, snapshots and
+        // errors alike. Clients only ever come in through `dispatch`.
+        let read = dispatch(
+            &mut engine,
+            "Runtime.evaluate",
+            json!({ "expression": "document.getElementById('p').value + ' / ' + document.getElementById('u').value" }),
+        );
+        assert_eq!(read["result"]["value"], "{{secret:pw}} / {{secret:user}}");
+        let tree = dispatch(&mut engine, "Accessibility.getFullAXTree", json!({})).to_string();
+        assert!(tree.contains("{{secret:user}}") && !tree.contains("kim.minsu"), "{tree}");
+        let thrown = dispatch(
+            &mut engine,
+            "Runtime.evaluate",
+            json!({ "expression": "throw new Error('pw is ' + document.getElementById('p').value)" }),
+        );
+        assert!(!thrown.to_string().contains("hunter2"), "{thrown}");
+    }
+
+    #[test]
+    fn a_secret_is_not_typed_into_another_origin() {
+        let mut engine = engine_with_secrets("<body><input id='p'></body>");
+        engine.url = "http://evil.test/".to_string();
+        evaluate(&mut engine, "document.getElementById('p').focus()");
+        let mut sink = |_: &str, _: Value| {};
+        let error = engine.dispatch("Input.insertText", &json!({ "text": "{{secret:pw}}" }), &mut sink).unwrap_err();
+        assert!(error.message.contains("is for http://example.test"), "{}", error.message);
+        assert!(!error.message.contains("hunter2"));
+        assert_eq!(evaluate(&mut engine, "document.getElementById('p').value")["result"]["value"], "");
     }
 
     #[test]

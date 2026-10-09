@@ -12,60 +12,30 @@ It is not a browser for people. There is no window, no compositor, and no
 rendering pipeline. It speaks the Chrome DevTools Protocol so that existing
 clients work unchanged.
 
-## Status: M1 in progress
+## Status: it logs in
 
-Two engines exist behind the same CDP surface, and the binary picks between
-them with `--engine`:
+`--engine html` is a real engine: it fetches over HTTP and HTTPS (TLS inside
+the guest), parses HTML, runs the page's JavaScript in QuickJS, applies its
+stylesheets, lays it out, and answers CDP from the result. A client can read a
+page, fill it, click it and submit it, and the session survives in an
+in-memory cookie jar. Credentials are typed by placeholder and never come back
+to the client; see [`docs/credentials.md`](docs/credentials.md).
 
-| Engine | What it does | Command |
+| Check | What it drives | Command |
 |---|---|---|
-| `fake` (default) | Answers from a fixed page model. No HTML is parsed. | `./scripts/verify-m0.sh` |
-| `html` | Fetches over HTTP, parses, and projects a real accessibility tree. | `./scripts/verify-m1.sh` |
+| M0 | The protocol path, against a fixed page model (`--engine fake`, the default) | `./scripts/verify-m0.sh` |
+| M1 | A real page: parsing, script, the accessibility tree, cookies, clicks | `./scripts/verify-m1.sh` |
+| Login | A script-rendered login site, filled with secrets and submitted, with leak checks | `./scripts/verify-login.sh` |
 
-`fake` stays the default so the M0 acceptance test keeps testing what it was
-written against.
+Each runs natively and as the WASIX module under Wasmer (`MODE=wasix`), with
+the real `agent-browser` CLI (0.38.2).
 
-The same 16 M0 checks pass natively and inside WASIX:
+On a real React single-page app, the reference site's login screen opens in
+about five seconds, lays out within a pixel or two of Chrome at the same
+viewport, and takes `fill`, `click` and `press Enter`.
 
-| Mode | Command |
-|---|---|
-| Native, for fast iteration | `./scripts/verify-m0.sh` |
-| WASIX module under Wasmer | `MODE=wasix ./scripts/verify-m0.sh` |
-
-What works today, driven by the real `agent-browser` CLI:
-
-```
-$ agent-browser --cdp http://127.0.0.1:9333 open https://example.com
-✓ Sandbox Login
-  https://example.com
-
-$ agent-browser --cdp http://127.0.0.1:9333 snapshot
-- generic
-  - heading "Sandbox Login" [level=1, ref=e1]
-  - paragraph "Sign in to continue to the sandbox."
-  - form
-    - LabelText
-      - StaticText "User"
-    - textbox "User" [ref=e2]
-    - LabelText
-      - StaticText "Password"
-    - textbox "Password" [ref=e3]
-    - button "Sign in" [ref=e4]
-  - link "More info" [ref=e5]
-```
-
-Also verified: navigation, `get url`, `get title`, `eval`, `scroll`, history
-back and forward, `cookies get`, and `Page.captureScreenshot` returning a real
-PNG that reflects the fake block layout.
-
-The page behind those results comes from `engine-fake`, which answers from a
-fixed model. It cannot run JavaScript. Two things therefore do not work yet:
-free-form selectors resolved through page script (`find text ...`), and clicking.
-
-The WASIX build is 272 KB, binds loopback inside the sandbox, and is reachable
-from outside it. The largest open question going in — whether WASIX allows
-loopback `bind`/`listen` at all — is answered yes, with the evidence in
-[`docs/wasix.md`](docs/wasix.md).
+Not there yet: screenshots (no rasterizer), scrolling, ES modules, and
+`Network.*` events. The WASIX module is 3.3 MB.
 
 ## Why the shape is what it is
 
@@ -108,23 +78,29 @@ one. Details in [`docs/wasix.md`](docs/wasix.md).
 crates/
   cdp-wire/       HTTP discovery, RFC 6455 framing, SHA-1, JSON envelope.
   browser-core/   Targets, sessions, method dispatch. Engine-agnostic.
-  engine/         The real engine: arena DOM, parser, fetch, selectors, accessibility.
+  engine/         The real engine: DOM, parser, fetch and TLS, cookies, selectors, CSS,
+                  layout, accessibility, secrets, and QuickJS with the DOM prelude
+                  (src/prelude/*.js).
   engine-fake/    M0 engine: fixed page model, accessibility projection, PNG encoder.
   browser/        The binary. Wires a transport to an engine, chosen with --engine.
 docs/
   cdp-surface.md          The measured protocol surface, and what it implies.
   wasix.md                What the WASIX run proved, and how it was measured.
   quickjs.md              Why Context::full aborts, and the context setup that works.
+  credentials.md          How secrets are typed and kept from the client, and the limits.
   backlog.md              What is measured, what is left, and what was decided against.
   capture/                Raw frames and expressions from a real Chrome session.
 experiments/
   quickjs/                Probe: QuickJS evaluating JavaScript inside WASIX.
+  tls/                    Probe: rustls with ring inside WASIX.
+vendor/rquickjs-sys/      QuickJS, patched; see vendor/README.md.
 tools/cdp-log-proxy/      The logging proxy used to take that capture.
-fixtures/                 Pages the M1 test serves over HTTP.
+fixtures/                 Pages the M1 test serves, and fixtures/login, a login site.
 harness/                  Browser-sandbox experiments (E0-E5) and a runner page.
 scripts/
   verify-m0.sh            M0 acceptance test, native or WASIX.
-  verify-m1.sh            M1 acceptance test: fetch, parse, snapshot.
+  verify-m1.sh            M1 acceptance test: fetch, parse, script, snapshot, click.
+  verify-login.sh         Login with secrets, with leak checks.
   verify-harness.sh       Runs the browser-sandbox probes and judges them.
   harness-stop.sh         Frees the harness ports if a manual run was abandoned.
   wasix-build.sh          Builds the WASIX module.
@@ -136,8 +112,8 @@ scripts/
 ## Running it
 
 ```bash
-cargo build
-./target/debug/wasm-headless-browser 127.0.0.1:9222
+cargo build --release
+./target/release/wasm-headless-browser --engine html 127.0.0.1:9222
 ```
 
 Then point any CDP client at it. With `agent-browser`:
@@ -149,19 +125,27 @@ agent-browser --cdp http://127.0.0.1:9222 snapshot
 
 A bare port (`--cdp 9222`) also works; `host:port` without a scheme does not.
 
+To log in, pipe the credentials in and type placeholders
+([`docs/credentials.md`](docs/credentials.md)):
+
+```bash
+security find-generic-password -s gw-password -w \
+  | ./target/release/wasm-headless-browser --engine html --secret gw@https://gw.example.com 127.0.0.1:9222
+agent-browser --cdp http://127.0.0.1:9222 fill @e3 '{{secret:gw}}'
+```
+
 ## Roadmap
 
 | Milestone | Content |
 |---|---|
 | M0 | Protocol plumbing and the engine seam. **Done** |
-| M1 | Real engine. HTML parsing, the DOM, fetching and the accessibility tree are **done**; approximate layout is not |
-| M2 | A JavaScript engine, which is what makes clicking and arbitrary selectors work. QuickJS is chosen and proven to run; see [`docs/quickjs.md`](docs/quickjs.md) |
-| M3 | Network: real fetches, `Network.*` events, cookies |
-| M4 | Credentials held in memory only, injected at request time and never written to disk |
+| M1 | Real engine: parsing, DOM, fetching over HTTP(S), CSS cascade, layout. **Done**, except screenshots |
+| M2 | JavaScript: QuickJS (patched, see [`vendor/README.md`](vendor/README.md)), a DOM binding, an event loop, `fetch` and XHR, input. **Done**, except ES modules |
+| M3 | Network: cookies are **done**; `Network.*` events and request interception are not |
+| M4 | Credentials held in memory only, typed by placeholder, scrubbed from CDP. **Done** |
 
-M1 is the first milestone where a real site can be read. M2 is where the cost
-concentrates, because the two heaviest expressions a client sends are page
-scripts, not protocol commands.
+The working log, with what was measured and what is left, is
+[`docs/backlog.md`](docs/backlog.md).
 
 ## Open questions
 

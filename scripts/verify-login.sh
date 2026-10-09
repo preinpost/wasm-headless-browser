@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Login-flow acceptance test: read the page, fill it, submit, and land signed in.
+# Login-flow acceptance test: read the page, fill it, submit, and land signed in,
+# with the credentials kept from the client.
 #
 #   ./scripts/verify-login.sh                 # native build
 #   MODE=wasix ./scripts/verify-login.sh      # the WASIX module under Wasmer
@@ -8,12 +9,15 @@
 # an HttpOnly session cookie, and a signed-in page that reads it back. That is
 # the shape of the reference site without its credentials.
 #
-# What it proves: agent-browser's `fill` reaches script-owned inputs,
-# `press Enter` submits through the page's own handler, the session survives
-# a reload, and the password never shows up in a snapshot or an error.
+# The credentials go to the engine the way they would for real: piped into its
+# stdin, bound to the site's origin with --secret. The client types
+# {{secret:NAME}} and never sees a value. The engine runs with WHB_TRACE_CDP=1,
+# its noisiest, and every word the client got back is kept, so the leak checks
+# at the end look at everything that could carry one.
 #
-# The wrong password is submitted by clicking the button, the right one by
-# pressing Enter, so both paths are covered.
+# The wrong password is typed as plain text and submitted by clicking the
+# button; the right one is a placeholder submitted by pressing Enter, so both
+# input paths are covered.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,6 +27,7 @@ SITE_PORT="${SITE_PORT:-8140}"
 SESSION="login-verify-$$"
 BASE="http://127.0.0.1:${CDP_PORT}"
 SITE="http://127.0.0.1:${SITE_PORT}"
+USER_NAME="kim"
 PASSWORD="hunter2"
 
 export AGENT_BROWSER_SESSION="$SESSION"
@@ -30,6 +35,7 @@ export AGENT_BROWSER_NAMESPACE="$SESSION"
 
 pass=0
 fail=0
+TRANSCRIPT=""
 
 check() {
   local what="$1" expected="$2" actual="$3"
@@ -54,30 +60,34 @@ check_absent() {
   fi
 }
 
+# Runs agent-browser and keeps what it said, for the leak checks.
 ab() {
-  agent-browser --cdp "$BASE" "$@" 2>&1 || true
+  local out
+  out="$(agent-browser --cdp "$BASE" "$@" 2>&1 || true)"
+  TRANSCRIPT+="$out"$'\n'
+  printf '%s' "$out"
 }
 
-# The ref agent-browser gave the textbox with this name in the last snapshot.
+# The ref agent-browser gave a role and name in a snapshot.
 ref_of() {
-  grep -o "textbox \"$1\" \[ref=e[0-9]*" <<<"$2" | grep -o 'e[0-9]*$' | head -1
+  grep -o "$1 \"$2\" \[ref=e[0-9]*" <<<"$3" | grep -o 'e[0-9]*$' | head -1
 }
 
 SERVER_ERR="$(mktemp)"
 start_engine() {
+  local command
   case "$MODE" in
-    native)
-      "$ROOT/target/release/wasm-headless-browser" --engine html "127.0.0.1:${CDP_PORT}" 2>"$SERVER_ERR" >/dev/null &
-      ;;
-    wasix)
-      wasmer run --net "$ROOT/target/wasm32-wasmer-wasi/release/wasm-headless-browser.wasm" \
-        -- --engine html "127.0.0.1:${CDP_PORT}" 2>"$SERVER_ERR" >/dev/null &
-      ;;
+    native) command=("$ROOT/target/release/wasm-headless-browser") ;;
+    # Wasmer does not pass the host's environment through; --env does.
+    wasix) command=(wasmer run --net --env WHB_TRACE_CDP=1 "$ROOT/target/wasm32-wasmer-wasi/release/wasm-headless-browser.wasm" --) ;;
     *)
       echo "unknown MODE '$MODE' (expected native or wasix)" >&2
       exit 2
       ;;
   esac
+  printf '%s\n%s\n' "$USER_NAME" "$PASSWORD" | WHB_TRACE_CDP=1 "${command[@]}" --engine html \
+    --secret "fixture_user@${SITE}" --secret "fixture_pw@${SITE}" "127.0.0.1:${CDP_PORT}" \
+    2>>"$SERVER_ERR" >/dev/null &
   SERVER_PID=$!
 }
 
@@ -119,33 +129,40 @@ check "the user field is there" 'textbox "User"' "$snap"
 check "the password field is there" 'textbox "Password"' "$snap"
 check "the submit button is there" 'button "Sign in"' "$snap"
 
-echo "a wrong password"
-ab fill "@$(ref_of User "$snap")" kim >/dev/null
-ab fill "@$(ref_of Password "$snap")" wrong-password >/dev/null
-check "clicking the button submits" "Done" "$(ab click "@$(grep -o 'button "Sign in" \[ref=e[0-9]*' <<<"$snap" | grep -o 'e[0-9]*$')")"
-check "the page reports the failure" 'alert.*Invalid credentials\|Invalid credentials' "$(ab snapshot)"
+echo "a wrong password, typed, submitted by clicking"
+ab fill "@$(ref_of textbox User "$snap")" "$USER_NAME" >/dev/null
+ab fill "@$(ref_of textbox Password "$snap")" wrong-password >/dev/null
+check "clicking the button submits" "Done" "$(ab click "@$(ref_of button 'Sign in' "$snap")")"
+check "the page reports the failure" 'Invalid credentials' "$(ab snapshot)"
 check_absent "the failed attempt left no sid" "sid=" "$(ab cookies get)"
 
-echo "the right password"
+echo "the right credentials, by placeholder, submitted with Enter"
 snap="$(ab snapshot -i)"
-check "fill reaches a script-owned input" "Done" "$(ab fill "@$(ref_of User "$snap")" kim)"
-check "the typed user shows in the tree" 'textbox "User".*: kim' "$(ab snapshot -i)"
-ab fill "@$(ref_of Password "$snap")" "$PASSWORD" >/dev/null
-check_absent "the password is not in the tree" "$PASSWORD" "$(ab snapshot)"
+check "a secret fills a script-owned input" "Done" "$(ab fill "@$(ref_of textbox User "$snap")" '{{secret:fixture_user}}')"
+check "the tree shows the placeholder, not the user" 'textbox "User".*{{secret:fixture_user}}' "$(ab snapshot -i)"
+ab fill "@$(ref_of textbox Password "$snap")" '{{secret:fixture_pw}}' >/dev/null
+check "reading the field back gives the placeholder" "{{secret:fixture_pw}}" "$(ab eval "document.getElementById('password').value")"
 check "Enter submits" "Done" "$(ab press Enter)"
-signed_in="$(ab snapshot)"
-check "the signed-in page renders" 'heading "Welcome, kim"' "$signed_in"
+check "the signed-in page renders, its name scrubbed" 'heading "Welcome, {{secret:fixture_user}}"' "$(ab snapshot)"
 check "the url moved with pushState" "$SITE/home" "$(ab get url)"
 check "the session cookie is in the jar" "sid=" "$(ab cookies get)"
 check_absent "page script cannot see the HttpOnly cookie" "sid=" "$(ab eval 'document.cookie')"
 
 echo "the session survives a reload"
 check "reopening /home is still signed in" "Fixture Login" "$(ab open "$SITE/home")"
-check "the cookie authenticated the API call" 'heading "Welcome, kim"' "$(ab snapshot)"
+check "the cookie authenticated the API call" 'heading "Welcome, ' "$(ab snapshot)"
+
+echo "a secret stays with its origin"
+ab open "data:text/html,<title>Elsewhere</title><input id=x aria-label=Elsewhere>" >/dev/null
+check "another origin's field refuses it" "is for $SITE" \
+  "$(ab fill '#x' '{{secret:fixture_pw}}')"
+check "and stays empty" '""' "$(ab eval "document.getElementById('x').value")"
 
 echo "what must not leak"
-check_absent "no snapshot carried the password" "$PASSWORD" "$signed_in$(ab snapshot)"
-check_absent "the engine's stderr does not carry it" "$PASSWORD" "$(cat "$SERVER_ERR")"
+check_absent "the client never saw the password" "$PASSWORD" "$TRANSCRIPT"
+check_absent "the client never saw the user name" "Welcome, $USER_NAME" "$TRANSCRIPT"
+check_absent "the engine's stderr, traced, does not carry it" "$PASSWORD" "$(cat "$SERVER_ERR")"
+check "the trace did run" "Input.insertText" "$(cat "$SERVER_ERR")"
 
 echo
 if ((fail > 0)); then

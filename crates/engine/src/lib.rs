@@ -27,6 +27,7 @@ pub mod fetch;
 pub mod js;
 pub mod layout;
 pub mod parse;
+pub mod secrets;
 pub mod select;
 pub mod style;
 #[cfg(test)]

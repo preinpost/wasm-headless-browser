@@ -154,7 +154,8 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 4. **클릭.** 실제 화면을 측정(M1.6)한 뒤 레이아웃과 히트테스트(M1.4),
    마우스 이벤트(M2.5). **완료.** 참조 사이트 로그인 화면이 Chrome과 거의 같은
    자리에 배치되고, 클릭 결과도 같다
-5. **자격증명.** 비밀번호가 어디로도 새지 않게 한다 (M4). 3단계부터 염두에 둔다
+5. **자격증명.** 비밀번호가 어디로도 새지 않게 한다 (M4). **완료.** 실제 계정으로
+   참조 사이트에 로그인하는 것은 사용자가 이 경로로 직접 한다
 
 검증은 로컬 로그인 픽스처로 합니다. 쿠키를 발급하는 작은 서버와 JS로
 그려지는 로그인 화면을 두고, agent-browser로 open → fill → click → 로그인 후
@@ -307,16 +308,17 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 
 ### 4.5 M4 자격증명 (P1, 목표의 핵심)
 
-- [ ] M4.1 자격증명을 메모리로만 받는 경로를 설계한다. 샌드박스 파일시스템과
-      브라우저 스토리지 어디에도 쓰지 않는다.
-- [ ] M4.2 `agent-browser`의 auth vault를 쓰지 않는다. 그 기능은 디스크에
-      저장하므로 요구와 정면으로 충돌한다. 직접 주입한다.
-- [ ] M4.3 비밀번호가 새지 않는 경로를 확인한다. 에러 메시지, 콘솔 로그,
-      스크린샷, CDP 이벤트, 크래시 출력을 모두 본다. 지금까지 확인한 것: 접근성
-      트리, `DOM.describeNode`, 엔진의 stderr에는 나오지 않는다(`verify-login.sh`).
-      **페이지 스크립트와 `Runtime.evaluate`/`callFunctionOn`으로는 읽힌다.**
-      로그인 폼을 제출하려면 페이지가 읽어야 하고, Chrome도 같다. 클라이언트가
-      그 값을 로그에 남기지 않게 하는 것은 엔진 밖의 문제다.
+- [x] M4.1 자격증명은 stdin으로만 받는다(`--secret 이름@출처`, 값은 한 줄씩).
+      인자·환경 변수·파일로는 받지 않고, stdin이 터미널이면 거부한다(WASIX에서는
+      `wasix-run.sh`가 호스트에서 검사). 클라이언트는 `{{secret:이름}}`을 `fill`하고,
+      엔진이 `Input.insertText` 안에서 그 출처의 페이지에만 값을 넣는다. 엔진이
+      내보내는 모든 CDP 결과·오류·이벤트와 탭 제목·URL에서 값을 자리표시자로
+      되돌린다. 값은 해제될 때 덮어쓴다. [docs/credentials.md](credentials.md).
+- [x] M4.2 agent-browser의 auth vault는 쓰지 않는다. 자리표시자로 대신한다.
+- [x] M4.3 유출 경로 점검. CDP 결과·오류·이벤트, 접근성 트리, 추적을 켠 엔진
+      stderr, 디스크는 확인했다(`verify-login.sh` 23개, 네이티브·WASIX). 콘솔은
+      아직 내보내지 않고, 스크린샷은 아직 없으며, 의존성의 panic 메시지는 통제하지
+      못한다. 악의적인 클라이언트는 한 글자씩 빼낼 수 있다(문서에 명시).
 
 ## 5. 미결 사항
 
@@ -406,6 +408,12 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 - **Chrome과 레이아웃을 비교하려면** `~/Library/Caches/ms-playwright`의 headless
   shell을 `agent-browser --executable-path`로 띄운다. 사용자의 Chrome 프로필을
   건드리지 않는다. 둘 다 `set viewport 800 600`으로 맞춘다.
+- **Wasmer에서는 게스트의 stdin이 늘 터미널로 보인다.** 파이프로 넣어도 그렇다.
+  그래서 브라우저는 WASI 타깃에서 터미널 검사를 하지 않고, `wasix-run.sh`가 호스트에서
+  한다. 값 자체는 파이프로 제대로 전달된다. 또 Wasmer는 호스트의 환경 변수를 넘기지
+  않으므로 `WHB_TRACE_CDP` 같은 것은 `wasmer run --env`로 준다.
+- **agent-browser의 `type`은 한 글자씩 `Input.insertText`를 보낸다.** 그래서
+  자리표시자는 `fill`로만 동작한다.
 - **클라이언트가 무엇을 보내는지는 `WHB_TRACE_CDP=1`로 본다.** 모든 CDP 요청과
   응답이 잘려서 stderr로 나온다. 예를 들어 agent-browser의 `fill`은
   `DOM.resolveNode` → `callFunctionOn(focus)` → `callFunctionOn(값 지우기)` →
