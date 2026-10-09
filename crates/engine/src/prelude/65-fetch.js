@@ -2,9 +2,10 @@
 // connections the engine cannot make yet, which fail rather than hang.
 //
 // Every request goes through the engine's client, so it carries the page's
-// cookies and stores the ones it gets back. Requests run synchronously in
-// Rust; `fetch` and async XHR make them look asynchronous by completing in a
-// task. Two known gaps: bodies cross into Rust as UTF-8 strings, so binary
+// cookies and stores the ones it gets back. `fetch` and async XHR start the
+// request at once on a thread of the engine's and collect the response in the
+// task that delivers it, so the download overlaps the script that runs
+// meanwhile, and events still come in a fixed order. Two known gaps: bodies cross into Rust as UTF-8 strings, so binary
 // uploads and downloads are mangled; and cross-origin requests are not
 // checked against CORS.
 
@@ -25,7 +26,21 @@ function performRequest(method, url, headers, body) {
     if (!blob) return { status: 0, statusText: 'unknown blob URL', url, headers: [], body: '' };
     return { status: 200, statusText: 'OK', url, headers: [['content-type', blob.type]], body: utf8Decode(blobBytes.get(blob)) };
   }
-  const raw = api.http(String(method), String(url), headers, body ?? '');
+  return responseFrom(api.http(String(method), String(url), headers, body ?? ''));
+}
+
+// [`performRequest`], started now. Returns a function that waits for the
+// response, for the task that uses it; `finish.cancel()` gives up on it.
+function startRequest(method, url, headers, body) {
+  if (String(url).startsWith('blob:')) {
+    const response = performRequest(method, url, headers, body);
+    return Object.assign(() => response, { cancel() {} });
+  }
+  const handle = api.httpStart(String(method), String(url), headers, body ?? '');
+  return Object.assign(() => responseFrom(api.httpFinish(handle)), { cancel: () => api.httpDrop(handle) });
+}
+
+function responseFrom(raw) {
   return { status: Number(raw[0]), statusText: raw[1], url: raw[2], headers: parseRawHeaders(raw[3]), body: raw[4] };
 }
 
@@ -175,8 +190,9 @@ function fetch(input, init) {
       reject(abortError(signal));
       return;
     }
+    const finish = startRequest(request.method, request.url, flatHeaders(request.headers), bodies.get(request).text);
     const handle = schedule(() => {
-      const r = performRequest(request.method, request.url, flatHeaders(request.headers), bodies.get(request).text);
+      const r = finish();
       if (r.status === 0) {
         reject(new TypeError(`Failed to fetch: ${r.statusText}`));
         return;
@@ -190,6 +206,7 @@ function fetch(input, init) {
     if (signal) {
       signal.addEventListener('abort', () => {
         cancel(handle);
+        finish.cancel();
         reject(abortError(signal));
       }, { once: true });
     }
@@ -273,7 +290,7 @@ const XHR_STATES = { UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE
 class XMLHttpRequest extends XMLHttpRequestEventTarget {
   constructor() {
     super();
-    xhrState.set(this, { readyState: 0, method: 'GET', url: '', async: true, headers: [], response: null, sent: false, handle: 0 });
+    xhrState.set(this, { readyState: 0, method: 'GET', url: '', async: true, headers: [], response: null, sent: false, handle: 0, finish: null });
     this.upload = new XMLHttpRequestUpload();
     this.responseType = '';
     this.timeout = 0;
@@ -355,17 +372,19 @@ class XMLHttpRequest extends XMLHttpRequestEventTarget {
     const hasBody = s.method !== 'GET' && s.method !== 'HEAD';
     const { text, contentType } = hasBody ? encodeBody(body) : { text: '', contentType: null };
     if (contentType && !s.headers.some((h, i) => i % 2 === 0 && h.toLowerCase() === 'content-type')) s.headers.push('Content-Type', contentType);
-    const run = () => performRequest(s.method, s.url, s.headers, text);
     if (!s.async) {
-      const r = run();
+      const r = performRequest(s.method, s.url, s.headers, text);
       finishXhr(this, r);
       if (r.status === 0) throw domError('NetworkError', `Failed to execute 'send' on 'XMLHttpRequest': Failed to load '${s.url}'.`);
       return;
     }
+    const finish = startRequest(s.method, s.url, s.headers, text);
+    s.finish = finish;
     dispatch(this, new ProgressEvent('loadstart'));
     s.handle = schedule(() => {
       s.handle = 0;
-      finishXhr(this, run());
+      s.finish = null;
+      finishXhr(this, finish());
     }, 0);
   }
   abort() {
@@ -373,6 +392,8 @@ class XMLHttpRequest extends XMLHttpRequestEventTarget {
     if (s.handle) {
       cancel(s.handle);
       s.handle = 0;
+      s.finish?.cancel();
+      s.finish = null;
     }
     if (s.sent && s.readyState !== 4) {
       s.readyState = 4;

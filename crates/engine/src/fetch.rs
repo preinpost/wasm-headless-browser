@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject;
@@ -231,10 +231,69 @@ pub struct Client {
     /// clone. A page load is dozens of requests to one host; a new TCP and
     /// TLS handshake for each cost about 100 ms apiece on the reference site.
     idle: Arc<Mutex<HashMap<String, Vec<Connection>>>>,
+    /// Requests started ahead of being asked for, by URL. See
+    /// [`Client::preload`].
+    preloads: Arc<Mutex<HashMap<String, Pending>>>,
+    /// Requests in flight on their own threads, by host.
+    slots: Arc<Slots>,
 }
 
 /// Idle connections kept per host, as browsers bound theirs.
 const MAX_IDLE_PER_HOST: usize = 6;
+
+/// Requests [started](Client::start) at once against one host. Chrome's
+/// limit, and the same as the idle pool, so a burst finds connections to
+/// reuse rather than opening new ones.
+pub const MAX_CONNECTIONS_PER_HOST: usize = 6;
+
+/// A request running on its own thread.
+pub struct Pending(mpsc::Receiver<Result<Response, FetchError>>);
+
+impl Pending {
+    /// Waits for the answer.
+    pub fn wait(self) -> Result<Response, FetchError> {
+        self.0
+            .recv()
+            .unwrap_or_else(|_| Err(FetchError::Io("the request could not be started on a thread".into())))
+    }
+}
+
+/// Counts requests in flight per host and makes the next one wait when a
+/// host has [`MAX_CONNECTIONS_PER_HOST`].
+#[derive(Default)]
+struct Slots {
+    busy: Mutex<HashMap<String, usize>>,
+    freed: Condvar,
+}
+
+impl Slots {
+    fn acquire(&self, host: &str) -> Slot<'_> {
+        let mut busy = self.busy.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while busy.get(host).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_HOST {
+            busy = self.freed.wait(busy).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *busy.entry(host.to_string()).or_default() += 1;
+        Slot { slots: self, host: host.to_string() }
+    }
+}
+
+/// One request's place against its host, given back when it is dropped.
+struct Slot<'a> {
+    slots: &'a Slots,
+    host: String,
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        let mut busy = self.slots.busy.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = busy.get_mut(&self.host) {
+            *count -= 1;
+        }
+        // All, not one: a waiter woken for another host would sleep again
+        // and leave this host's waiter asleep.
+        self.slots.freed.notify_all();
+    }
+}
 
 impl Client {
     pub fn new(cookies: Arc<Mutex<CookieJar>>) -> Self {
@@ -242,7 +301,13 @@ impl Client {
     }
 
     pub fn with_tls(cookies: Arc<Mutex<CookieJar>>, tls: Arc<ClientConfig>) -> Self {
-        Client { tls, cookies, idle: Arc::new(Mutex::new(HashMap::new())) }
+        Client {
+            tls,
+            cookies,
+            idle: Arc::new(Mutex::new(HashMap::new())),
+            preloads: Arc::new(Mutex::new(HashMap::new())),
+            slots: Arc::new(Slots::default()),
+        }
     }
 
     pub fn cookies(&self) -> &Arc<Mutex<CookieJar>> {
@@ -253,7 +318,76 @@ impl Client {
         self.send(Request::get(url))
     }
 
+    /// Sends `request` and waits for the answer. A plain `GET` for a URL
+    /// that was [preloaded](Self::preload) takes the preload's answer instead,
+    /// waiting for it if it is still on its way.
     pub fn send(&self, request: Request) -> Result<Response, FetchError> {
+        if let Some(pending) = self.take_preload(&request) {
+            return pending.wait();
+        }
+        self.send_direct(request)
+    }
+
+    /// Starts `request` on a thread of its own and returns at once. The
+    /// answer is collected with [`Pending::wait`]. At most
+    /// [`MAX_CONNECTIONS_PER_HOST`] run against one host at a time, as in a
+    /// browser; the rest queue.
+    ///
+    /// This is how a page load stops being one request after another: the
+    /// reference site's login screen is 71 requests and 26 MB, and fetched in
+    /// sequence they took 3.5 of its 5 seconds.
+    pub fn start(&self, request: Request) -> Pending {
+        let (tx, rx) = mpsc::channel();
+        let client = self.clone();
+        let host = Url::parse(&request.url).map(|u| u.authority()).unwrap_or_default();
+        // If the thread cannot be made, the sender is dropped with the
+        // closure and `wait` reports that.
+        let _ = std::thread::Builder::new().name("fetch".into()).spawn(move || {
+            let _slot = client.slots.acquire(&host);
+            let _ = tx.send(client.send_direct(request));
+        });
+        Pending(rx)
+    }
+
+    /// Starts a `GET` for `url` now, for a [`send`](Self::send) that will ask
+    /// for it later. A browser's preload scanner does this for the scripts
+    /// and stylesheets it finds while parsing. Asking twice starts it once.
+    pub fn preload(&self, url: &str) {
+        if url.starts_with("data:") {
+            return;
+        }
+        let mut preloads = self.preloads();
+        if !preloads.contains_key(url) {
+            preloads.insert(url.to_string(), self.start(Request::get(url)));
+        }
+    }
+
+    /// Drops preloads nothing asked for, when the document that wanted them
+    /// is gone.
+    pub fn clear_preloads(&self) {
+        self.preloads().clear();
+    }
+
+    /// The preload `request` can be answered from: a `GET` for the same URL
+    /// that asks for nothing but a content type. A request with its own
+    /// headers, credentials for instance, is sent as it is.
+    fn take_preload(&self, request: &Request) -> Option<Pending> {
+        let plain = request.method.eq_ignore_ascii_case("GET")
+            && request.headers.iter().all(|(name, _)| name.eq_ignore_ascii_case("accept"));
+        if !plain {
+            return None;
+        }
+        self.preloads().remove(&request.url)
+    }
+
+    fn preloads(&self) -> std::sync::MutexGuard<'_, HashMap<String, Pending>> {
+        self.preloads.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// [`send`](Self::send) without looking at the preloads. A preload's own
+    /// thread sends this way; through `send` it would find itself and wait
+    /// for its own answer.
+    fn send_direct(&self, request: Request) -> Result<Response, FetchError> {
         if let Some(response) = local_response(&request.url)? {
             return Ok(response);
         }
@@ -887,6 +1021,19 @@ mod tests {
     }
 
     #[test]
+    fn a_get_takes_the_preload_and_others_do_not() {
+        // serve_once answers one connection: a second request would fail.
+        let url = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".into());
+        let client = client();
+        client.preload(&url);
+        let with_header = Request { headers: vec![("Authorization".into(), "x".into())], ..Request::get(&url) };
+        assert!(client.take_preload(&with_header).is_none());
+        let response = client.send(Request { headers: vec![("Accept".into(), "*/*".into())], ..Request::get(&url) });
+        assert_eq!(response.unwrap().body, b"hi");
+        assert!(client.take_preload(&Request::get(&url)).is_none(), "taken once");
+    }
+
+    #[test]
     fn a_307_repeats_the_post() {
         let (base, requests) = serve_script(vec![
             "HTTP/1.1 307 Temporary Redirect\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n".to_string(),
@@ -1112,3 +1259,4 @@ mod tests {
         assert!(err.to_string().contains("connect"), "message: {err}");
     }
 }
+

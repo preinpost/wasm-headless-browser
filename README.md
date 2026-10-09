@@ -31,7 +31,8 @@ Each runs natively and as the WASIX module under Wasmer (`MODE=wasix`), with
 the real `agent-browser` CLI (0.38.2).
 
 On a real React single-page app, the reference site's login screen opens in
-about five seconds, lays out within a pixel or two of Chrome at the same
+about four seconds (3.5 native, 4.2 under WASIX), its 71 requests downloading
+in parallel, lays out within a pixel or two of Chrome at the same
 viewport, and takes `fill`, `click` and `press Enter`.
 
 Not there yet: screenshots (no rasterizer), scrolling, ES modules, and

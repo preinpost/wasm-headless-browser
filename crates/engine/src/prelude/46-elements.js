@@ -162,9 +162,9 @@ function linkInserted(id) {
   if (requestedLinks.has(id) || !isStylesheetLink(id)) return;
   requestedLinks.add(id);
   const el = wrap(id);
-  const href = el.href;
+  const finish = startRequest('GET', el.href, ['Accept', 'text/css,*/*;q=0.1'], '');
   schedule(() => {
-    const response = performRequest('GET', href, ['Accept', 'text/css,*/*;q=0.1'], '');
+    const response = finish();
     const ok = response.status >= 200 && response.status < 300;
     if (ok) api.setStylesheet(id, response.body);
     fire(el, ok ? 'load' : 'error');

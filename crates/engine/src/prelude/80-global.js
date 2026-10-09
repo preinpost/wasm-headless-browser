@@ -68,7 +68,8 @@ function scriptKind(id) {
 }
 
 // Fetches and runs one script element. Returns an error message, or ''.
-function runScriptElement(id) {
+// `finish` collects a request already started for its `src`.
+function runScriptElement(id, finish) {
   const kind = scriptKind(id);
   if (kind === null) return '';
   const el = wrap(id);
@@ -83,7 +84,7 @@ function runScriptElement(id) {
   let name;
   if (src !== undefined) {
     const url = resolveUrl(src);
-    const response = url ? performRequest('GET', url, ['Accept', '*/*'], '') : { status: 0, statusText: 'invalid URL' };
+    const response = finish ? finish() : url ? performRequest('GET', url, ['Accept', '*/*'], '') : { status: 0, statusText: 'invalid URL' };
     if (response.status === 0 || response.status >= 400) {
       fire(el, 'error');
       return `could not load ${url ?? src}: ${response.status === 0 ? response.statusText : 'HTTP ' + response.status}`;
@@ -106,14 +107,19 @@ function runScriptElement(id) {
 
 // A script that became connected, or got its content or `src`, after the
 // parser was done. Inline scripts run at once; external ones in a task,
-// because a script inserted by script is async.
+// because a script inserted by script is async. The download starts now, so
+// a bundler that inserts a dozen chunks gets them in parallel.
 function prepareScript(id) {
   if (startedScripts.has(id) || parserScripts.has(id) || !api.isConnected(id)) return;
   const hasSrc = api.hasAttr(id, 'src');
   // An empty inline script waits for content or a src, as in a browser.
   if (!hasSrc && !api.textContent(id).trim()) return;
   startedScripts.add(id);
-  if (hasSrc) schedule(() => runScriptElement(id), 0);
+  if (hasSrc) {
+    const url = scriptKind(id) === 'classic' ? resolveUrl(api.attr(id, 'src')) : null;
+    const finish = url ? startRequest('GET', url, ['Accept', '*/*'], '') : undefined;
+    schedule(() => runScriptElement(id, finish), 0);
+  }
   else runScriptElement(id);
 }
 

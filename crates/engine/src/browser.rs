@@ -207,6 +207,7 @@ impl HtmlEngine {
         // The document lock borrows `self`, so everything that touches other
         // fields is collected here and applied once the guard is dropped.
         let requested = request.url.clone();
+        self.client.clear_preloads();
         let fetched = self.client.send(request);
         let mut new_url = requested.clone();
         let new_error;
@@ -248,6 +249,7 @@ impl HtmlEngine {
         self.url = new_url;
         self.last_error = new_error;
 
+        self.preload_subresources();
         self.load_stylesheets();
 
         // A new document gets a new global environment, as in a browser. The
@@ -259,19 +261,42 @@ impl HtmlEngine {
         }
     }
 
+    /// Starts fetching every stylesheet and classic script the parser found,
+    /// all at once, as a browser's preload scanner does. They are still used
+    /// in the order the page puts them; this only stops each waiting for the
+    /// one before it to download. Scripts download while the stylesheets are
+    /// parsed and while earlier scripts run.
+    fn preload_subresources(&self) {
+        let Ok(base) = url::Url::parse(&self.url) else { return };
+        let urls: Vec<String> = {
+            let doc = self.doc();
+            doc.descendants(doc.document_id())
+                .filter_map(|id| {
+                    let href = if doc.is_tag(id, "link") && has_token(doc.attr(id, "rel"), "stylesheet") {
+                        doc.attr(id, "href")
+                    } else if doc.is_tag(id, "script") && is_classic_script_type(doc.attr(id, "type")) {
+                        doc.attr(id, "src")
+                    } else {
+                        None
+                    };
+                    base.join(href?).ok().map(String::from)
+                })
+                .collect()
+        };
+        for url in urls {
+            self.client.preload(&url);
+        }
+    }
+
     /// Fetches the stylesheets the parser found, before any script runs, as a
-    /// browser holds scripts back for them. One after another, over the
-    /// client's kept-alive connections. Ones that fail are left out of the
-    /// cascade, as a browser leaves them out.
+    /// browser holds scripts back for them. They were
+    /// [preloaded](Self::preload_subresources), so this mostly waits. Ones
+    /// that fail are left out of the cascade, as a browser leaves them out.
     fn load_stylesheets(&mut self) {
         let links: Vec<(NodeId, String)> = {
             let doc = self.doc();
             doc.descendants(doc.document_id())
-                .filter(|id| doc.is_tag(*id, "link"))
-                .filter(|id| {
-                    doc.attr(*id, "rel")
-                        .is_some_and(|rel| rel.split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("stylesheet")))
-                })
+                .filter(|id| doc.is_tag(*id, "link") && has_token(doc.attr(*id, "rel"), "stylesheet"))
                 .filter_map(|id| doc.attr(id, "href").map(|href| (id, href.to_string())))
                 .collect()
         };
@@ -1185,6 +1210,19 @@ fn escape_html(input: &str) -> String {
 
 /// The page shown when a navigation fails. A browser shows something; so does
 /// this, because a client reading an empty document learns nothing.
+/// Whether a space-separated attribute such as `rel` holds `token`.
+fn has_token(value: Option<&str>, token: &str) -> bool {
+    value.is_some_and(|v| v.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case(token)))
+}
+
+/// Whether a `<script type>` is one the engine runs as a classic script.
+/// The prelude's `scriptKind` decides for real; this only has to agree well
+/// enough not to preload what will not run.
+fn is_classic_script_type(kind: Option<&str>) -> bool {
+    let Some(kind) = kind.map(|k| k.trim().to_ascii_lowercase()) else { return true };
+    kind.is_empty() || kind.contains("javascript") || kind.contains("ecmascript") || kind.contains("jscript")
+}
+
 fn error_page(url: &str, message: &str) -> String {
     format!(
         "<!doctype html><html><head><title>{title}</title></head>\
@@ -1267,6 +1305,91 @@ mod tests {
 
         // Page script sees only what is not HttpOnly.
         assert_eq!(evaluate(&mut engine, "document.cookie")["result"]["value"], "theme=dark");
+    }
+
+    #[test]
+    fn the_parser_found_scripts_and_stylesheets_download_together() {
+        let base = crate::test_server::serve_together(
+            vec![
+                ("/", "text/html", "<link rel=stylesheet href=s.css><script src=a.js></script><script src=b.js></script>".into()),
+                ("/s.css", "text/css", "p { color: red }".into()),
+                ("/a.js", "text/javascript", "document.title = 'a';".into()),
+                ("/b.js", "text/javascript", "document.title += 'b';".into()),
+            ],
+            vec!["/s.css", "/a.js", "/b.js"],
+        );
+        let mut engine = HtmlEngine::new("t");
+        engine.load(&format!("{base}/"));
+        assert_eq!(engine.last_error, None);
+        assert_eq!(evaluate(&mut engine, "document.title")["result"]["value"], "ab");
+        assert_eq!(evaluate(&mut engine, "document.styleSheets.length")["result"]["value"], 1);
+    }
+
+    #[test]
+    fn what_script_requests_downloads_together_and_runs_in_order() {
+        let base = crate::test_server::serve_together(
+            vec![
+                (
+                    "/",
+                    "text/html",
+                    "<script>
+                       window.log = [];
+                       for (const name of ['c.js', 'd.js']) {
+                         const s = document.createElement('script');
+                         s.src = name;
+                         document.head.append(s);
+                       }
+                       const l = document.createElement('link');
+                       l.rel = 'stylesheet';
+                       l.href = 't.css';
+                       l.onload = () => log.push('css');
+                       document.head.append(l);
+                       fetch('e.json').then((r) => r.json()).then((j) => log.push(j.name));
+                       const x = new XMLHttpRequest();
+                       x.open('GET', 'f.txt');
+                       x.onload = () => log.push(x.responseText);
+                       x.send();
+                     </script>"
+                        .into(),
+                ),
+                ("/c.js", "text/javascript", "log.push('c');".into()),
+                ("/d.js", "text/javascript", "log.push('d');".into()),
+                ("/t.css", "text/css", "p { color: red }".into()),
+                ("/e.json", "application/json", r#"{"name":"e"}"#.into()),
+                ("/f.txt", "text/plain", "f".into()),
+            ],
+            vec!["/c.js", "/d.js", "/t.css", "/e.json", "/f.txt"],
+        );
+        let mut engine = HtmlEngine::new("t");
+        engine.load(&format!("{base}/"));
+        assert_eq!(engine.last_error, None);
+        // Each completes in the task it was queued in, so the order is the
+        // order they were asked for, whatever order they arrived in.
+        assert_eq!(evaluate(&mut engine, "log.join()")["result"]["value"], "c,d,css,e,f");
+    }
+
+    #[test]
+    fn an_aborted_fetch_is_dropped() {
+        let base = crate::test_server::serve_together(
+            vec![
+                (
+                    "/",
+                    "text/html",
+                    "<script>
+                       window.log = [];
+                       const c = new AbortController();
+                       fetch('slow.txt', { signal: c.signal }).then(() => log.push('done'), (e) => log.push(e.name));
+                       c.abort();
+                     </script>"
+                        .into(),
+                ),
+                ("/slow.txt", "text/plain", "x".into()),
+            ],
+            vec!["/slow.txt"],
+        );
+        let mut engine = HtmlEngine::new("t");
+        engine.load(&format!("{base}/"));
+        assert_eq!(evaluate(&mut engine, "log.join()")["result"]["value"], "AbortError");
     }
 
     #[test]

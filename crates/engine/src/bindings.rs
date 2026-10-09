@@ -99,6 +99,9 @@ pub struct DomState {
     /// memory only, like the cookie jar, and for the same reason: login tokens
     /// end up here.
     storage: Arc<Mutex<HashMap<String, Vec<(String, String)>>>>,
+    /// Requests script started and has not collected yet, by handle. See
+    /// `httpStart`.
+    requests: Arc<Mutex<HashMap<u32, (fetch::Pending, String)>>>,
 }
 
 impl DomState {
@@ -119,6 +122,7 @@ impl DomState {
             viewport: Arc::new(Mutex::new(viewport)),
             user_agent: Arc::new(Mutex::new(user_agent.to_string())),
             storage: Arc::new(Mutex::new(HashMap::new())),
+            requests: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -789,6 +793,46 @@ fn put_navigation<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>)
     Ok(())
 }
 
+/// A request from script: `url` against the document's, and headers from
+/// the flat `[name, value, name, value]` list the prelude passes.
+fn http_request(
+    doc: &Arc<Mutex<Document>>,
+    method: String,
+    url: String,
+    headers: Vec<String>,
+    body: String,
+) -> fetch::Request {
+    let base = with_doc(doc, |d| d.url().to_string()).unwrap_or_default();
+    let url = resolve_url(&base, &url).unwrap_or(url);
+    let headers = headers
+        .chunks(2)
+        .filter_map(|pair| match pair {
+            [name, value] => Some((name.clone(), value.clone())),
+            _ => None,
+        })
+        .collect();
+    fetch::Request { method, url, headers, body: body.into_bytes() }
+}
+
+/// A response as the prelude reads it: `[status, statusText, finalUrl,
+/// rawHeaders, body]`. A status of 0 means the request failed, and
+/// statusText says why.
+fn http_answer(result: Result<fetch::Response, fetch::FetchError>, url: String) -> Vec<String> {
+    match result {
+        Ok(response) => {
+            let raw_headers = response.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect::<String>();
+            vec![
+                response.status.to_string(),
+                response.reason,
+                response.url,
+                raw_headers,
+                String::from_utf8_lossy(&response.body).into_owned(),
+            ]
+        }
+        Err(e) => vec!["0".into(), e.to_string(), url, String::new(), String::new()],
+    }
+}
+
 /// The rest of the web platform that needs the host: running script text,
 /// the network, URLs, randomness, base64 and storage.
 fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -> Result<(), JsError> {
@@ -807,39 +851,57 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
     });
 
     {
-        // One request through the engine's client, synchronously. The
-        // prelude makes it look asynchronous by running it from a task.
-        // Returns [status, statusText, finalUrl, rawHeaders, body]; a status
-        // of 0 means the request failed and statusText says why.
+        // One request through the engine's client, synchronously: a
+        // synchronous XHR, and parser scripts, which the engine has usually
+        // preloaded. Returns what `http_answer` makes.
         let doc = Arc::clone(&state.doc);
         let client = state.client.clone();
         install_fn!(ctx, api, "http", move |method: String, url: String, headers: Vec<String>, body: String| {
-            let base = with_doc(&doc, |d| d.url().to_string()).unwrap_or_default();
-            let absolute = resolve_url(&base, &url).unwrap_or(url);
-            let headers = headers
-                .chunks(2)
-                .filter_map(|pair| match pair {
-                    [name, value] => Some((name.clone(), value.clone())),
-                    _ => None,
-                })
-                .collect();
-            let request = fetch::Request { method, url: absolute.clone(), headers, body: body.into_bytes() };
-            match client.send(request) {
-                Ok(response) => {
-                    let raw_headers = response
-                        .headers
-                        .iter()
-                        .map(|(k, v)| format!("{k}: {v}\r\n"))
-                        .collect::<String>();
-                    vec![
-                        response.status.to_string(),
-                        response.reason,
-                        response.url,
-                        raw_headers,
-                        String::from_utf8_lossy(&response.body).into_owned(),
-                    ]
-                }
-                Err(e) => vec!["0".into(), e.to_string(), absolute, String::new(), String::new()],
+            let request = http_request(&doc, method, url, headers, body);
+            let url = request.url.clone();
+            http_answer(client.send(request), url)
+        });
+    }
+    {
+        // The same request, started now on its own thread, for `fetch`, an
+        // asynchronous XHR, or a script or stylesheet that script inserted.
+        // The prelude collects it with `httpFinish` from the task that
+        // delivers it, so the page sees events in the same order as before
+        // and the download overlaps whatever runs in between. Returns a
+        // handle.
+        let doc = Arc::clone(&state.doc);
+        let client = state.client.clone();
+        let requests = Arc::clone(&state.requests);
+        let next = Arc::new(Mutex::new(0u32));
+        install_fn!(ctx, api, "httpStart", move |method: String, url: String, headers: Vec<String>, body: String| {
+            let request = http_request(&doc, method, url, headers, body);
+            let url = request.url.clone();
+            let pending = client.start(request);
+            let mut next = next.lock().unwrap_or_else(|p| p.into_inner());
+            *next += 1;
+            if let Ok(mut requests) = requests.lock() {
+                requests.insert(*next, (pending, url));
+            }
+            *next
+        });
+    }
+    {
+        let requests = Arc::clone(&state.requests);
+        install_fn!(ctx, api, "httpFinish", move |handle: u32| {
+            let started = requests.lock().ok().and_then(|mut r| r.remove(&handle));
+            match started {
+                Some((pending, url)) => http_answer(pending.wait(), url),
+                None => http_answer(Err(fetch::FetchError::Io("no such request".into())), String::new()),
+            }
+        });
+    }
+    {
+        // An aborted request: its answer is not wanted. The thread finishes
+        // on its own.
+        let requests = Arc::clone(&state.requests);
+        install_fn!(ctx, api, "httpDrop", move |handle: u32| {
+            if let Ok(mut requests) = requests.lock() {
+                requests.remove(&handle);
             }
         });
     }

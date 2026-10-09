@@ -4,7 +4,7 @@
 문서가 영어로 된 다른 파일들과 섞이지만, 이 문서는 작업용이라 한국어로 씁니다.
 
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
-자격증명)를 모두 마쳤다. 다음 후보는 §0.4.
+자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -16,8 +16,8 @@ HTML을 파싱하고, 페이지 JS를 QuickJS로 돌리고, 스타일시트를 �
 세션은 메모리 전용 쿠키 저장소에 남는다. 자격증명은 자리표시자로 입력하고
 클라이언트에게 돌아가지 않는다(`docs/credentials.md`).
 
-참조 사이트(`https://login.example.com`, React SPA)의 로그인 화면이 약 5초에
-열리고, 800×600에서 Chrome과 1px 안팎으로 같은 자리에 배치되며, `fill`·`click`·
+참조 사이트(`https://login.example.com`, React SPA)의 로그인 화면이 네이티브 약
+3.5초, WASIX 약 4.2초에 열리고, 800×600에서 Chrome과 1px 안팎으로 같은 자리에 배치되며, `fill`·`click`·
 `press Enter`가 된다. 가짜 계정으로 실패 응답까지 확인했다. 실제 계정 로그인은
 사용자가 `--secret`으로 직접 한다(README의 "Running it").
 
@@ -42,7 +42,7 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 157, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 161, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 39 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 23 |
@@ -54,13 +54,15 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 - **스크린샷 (M1.5).** 남은 가장 큰 빈칸. 레이아웃이 있으니 박스·글자를 대략
   그릴 수 있다. 비밀번호 칸은 점으로 그려야 한다(M4.3).
-- **로딩 시간 (M2.13).** 참조 사이트 약 5초. 스타일시트와 청크를 병렬로 받으면 준다.
 - **`Network.*` 이벤트 (M3.1).** HAR과 `route`. 요청 본문의 비밀번호는 가리기 층이
   자동으로 덮는다.
 - **콘솔 (`Runtime.consoleAPICalled`).** 지금은 `probe_a_url`로만 본다.
 - **스크롤.** `scrollIntoView`가 아무것도 안 한다. 뷰포트 밖 요소의 클릭은 되지만
   `elementFromPoint`는 뷰포트 안만 본다.
 - **ES 모듈 (M2.11).**
+- **접근성 이름에 숨은 글자가 섞인다.** 참조 사이트 스냅샷의 최상위 `generic`(e1)의
+  이름에 `display:none`인 추가 인증 화면의 글자가 들어간다. 내용에서 이름을 만들 때
+  숨은 하위 요소를 빼야 한다(ax.rs). M2.13 전후로 같으므로 원래 있던 문제다.
 
 ### 0.5 이번 세션의 커밋 (오래된 것부터)
 
@@ -79,6 +81,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `0cf68cb` | 캐스케이드를 페이지에 연결: 시트 수집, 캐시, 접근성 트리, `getComputedStyle` |
 | `8abfeaa` | 레이아웃(taffy), 히트 테스트, 마우스 입력 (M1.4·M2.5) |
 | `d9c4296` | 자격증명: stdin, 자리표시자, CDP 출력 가리기 (M4) |
+| `ee1a18c` | 백로그 정리 |
 
 ## 1. 엔진 구조
 
@@ -87,7 +90,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | 파일 | 하는 일 |
 |---|---|
 | `browser.rs` | `HtmlEngine`. CDP 메서드, 로드 순서(가져오기 → 스타일시트 → 스크립트), 히스토리. 맨 바깥 `impl Engine`이 모든 출력에서 비밀을 가린다 |
-| `fetch.rs` | HTTP/1.1 클라이언트. TLS, keep-alive 풀, 리다이렉트, 쿠키 |
+| `fetch.rs` | HTTP/1.1 클라이언트. TLS, keep-alive 풀, 리다이렉트, 쿠키. `start`(스레드에서 요청, 호스트당 6개)와 `preload` |
 | `cookies.rs` | RFC 6265 쿠키 저장소. 메모리 전용, 모든 타깃이 공유 |
 | `dom.rs`, `parse.rs` | 아레나 DOM과 html5ever 싱크. 폼 상태(`Control`), 변경 버전, 스타일·레이아웃 캐시 |
 | `select.rs` | 선택자 파서·매처·명시도 |
@@ -138,6 +141,8 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | 참조 사이트의 React 입력란에 agent-browser `fill`이 동작한다. 아이디는 스냅샷에 나오고 비밀번호는 나오지 않는다 | 2026-10-09 agent-browser |
 | 참조 사이트의 로그인 화면이 WASIX에서 그려진다. 숨은 화면을 빼면 첫 단계 스냅샷은 첫 입력란·아이디·"다음"·체크박스뿐이고, 비밀번호 칸은 "다음" 뒤에 나온다 | 2026-10-09 agent-browser |
 | QuickJS 호출은 V8보다 네이티브 스택을 훨씬 많이 쓴다. 기본 한도 1MB로는 React 렌더링이 넘친다. 스크립트 스레드는 32MB 스택에 한도 24MB로 돈다 | 같은 측정 |
+| 참조 사이트는 gzip을 요청마다 즉석에서 압축해서 오히려 느리다. The largest bundle는 원본 4.6MB가 0.37~0.49초, gzip 1.2MB가 0.84~0.90초(curl, 세 번씩). 그래서 엔진은 `Accept-Encoding: identity`를 유지한다. 느린 회선에서는 반대일 수 있다 | 2026-10-09 |
+| 엔진 클라이언트의 다운로드 속도는 curl과 같다(큰 파일 4개 11MB를 순차 0.9~1.2초, 병렬 0.7~0.9초). 이 회선에서 병렬은 처리량보다 파싱과 겹치는 데 쓸모가 있다 | 같은 날 |
 | 참조 사이트는 React 번들 3개와 the grid library·jQuery·lottie를 싣는다. jQuery는 초기화 때 `createHTMLDocument`를, lottie는 캔버스 2D 컨텍스트를 요구하고, the grid library는 `Function.caller`를 요구한다 | 2026-10-09 `probe_a_url` |
 | agent-browser의 `back`·`forward`는 CDP 메서드가 아니라 `Runtime.evaluate("history.back()")`이다 | [docs/capture/required-expressions.txt](capture/required-expressions.txt) |
 | `Context::full`이 죽는 원인은 sysroot 불일치 하나다. `CLOCK_MONOTONIC`이 포인터 인코딩(1058440)으로 컴파일되고 WASIX는 정수 1을 기대한다 | 같은 문서 |
@@ -301,10 +306,19 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       `this._super.caller`로 부모 메서드를 찾는데 QuickJS는 늘 `undefined`를 줬다.
       rquickjs-sys를 `vendor/`에 들여와 QuickJS를 패치했다
       ([vendor/README.md](../vendor/README.md)).
-- [ ] M2.13 참조 사이트를 여는 시간. 처음 12초 중 9초는 요청 69개가 매번 새로 맺는
-      TCP·TLS였고, keep-alive 연결 풀로 3.5초가 됐다. 그 뒤 스타일시트 6개(2.8MB)를
-      받아 파싱하게 되면서 약 5초다. 남은 시간은 번들 파싱(the largest bundle 0.75초, main 0.54초,
-      the grid library 0.43초)과 순차 다운로드다. 시트와 청크를 병렬로 받으면 줄어든다.
+- [x] M2.13 참조 사이트를 여는 시간. 처음 12초 중 9초는 요청 69개가 매번 새로 맺는
+      TCP·TLS였고, keep-alive 연결 풀로 3.5초가 됐다. 스타일시트를 받게 되면서 다시
+      약 5초. 그때 요청 71개(25.7MB)를 하나씩 받는 데 3.5초였다.
+      이제 요청은 필요가 생긴 순간 시작하고 결과는 원래 쓰던 자리에서 받는다.
+      `Client::start`가 스레드에서 보내고(호스트당 6개, Chrome과 같음), 파서가 찾은
+      스타일시트와 클래식 스크립트는 파싱 직후 `preload`한다. 스크립트가 넣은
+      `<script src>`·`<link rel=stylesheet>`, 비동기 `fetch`·XHR은 호출하는 순간
+      시작하고 그 태스크에서 결과를 받는다. 그래서 실행·이벤트 순서는 그대로다.
+      번갈아 잰 중앙값: 네이티브 4.66초 → 3.56초, WASIX 약 5.6초 → 4.2초.
+      더 줄이기 어려운 이유: 회선이 대역폭 한계(약 12MB/s)라 병렬로 받아도 총량은
+      거의 그대로이고(이득은 받는 동안 파싱이 겹치는 데서 온다), 남은 것은 번들
+      파싱(약 1.7초)과 동기 XHR인 `the language pack`(6MB, 0.5~0.8초)이다.
+      gzip은 오히려 손해다(§2).
 - [ ] M2.11 ES 모듈(`type=module`)과 `import()`.
 - [ ] M2.12 `popstate`. 지금은 `pushState`로 만든 항목으로 뒤로 가면 그 URL을
       새로 읽는다.
@@ -438,6 +452,12 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
   그래서 브라우저는 WASI 타깃에서 터미널 검사를 하지 않고, `wasix-run.sh`가 호스트에서
   한다. 값 자체는 파이프로 제대로 전달된다. 또 Wasmer는 호스트의 환경 변수를 넘기지
   않으므로 `WHB_TRACE_CDP` 같은 것은 `wasmer run --env`로 준다.
+- **미리 받는 스레드는 `send_direct`로 보낸다.** `send`는 미리 받은 응답부터
+  찾으므로, 그 스레드가 `send`를 쓰면 자기 자신의 결과를 기다리며 멈춘다.
+- **미리 받은 응답은 헤더 없는 `GET`(`Accept`만 허용)에만 준다.** 인증 헤더 같은
+  것을 단 요청은 따로 보낸다. 문서가 바뀌면 쓰지 않은 것은 버린다.
+- **병렬 다운로드 테스트는 `test_server::serve_together`로 한다.** 지정한 경로가
+  모두 요청될 때까지 답하지 않으므로, 하나씩 받는 코드는 3초 뒤 503을 받고 실패한다.
 - **agent-browser의 `type`은 한 글자씩 `Input.insertText`를 보낸다.** 그래서
   자리표시자는 `fill`로만 동작한다.
 - **클라이언트가 무엇을 보내는지는 `WHB_TRACE_CDP=1`로 본다.** 모든 CDP 요청과
