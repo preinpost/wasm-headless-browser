@@ -168,7 +168,10 @@ impl Browser {
     /// Handles one decoded CDP message.
     ///
     /// With `WHB_TRACE_CDP` set, every method, its parameters and its result
-    /// go to stderr, truncated. That is how to find out what a client sends. Returns the response, if the message
+    /// go to stderr, truncated. That is how to find out what a client sends.
+    /// What is typed is replaced by its length, because it is how passwords
+    /// arrive. Other methods are logged as sent, so a client that puts a
+    /// secret in an expression still exposes it there. Returns the response, if the message
     /// expected one. Events go out through `out` before the response.
     pub fn handle(&mut self, msg: &Value, out: &mut BrowserEmit) -> Option<Value> {
         let id = msg.get("id").cloned();
@@ -183,9 +186,10 @@ impl Browser {
 
         if trace_enabled() {
             let shown = |v: &Value| v.to_string().chars().take(300).collect::<String>();
+            let logged = redact_typing(&method, &params);
             match &result {
-                Ok(value) => eprintln!("cdp {method} {} -> {}", shown(&params), shown(value)),
-                Err(e) => eprintln!("cdp {method} {} -> error {}", shown(&params), e.message),
+                Ok(value) => eprintln!("cdp {method} {} -> {}", shown(&logged), shown(value)),
+                Err(e) => eprintln!("cdp {method} {} -> error {}", shown(&logged), e.message),
             }
         }
 
@@ -350,4 +354,42 @@ impl Browser {
 fn trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("WHB_TRACE_CDP").is_some())
+}
+
+/// `params` with typed text replaced by its length: `Input.insertText` and
+/// the text a key event carries.
+fn redact_typing(method: &str, params: &Value) -> Value {
+    let fields: &[&str] = match method {
+        "Input.insertText" | "Input.imeSetComposition" => &["text"],
+        "Input.dispatchKeyEvent" => &["text", "unmodifiedText", "key", "code", "keyIdentifier"],
+        _ => return params.clone(),
+    };
+    let mut logged = params.clone();
+    for field in fields {
+        if let Some(text) = logged.get(*field).and_then(|v| v.as_str()) {
+            let length = text.chars().count();
+            logged[*field] = json!(format!("[{length} redacted]"));
+        }
+    }
+    logged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracing_never_shows_what_was_typed() {
+        let typed = redact_typing("Input.insertText", &json!({ "text": "hunter2" }));
+        assert_eq!(typed, json!({ "text": "[7 redacted]" }));
+        let key = redact_typing(
+            "Input.dispatchKeyEvent",
+            &json!({ "type": "keyDown", "key": "h", "text": "h", "code": "KeyH" }),
+        );
+        assert!(!key.to_string().contains("\"h\""), "{key}");
+        assert!(!key.to_string().contains("KeyH"), "{key}");
+        assert_eq!(key["type"], "keyDown");
+        let other = json!({ "expression": "1" });
+        assert_eq!(redact_typing("Runtime.evaluate", &other), other);
+    }
 }
