@@ -14,7 +14,7 @@ use std::sync::Mutex;
 
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
-use html5ever::{parse_document, ParseOpts};
+use html5ever::{parse_document, parse_fragment as html5ever_fragment, ParseOpts};
 use markup5ever::interface::{Attribute, ElemName};
 use markup5ever::{LocalName, Namespace, QualName};
 
@@ -257,6 +257,23 @@ pub fn parse_html(input: &str) -> Document {
     parse_document(sink, ParseOpts::default()).one(input)
 }
 
+/// Parses `input` as the contents of a `context` element, as `innerHTML` and
+/// `insertAdjacentHTML` do. Returns the scratch document and the node whose
+/// children are the parsed fragment.
+pub fn parse_fragment(input: &str, context: &str) -> (Document, NodeId) {
+    let sink = DomSink::new();
+    let name = QualName::new(None, markup5ever::ns!(html), LocalName::from(context));
+    let doc = html5ever_fragment(sink, ParseOpts::default(), name, Vec::new(), false).one(input);
+    // html5ever puts the fragment under a synthetic <html> root.
+    let container = doc
+        .children(doc.document_id())
+        .iter()
+        .copied()
+        .find(|id| doc.is_element(*id))
+        .unwrap_or(doc.document_id());
+    (doc, container)
+}
+
 /// Parses bytes, decoding as UTF-8 and replacing anything invalid. Real pages
 /// arrive as bytes, often with a mismatched or missing declaration.
 pub fn parse_html_bytes(input: &[u8]) -> Document {
@@ -266,7 +283,16 @@ pub fn parse_html_bytes(input: &[u8]) -> Document {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_html;
+    use super::{parse_fragment, parse_html};
+
+    #[test]
+    fn parses_a_fragment_in_context() {
+        let (doc, root) = parse_fragment("<li>a</li><li>b <b>c</b></li>", "ul");
+        let kids: Vec<_> = doc.children(root).iter().filter_map(|c| doc.tag(*c)).collect();
+        assert_eq!(kids, ["li", "li"]);
+        assert_eq!(doc.text_content(root), "ab c");
+    }
+
     use crate::dom::NodeData;
 
     fn tags(doc: &crate::dom::Document) -> Vec<String> {

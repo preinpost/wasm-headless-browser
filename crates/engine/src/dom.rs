@@ -12,7 +12,7 @@
 //! Nothing here knows about CSS or layout. This is the tree, and only the tree.
 
 use markup5ever::interface::QualName;
-use markup5ever::{ns, LocalName};
+use markup5ever::{ns, LocalName, Namespace};
 
 pub type NodeId = usize;
 
@@ -38,6 +38,9 @@ pub enum NodeData {
     Element { contents: Option<NodeId> },
     Text,
     Comment,
+    /// A `DocumentFragment`: a parentless container whose children move, not
+    /// itself, when it is inserted.
+    Fragment,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +54,17 @@ pub struct Node {
     pub text: String,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
+    /// Form control state that is not an attribute: what the user typed or
+    /// script assigned to `value`, and the current `checked` and `selected`.
+    /// `None` means "still the default", which the attribute supplies.
+    pub control: Control,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Control {
+    pub value: Option<String>,
+    pub checked: Option<bool>,
+    pub selected: Option<bool>,
 }
 
 impl Default for Node {
@@ -62,6 +76,7 @@ impl Default for Node {
             text: String::new(),
             parent: None,
             children: Vec::new(),
+            control: Control::default(),
         }
     }
 }
@@ -197,16 +212,113 @@ impl Document {
                     self.append_child(id, node);
                 }
             }
+            NodeData::Fragment => {
+                for child in self.nodes[id].children.clone() {
+                    self.detach(child);
+                }
+                if !text.is_empty() {
+                    let node = self.create_text(text.to_string());
+                    self.append_child(id, node);
+                }
+            }
             NodeData::Document | NodeData::Doctype { .. } => {}
         }
     }
 
     /// Deep copy, returned detached. `cloneNode(true)` in the specification.
     pub fn clone_subtree(&mut self, id: NodeId) -> NodeId {
-        let source = self.nodes[id].clone();
-        let copy = self.push(Node { ..source.clone() });
-        for child in self.nodes[id].children.clone() {
-            let child_copy = self.clone_subtree(child);
+        self.clone_node(id, true)
+    }
+
+    /// `cloneNode(deep)`. The copy is detached and owns copies of the
+    /// children, never the originals.
+    pub fn clone_node(&mut self, id: NodeId, deep: bool) -> NodeId {
+        let source = &self.nodes[id];
+        let copy = self.push(Node {
+            data: source.data.clone(),
+            name: source.name.clone(),
+            attrs: source.attrs.clone(),
+            text: source.text.clone(),
+            parent: None,
+            children: Vec::new(),
+            control: source.control.clone(),
+        });
+        if deep {
+            for child in self.nodes[id].children.clone() {
+                let child_copy = self.clone_node(child, true);
+                self.append_child(copy, child_copy);
+            }
+        }
+        copy
+    }
+
+    pub fn create_comment(&mut self, text: String) -> NodeId {
+        self.push(Node { data: NodeData::Comment, text, ..Node::default() })
+    }
+
+    pub fn create_fragment(&mut self) -> NodeId {
+        self.push(Node { data: NodeData::Fragment, ..Node::default() })
+    }
+
+    /// `createElementNS`. SVG and MathML elements keep their namespace, so
+    /// `namespaceURI` reads back what script asked for.
+    pub fn create_element_ns(&mut self, namespace: &str, tag: &str) -> NodeId {
+        let local = tag.rsplit(':').next().unwrap_or(tag);
+        self.push(Node {
+            data: NodeData::Element { contents: None },
+            name: Some(QualName::new(None, Namespace::from(namespace), LocalName::from(local))),
+            ..Node::default()
+        })
+    }
+
+    /// The element's namespace URI, empty for non-elements.
+    pub fn namespace(&self, id: NodeId) -> &str {
+        self.nodes[id].name.as_ref().map(|n| n.ns.as_ref()).unwrap_or("")
+    }
+
+    /// Inserts `child` into `parent` before `reference`, or last when there is
+    /// no reference. A reference that is not a child of `parent` appends,
+    /// rather than inserting somewhere else.
+    pub fn insert_child(&mut self, parent: NodeId, child: NodeId, reference: Option<NodeId>) {
+        match reference {
+            Some(r) if r != child && self.nodes[r].parent == Some(parent) => {
+                self.detach(child);
+                let pos = self.nodes[parent].children.iter().position(|c| *c == r).unwrap_or(0);
+                self.nodes[parent].children.insert(pos, child);
+                self.nodes[child].parent = Some(parent);
+            }
+            _ => self.append_child(parent, child),
+        }
+    }
+
+    /// True when `ancestor` is `id` or one of its ancestors.
+    pub fn is_inclusive_ancestor(&self, ancestor: NodeId, mut id: NodeId) -> bool {
+        loop {
+            if id == ancestor {
+                return true;
+            }
+            match self.nodes[id].parent {
+                Some(parent) => id = parent,
+                None => return false,
+            }
+        }
+    }
+
+    /// Copies `id` and its subtree out of `other` into this document,
+    /// detached. How a parsed fragment joins the live tree.
+    pub fn import(&mut self, other: &Document, id: NodeId) -> NodeId {
+        let source = other.node(id);
+        let copy = self.push(Node {
+            data: source.data.clone(),
+            name: source.name.clone(),
+            attrs: source.attrs.clone(),
+            text: source.text.clone(),
+            parent: None,
+            children: Vec::new(),
+            control: Control::default(),
+        });
+        for child in other.children(id).to_vec() {
+            let child_copy = self.import(other, child);
             self.append_child(copy, child_copy);
         }
         copy
@@ -283,6 +395,31 @@ impl Document {
     /// `data-*` style questions.
     pub fn attrs_with_prefix<'a>(&'a self, id: NodeId, prefix: &'a str) -> impl Iterator<Item = &'a Attr> {
         self.nodes[id].attrs.iter().filter(move |a| a.local_name().starts_with(prefix))
+    }
+
+    pub fn control(&self, id: NodeId) -> &Control {
+        &self.nodes[id].control
+    }
+
+    pub fn control_mut(&mut self, id: NodeId) -> &mut Control {
+        &mut self.nodes[id].control
+    }
+
+    /// The current value of a form control: what was typed or assigned, else
+    /// the `value` attribute. A `<textarea>`'s default is its text.
+    pub fn current_value(&self, id: NodeId) -> String {
+        if let Some(value) = &self.nodes[id].control.value {
+            return value.clone();
+        }
+        if self.is_tag(id, "textarea") {
+            return self.text_content(id);
+        }
+        self.attr(id, "value").unwrap_or("").to_string()
+    }
+
+    /// Whether a checkbox or radio is checked now.
+    pub fn current_checked(&self, id: NodeId) -> bool {
+        self.nodes[id].control.checked.unwrap_or_else(|| self.has_attr(id, "checked"))
     }
 
     pub fn template_contents(&self, id: NodeId) -> Option<NodeId> {

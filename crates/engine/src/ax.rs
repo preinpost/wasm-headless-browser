@@ -363,10 +363,10 @@ fn control_value(doc: &Document, id: NodeId) -> Option<String> {
             if doc.attr(id, "type") == Some("password") {
                 return Some(String::new());
             }
-            Some(doc.attr(id, "value").unwrap_or("").to_string())
+            Some(doc.current_value(id))
         }
         "checkbox" | "radio" | "switch" => {
-            let checked = doc.has_attr(id, "checked")
+            let checked = (doc.is_tag(id, "input") && doc.current_checked(id))
                 || matches!(doc.attr(id, "aria-checked"), Some("true") | Some("mixed"));
             Some(if checked { "true" } else { "false" }.to_string())
         }

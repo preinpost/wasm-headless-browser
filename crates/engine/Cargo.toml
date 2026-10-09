@@ -26,6 +26,9 @@ rquickjs = { version = "0.14", features = ["bindgen"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 
+# WHATWG URL parsing, for `URL`, `<script src>` and request URLs. Pure Rust.
+url = "2"
+
 [dev-dependencies]
 # Self-signed certificates for a local TLS server in the fetch tests.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

@@ -122,13 +122,50 @@ impl JsRuntime {
     /// Sloppy mode, not rquickjs's default of strict: a classic `<script>` and
     /// `Runtime.evaluate` both run sloppy in a browser, and page code that
     /// assigns an undeclared variable would otherwise throw.
+    ///
+    /// Promise reactions queued by the script run before this returns: a
+    /// browser performs a microtask checkpoint after every script.
     pub fn evaluate(&self, source: &str) -> Result<JsValue, JsError> {
         let mut options = EvalOptions::default();
         options.strict = false;
-        self.context.with(|ctx| match ctx.eval_with_options::<Value, _>(source, options).catch(&ctx) {
-            Ok(value) => Ok(to_js_value(&value)),
-            Err(caught) => Err(caught_error(caught)),
-        })
+        let result =
+            self.context.with(|ctx| match ctx.eval_with_options::<Value, _>(source, options).catch(&ctx) {
+                Ok(value) => Ok(to_js_value(&value)),
+                Err(caught) => Err(caught_error(caught)),
+            });
+        self.run_microtasks();
+        result
+    }
+
+    /// Runs queued Promise jobs until none are left. A job that throws is an
+    /// unhandled rejection, which a browser reports and moves past; so does
+    /// this. Bounded, because a job can queue another forever.
+    pub fn run_microtasks(&self) {
+        for _ in 0..1_000_000 {
+            match self.runtime.execute_pending_job() {
+                Ok(true) | Err(_) => continue,
+                Ok(false) => break,
+            }
+        }
+    }
+
+    /// Runs the prelude's task queue: timers, animation frames and network
+    /// completions, in due order on a virtual clock, with a microtask
+    /// checkpoint after each. Stops when nothing is due within `budget_ms`
+    /// of virtual time or after `max_tasks`, so a page polling on an interval
+    /// cannot hold the engine. Returns how many tasks ran.
+    pub fn run_tasks(&self, budget_ms: f64, max_tasks: usize) -> usize {
+        if self.evaluate(&format!("__beginTurn({budget_ms})")).is_err() {
+            return 0;
+        }
+        let mut ran = 0;
+        while ran < max_tasks {
+            match self.evaluate("__runNextTask()") {
+                Ok(JsValue::Bool(true)) => ran += 1,
+                _ => break,
+            }
+        }
+        ran
     }
 
     /// Runs a snippet for its side effects, discarding the result. Used to load
@@ -446,6 +483,7 @@ enum Request {
     Evaluate { source: String, reply: Sender<Result<JsValue, JsError>> },
     /// A fresh context with the bindings reinstalled, for a new document.
     Reset { reply: Sender<Result<(), JsError>> },
+    RunTasks { budget_ms: f64, max_tasks: usize, reply: Sender<usize> },
     Shutdown,
 }
 
@@ -455,13 +493,13 @@ impl ScriptHost {
     /// than on the first evaluation.
     pub fn spawn(
         doc: Arc<Mutex<crate::dom::Document>>,
-        cookies: Arc<Mutex<crate::cookies::CookieJar>>,
+        client: crate::fetch::Client,
         viewport: (f64, f64),
         user_agent: &str,
     ) -> Result<Self, JsError> {
         let (requests, inbox) = channel::<Request>();
         let console = Arc::new(Mutex::new(ConsoleLog::default()));
-        let state = Arc::new(crate::bindings::DomState::new(doc, cookies, viewport, user_agent));
+        let state = Arc::new(crate::bindings::DomState::new(doc, client, viewport, user_agent));
         let (ready_tx, ready_rx) = channel::<Result<(), JsError>>();
 
         let thread_state = Arc::clone(&state);
@@ -486,6 +524,9 @@ impl ScriptHost {
                     match request {
                         Request::Evaluate { source, reply } => {
                             let _ = reply.send(js.evaluate(&source));
+                        }
+                        Request::RunTasks { budget_ms, max_tasks, reply } => {
+                            let _ = reply.send(js.run_tasks(budget_ms, max_tasks));
                         }
                         Request::Reset { reply } => {
                             thread_state.reset_page();
@@ -537,6 +578,15 @@ impl ScriptHost {
         reply_rx.recv().map_err(|_| JsError {
             message: "the script thread stopped while resetting".to_string(),
         })?
+    }
+
+    /// See [`JsRuntime::run_tasks`]. Returns how many tasks ran.
+    pub fn run_tasks(&self, budget_ms: f64, max_tasks: usize) -> usize {
+        let (reply_tx, reply_rx) = channel();
+        if self.requests.send(Request::RunTasks { budget_ms, max_tasks, reply: reply_tx }).is_err() {
+            return 0;
+        }
+        reply_rx.recv().unwrap_or(0)
     }
 
     pub fn state(&self) -> &Arc<crate::bindings::DomState> {

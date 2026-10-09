@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use crate::cookies::{self, Cookie, CookieJar};
 use crate::dom::{Document, NodeData, NodeId};
 use crate::fetch::{self, Request};
+use crate::bindings::Navigation;
 use crate::js::{JsError, JsValue, ScriptHost};
 use crate::parse::{parse_html, parse_html_bytes};
 use crate::select;
@@ -24,6 +25,16 @@ use crate::select;
 /// How many times a script-initiated navigation is followed before stopping.
 /// A page that redirects itself in a loop should not hang the engine.
 const MAX_SCRIPT_NAVIGATIONS: u8 = 3;
+
+/// Virtual milliseconds of timers a page gets to settle after loading, and
+/// after each `Runtime.evaluate`. Time is virtual, so this costs only the work
+/// the timers do, not wall-clock waiting.
+const LOAD_BUDGET_MS: f64 = 5_000.0;
+const EVALUATE_BUDGET_MS: f64 = 1_000.0;
+
+/// Upper bound on tasks per settling pass, against pages that schedule work
+/// forever.
+const MAX_TASKS: usize = 10_000;
 
 pub struct HtmlEngine {
     target_id: String,
@@ -59,14 +70,14 @@ impl HtmlEngine {
         let mut counter = ids::seed();
         let doc = Arc::new(Mutex::new(Document::new()));
         let viewport = (800.0, 600.0);
-        let script =
-            ScriptHost::spawn(Arc::clone(&doc), Arc::clone(&cookies), viewport, USER_AGENT).ok();
+        let client = fetch::Client::new(cookies);
+        let script = ScriptHost::spawn(Arc::clone(&doc), client.clone(), viewport, USER_AGENT).ok();
 
         HtmlEngine {
             target_id: target_id.to_string(),
             doc,
             script,
-            client: fetch::Client::new(cookies),
+            client,
             url: "about:blank".to_string(),
             frame_id: ids::token(&mut counter),
             loader_id: ids::token(&mut counter),
@@ -154,6 +165,26 @@ impl HtmlEngine {
         self.run_document_scripts();
         self.follow_script_navigation();
         self.push_history();
+        self.sync_script_url();
+    }
+
+    /// Follows a URL change script made without loading anything:
+    /// `history.pushState` or `location.hash = ...`. Returns the new URL.
+    fn sync_script_url(&mut self) -> Option<String> {
+        let replace = self.script.as_ref()?.state().take_url_change()?;
+        let url = self.doc().url().to_string();
+        if url == self.url {
+            return None;
+        }
+        self.url = url.clone();
+        if replace {
+            if let Some(entry) = self.history.get_mut(self.history_index) {
+                *entry = url.clone();
+            }
+        } else {
+            self.push_history();
+        }
+        Some(url)
     }
 
     /// Fetches `request` and makes the result the document. A fetch failure
@@ -211,43 +242,81 @@ impl HtmlEngine {
         }
     }
 
-    /// Runs inline `<script>` elements in document order.
+    /// Runs the page's scripts in the order a browser would, then lets the
+    /// page settle.
     ///
-    /// External scripts are skipped, as are modules: fetching and evaluating
-    /// them is a separate piece of work. A script that throws is reported to the
-    /// engine's error slot and does not stop the ones after it, which is what a
-    /// browser does.
+    /// The document is parsed completely before any script runs, so a
+    /// parser-blocking script sees elements that come after it, and
+    /// `document.write` appends rather than inserting. Within that, the order
+    /// is the browser's: parser-blocking scripts (inline, and external without
+    /// `async` or `defer`) in document order, then `DOMContentLoaded` after
+    /// the `defer` scripts, then `async` scripts, then the task queue, then
+    /// `load`. A script that throws is reported and does not stop the ones
+    /// after it.
     fn run_document_scripts(&mut self) {
         let Some(script) = &self.script else { return };
 
-        let sources: Vec<(String, String)> = {
+        struct Found {
+            id: NodeId,
+            label: String,
+            external: bool,
+            deferred: bool,
+            asynchronous: bool,
+        }
+        let found: Vec<Found> = {
             let doc = self.doc();
             doc.descendants(doc.document_id())
                 .filter(|id| doc.is_tag(*id, "script"))
-                .filter(|id| {
-                    // `src` is not fetched, and a module has different semantics.
-                    doc.attr(*id, "src").is_none()
-                        && !matches!(doc.attr(*id, "type"), Some("module"))
+                .map(|id| {
+                    let src = doc.attr(id, "src");
+                    Found {
+                        id,
+                        label: src.map(str::to_string).unwrap_or_else(|| format!("inline-{id}")),
+                        external: src.is_some(),
+                        // Modules are deferred by default.
+                        deferred: doc.has_attr(id, "defer") || doc.attr(id, "type") == Some("module"),
+                        asynchronous: doc.has_attr(id, "async"),
+                    }
                 })
-                .map(|id| (doc.text_content(id), format!("inline-{id}")))
-                .filter(|(source, _)| !source.trim().is_empty())
                 .collect()
         };
 
-        for (source, label) in sources {
+        let mut errors = Vec::new();
+        let mut run = |found: &Found| {
             // The document lock is not held here: the script thread locks it.
-            if let Err(e) = script.run(&source) {
-                self.last_error = Some(format!("script error in <script> ({label}): {}", e.message));
+            match script.evaluate(&format!("__executeScript({})", found.id)) {
+                Ok(JsValue::String(message)) if !message.is_empty() => {
+                    errors.push(format!("script error in <script> ({}): {message}", found.label));
+                }
+                Err(e) => errors.push(format!("script error in <script> ({}): {}", found.label, e.message)),
+                _ => {}
             }
-            // Timers are drained between scripts so that one script's deferred
-            // work happens before the next script runs, roughly as a browser
-            // would order it.
-            let _ = script.run("__drainTimers()");
+        };
+
+        let blocking = |f: &&Found| !f.external || (!f.deferred && !f.asynchronous);
+        for f in found.iter().filter(blocking) {
+            run(f);
+        }
+        let _ = script.run("__documentParsed()");
+        for f in found.iter().filter(|f| f.external && f.deferred && !f.asynchronous) {
+            run(f);
+        }
+        let _ = script.run("__fireDOMContentLoaded()");
+        for f in found.iter().filter(|f| f.external && f.asynchronous) {
+            run(f);
+        }
+        script.run_tasks(LOAD_BUDGET_MS, MAX_TASKS);
+        let _ = script.run("__fireLoad()");
+        script.run_tasks(LOAD_BUDGET_MS, MAX_TASKS);
+
+        if let Some(first) = errors.into_iter().next() {
+            self.last_error = Some(first);
         }
     }
 
-    /// If a script assigned `location.href`, follow it. Bounded, because a page
-    /// that redirects itself in a loop should not hang the engine.
+    /// If a script assigned `location.href` or submitted a form, follow it.
+    /// Bounded, because a page that redirects itself in a loop should not hang
+    /// the engine.
     fn follow_script_navigation(&mut self) {
         for _ in 0..MAX_SCRIPT_NAVIGATIONS {
             let Some(requested) = self
@@ -257,20 +326,47 @@ impl HtmlEngine {
             else {
                 return;
             };
-            if requested == self.url {
+            if !self.script_navigation(requested) {
                 return;
             }
-            let target = match fetch::Url::parse(&self.url)
-                .ok()
-                .and_then(|base| base.join(&requested).ok())
-            {
-                Some(url) => url.to_string_with_path(),
-                None => requested,
-            };
-
-            self.replace_document(Request::get(&target));
-            self.run_document_scripts();
         }
+    }
+
+    /// Acts on one navigation script asked for. Returns whether anything
+    /// changed.
+    ///
+    /// A `GET` that differs from the current URL only in its fragment stays in
+    /// the same document, as `location.hash = ...` does in a browser. A `GET`
+    /// to exactly the current URL is ignored, so a page that sets
+    /// `location.href` to itself does not loop.
+    fn script_navigation(&mut self, requested: Navigation) -> bool {
+        let target = url::Url::parse(&self.url)
+            .and_then(|base| base.join(&requested.url))
+            .map(String::from)
+            .unwrap_or(requested.url);
+        let is_get = requested.method.eq_ignore_ascii_case("GET") && !requested.reload;
+        if is_get && target == self.url {
+            return false;
+        }
+        let without_fragment = |u: &str| u.split('#').next().unwrap_or(u).to_string();
+        if is_get && target.contains('#') && without_fragment(&target) == without_fragment(&self.url) {
+            self.url = target.clone();
+            self.doc().set_url(&target);
+            self.push_history();
+            return true;
+        }
+        let mut request = Request {
+            method: requested.method.to_ascii_uppercase(),
+            url: target,
+            headers: Vec::new(),
+            body: requested.body,
+        };
+        if let Some(content_type) = requested.content_type {
+            request.headers.push(("Content-Type".into(), content_type));
+        }
+        self.replace_document(request);
+        self.run_document_scripts();
+        true
     }
 
     fn push_history(&mut self) {
@@ -412,6 +508,7 @@ impl HtmlEngine {
             NodeData::Doctype { name } => (10, name.clone()),
             NodeData::Comment => (8, "#comment".to_string()),
             NodeData::Text => (3, "#text".to_string()),
+            NodeData::Fragment => (11, "#document-fragment".to_string()),
             NodeData::Element { .. } => (1, doc.tag(node).unwrap_or("").to_ascii_uppercase()),
         };
         let mut value = json!({
@@ -548,11 +645,17 @@ impl Engine for HtmlEngine {
                 let source =
                     params.get("expression").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let result = self.evaluate(&source);
+                // Whatever the expression set in motion, a click handler's
+                // timers or a request's completion, gets to run.
+                if let Some(script) = &self.script {
+                    script.run_tasks(EVALUATE_BUDGET_MS, MAX_TASKS);
+                }
 
                 // A script may have asked to navigate or to move through
                 // history; act on it after the evaluation has finished rather
                 // than re-entering the runtime. `back` in agent-browser is
                 // `history.back()` evaluated this way.
+                let moved = self.sync_script_url();
                 let (requested, steps) = match &self.script {
                     Some(script) => (
                         script.state().take_requested_navigation(),
@@ -560,11 +663,19 @@ impl Engine for HtmlEngine {
                     ),
                     None => (None, 0),
                 };
-                if let Some(requested) = requested.filter(|r| *r != self.url) {
-                    self.load(&requested);
-                    self.emit_lifecycle(out);
+                if let Some(requested) = requested {
+                    if self.script_navigation(requested) {
+                        self.follow_script_navigation();
+                        self.push_history();
+                        self.emit_lifecycle(out);
+                    }
                 } else if steps != 0 && self.go(steps) {
                     self.emit_lifecycle(out);
+                } else if let Some(url) = moved {
+                    out(
+                        "Page.navigatedWithinDocument",
+                        json!({ "frameId": self.frame_id, "url": url, "navigationType": "historyApi" }),
+                    );
                 }
                 Ok(result)
             }
@@ -821,7 +932,11 @@ pub(crate) fn class_for(doc: &Document, node: NodeId) -> &'static str {
         NodeData::Doctype { .. } => return "DocumentType",
         NodeData::Text => return "Text",
         NodeData::Comment => return "Comment",
+        NodeData::Fragment => return "DocumentFragment",
         NodeData::Element { .. } => {}
+    }
+    if doc.namespace(node) == "http://www.w3.org/2000/svg" {
+        return if doc.is_tag(node, "svg") { "SVGSVGElement" } else { "SVGElement" };
     }
     match doc.tag(node) {
         Some("html") => "HTMLHtmlElement",
@@ -841,6 +956,28 @@ pub(crate) fn class_for(doc: &Document, node: NodeId) -> &'static str {
         Some("script") => "HTMLScriptElement",
         Some("div") => "HTMLDivElement",
         Some("span") => "HTMLSpanElement",
+        Some("head") => "HTMLHeadElement",
+        Some("title") => "HTMLTitleElement",
+        Some("meta") => "HTMLMetaElement",
+        Some("link") => "HTMLLinkElement",
+        Some("style") => "HTMLStyleElement",
+        Some("ul") => "HTMLUListElement",
+        Some("ol") => "HTMLOListElement",
+        Some("li") => "HTMLLIElement",
+        Some("table") => "HTMLTableElement",
+        Some("tr") => "HTMLTableRowElement",
+        Some("td") | Some("th") => "HTMLTableCellElement",
+        Some("thead") | Some("tbody") | Some("tfoot") => "HTMLTableSectionElement",
+        Some("option") => "HTMLOptionElement",
+        Some("iframe") => "HTMLIFrameElement",
+        Some("canvas") => "HTMLCanvasElement",
+        Some("template") => "HTMLTemplateElement",
+        Some("br") => "HTMLBRElement",
+        Some("hr") => "HTMLHRElement",
+        Some("pre") => "HTMLPreElement",
+        Some("video") => "HTMLVideoElement",
+        Some("audio") => "HTMLAudioElement",
+        Some("dialog") => "HTMLDialogElement",
         _ => "HTMLElement",
     }
 }
@@ -866,7 +1003,7 @@ pub fn serialize(doc: &Document, node: NodeId) -> String {
 
 fn write_node(doc: &Document, node: NodeId, out: &mut String) {
     match &doc.node(node).data {
-        NodeData::Document => {
+        NodeData::Document | NodeData::Fragment => {
             for child in doc.children(node).to_vec() {
                 write_node(doc, child, out);
             }
@@ -1145,15 +1282,31 @@ mod tests {
     }
 
     #[test]
-    fn external_scripts_are_skipped_not_faked() {
+    fn external_scripts_are_fetched_and_run_in_order() {
+        let script = "document.getElementById('out').textContent += 'external;';";
+        let (base, _requests) = crate::test_server::serve_script(vec![
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                PAGE.len(),
+                PAGE
+            ),
+            format!("HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\n\r\n{script}", script.len()),
+        ]);
+        const PAGE: &str = "<body><div id=\"out\"></div><script src=\"/app.js\" defer></script>\
+                            <script>document.getElementById('out').textContent += 'inline;';</script></body>";
         let mut engine = HtmlEngine::new("t");
-        engine.load(
-            "data:text/html,<body><div id=\"out\"></div>\
-             <script src=\"https://example.com/app.js\"></script></body>",
-        );
+        engine.load(&format!("{base}/"));
         let doc = engine.doc();
         let out = doc.find_id(doc.document_id(), "out").expect("the div exists");
-        assert_eq!(doc.text_content(out), "");
+        // `defer` runs after the parser-blocking inline script.
+        assert_eq!(doc.text_content(out), "inline;external;");
+    }
+
+    #[test]
+    fn a_script_that_cannot_be_fetched_is_reported() {
+        let mut engine = HtmlEngine::new("t");
+        engine.load("data:text/html,<body><script src=\"http://127.0.0.1:1/app.js\"></script></body>");
+        assert!(engine.last_error.as_deref().unwrap_or("").contains("could not load"), "{:?}", engine.last_error);
     }
 
     #[test]
@@ -1318,5 +1471,28 @@ mod tests {
             .iter()
             .any(|n| n["role"]["value"] == "heading" && n["name"]["value"] == "Login"));
         assert!(nodes.iter().any(|n| n["role"]["value"] == "link" && n["name"]["value"] == "go"));
+    }
+
+    /// Opens a real page and prints what its scripts said. Not a check, a
+    /// tool for finding what a site needs next:
+    ///
+    ///   WHB_PROBE_URL=https://example.com cargo test -p engine probe_a_url -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn probe_a_url() {
+        let Ok(url) = std::env::var("WHB_PROBE_URL") else { return };
+        let mut engine = HtmlEngine::new("probe");
+        let started = std::time::Instant::now();
+        engine.load(&url);
+        eprintln!("loaded {} in {:?}", engine.url, started.elapsed());
+        eprintln!("last error: {:?}", engine.last_error);
+        if let Some(script) = &engine.script {
+            for line in script.console_lines() {
+                eprintln!("console: {}", line.chars().take(600).collect::<String>());
+            }
+        }
+        let doc = engine.doc();
+        let text = doc.text_content(doc.document_id());
+        eprintln!("text: {}", text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(800).collect::<String>());
     }
 }
