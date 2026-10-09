@@ -329,6 +329,12 @@ fn put_content<'js>(
             with_doc(&doc, |d| crate::browser::serialize(d, id)).unwrap_or_default()
         });
     }
+    {
+        let doc = Arc::clone(doc);
+        install_fn!(ctx, api, "interfaceName", move |id: usize| {
+            with_doc(&doc, |d| crate::browser::class_for(d, id).to_string()).unwrap_or_default()
+        });
+    }
 
     Ok(())
 }
@@ -349,6 +355,12 @@ fn put_mutations<'js>(
         let doc = Arc::clone(doc);
         install_fn!(ctx, api, "removeAttr", move |id: usize, name: String| {
             let _ = with_doc_mut(&doc, |d| d.remove_attr(id, &name));
+        });
+    }
+    {
+        let doc = Arc::clone(doc);
+        install_fn!(ctx, api, "setTextContent", move |id: usize, text: String| {
+            let _ = with_doc_mut(&doc, |d| d.set_text_content(id, &text));
         });
     }
     {
@@ -744,6 +756,51 @@ mod tests {
         let doc = state.doc.lock().unwrap();
         let p = doc.find_id(doc.document_id(), "p").unwrap();
         assert_eq!(doc.attr(p, "data-state"), Some("ready"));
+    }
+
+    #[test]
+    fn assigning_text_content_replaces_the_children() {
+        let (js, state) = host("<body><div id='d'><b>old</b> text</div></body>");
+        js.evaluate("document.getElementById('d').textContent = 'new'").unwrap();
+        {
+            let doc = state.doc.lock().unwrap();
+            let d = doc.find_id(doc.document_id(), "d").unwrap();
+            assert_eq!(doc.text_content(d), "new");
+            assert_eq!(doc.children(d).len(), 1);
+        }
+        js.evaluate("document.getElementById('d').innerText = null").unwrap();
+        assert_eq!(text(&js, "document.getElementById('d').childNodes.length"), "0");
+    }
+
+    #[test]
+    fn reflected_properties_write_their_attribute() {
+        let (js, state) = host("<body><p id='p'>x</p></body>");
+        js.evaluate(
+            "const p = document.getElementById('p');\
+             p.className = 'note';\
+             p.title = 'tip';\
+             p.hidden = true;",
+        )
+        .unwrap();
+        let doc = state.doc.lock().unwrap();
+        let p = doc.find_id(doc.document_id(), "p").unwrap();
+        assert_eq!(doc.attr(p, "class"), Some("note"));
+        assert_eq!(doc.attr(p, "title"), Some("tip"));
+        assert!(doc.has_attr(p, "hidden"));
+    }
+
+    #[test]
+    fn nodes_name_their_interface() {
+        let (js, _) = host("<body><p id='p'>x</p></body>");
+        assert_eq!(
+            text(&js, "Object.prototype.toString.call(document.getElementById('p'))"),
+            "[object HTMLParagraphElement]"
+        );
+        assert_eq!(text(&js, "Object.prototype.toString.call(document)"), "[object HTMLDocument]");
+        assert_eq!(
+            js.evaluate("document.getElementById('p').firstChild").unwrap(),
+            JsValue::Object { class: "Text".into(), is_function: false }
+        );
     }
 
     #[test]

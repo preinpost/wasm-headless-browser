@@ -3,7 +3,7 @@
 작업 기록입니다. 이미 측정으로 확정한 사실과, 아직 남은 일을 나눠 적었습니다.
 문서가 영어로 된 다른 파일들과 섞이지만, 이 문서는 작업용이라 한국어로 씁니다.
 
-마지막 갱신: JS 엔진 통합 착수. BL-010 미검증 상태.
+마지막 갱신: BL-010 검증 완료. M2의 엔진 연결부가 네이티브와 WASIX 양쪽에서 동작한다.
 
 ## 1. 현재 위치
 
@@ -15,63 +15,53 @@
 | — | 브라우저 샌드박스 외부 통신 (E4·E5) | 완료 |
 | — | QuickJS 실행 가능성 확인 | 완료 |
 | M1 | 실제 엔진: HTML 파싱, DOM, 접근성 트리, 근사 레이아웃 | 진행 중 (레이아웃 제외 완료) |
-| M2 | JavaScript 엔진과 DOM 바인딩 | 착수 전 |
+| M2 | JavaScript 엔진과 DOM 바인딩 | 진행 중 (M2.1–M2.3 완료) |
 | M3 | 네트워크 이벤트, 쿠키·스토리지, 스크린샷 | 착수 전 |
 | M4 | 자격증명을 메모리로만 다루기 | 착수 전 |
 
 `--engine html`로 실제 페이지를 가져와 파싱하고, 그 문서에서 접근성 트리를
 만들어 냅니다. `agent-browser`로 열고 스냅샷을 뜨면 진짜 페이지가 나옵니다.
 
-아직 없는 것은 레이아웃과 JavaScript입니다. 둘 다 **흉내 내지 않고 이유를
-말합니다.** 스크린샷과 입력은 "레이아웃이 없다"는 오류를 돌려줍니다.
+페이지의 인라인 스크립트가 QuickJS로 실행되고, 그 결과가 접근성 트리에
+반영됩니다. `Runtime.evaluate`도 실제 JS입니다. 외부 스크립트(`src`)와
+모듈은 아직 실행하지 않습니다.
 
-## 1.5 미검증 상태 (집에서 확인 필요)
+아직 없는 것은 레이아웃입니다. **흉내 내지 않고 이유를 말합니다.**
+스크린샷과 입력은 "레이아웃이 없다"는 오류를 돌려줍니다.
 
-**BL-010. `cargo test -p engine`을 끝까지 돌려야 합니다.** QuickJS를 엔진
-크레이트에 넣은 뒤 `browser.rs`를 실제 JS로 갈아끼웠는데, 그 뒤 테스트를
-완주하지 못했습니다.
+## 1.5 BL-010 검증 결과
 
-```bash
-cd wasm-headless-browser
-cargo test -p engine           # 한 번은 오래 걸립니다. 중단하지 마세요.
-cargo test                     # 워크스페이스 전체
-```
+검증한 것:
 
-중간에 중단하면 안 됩니다. `quickjs.c`가 한 덩어리로 오래 걸리는 컴파일
-단계라, 중단하면 다음 실행이 처음부터 다시 시작합니다. 진행 중인지 보려면
-다른 터미널에서 `ps -A -o comm | grep cc1`을 확인하세요.
+- 워크스페이스 전체 `cargo test`: 엔진 92개, `cdp-wire` 3개 통과
+- `./scripts/verify-m0.sh`: 16개 통과
+- `./scripts/verify-m1.sh`: 26개 통과. 픽스처에 인라인 스크립트를 넣고
+  스크립트가 만든 제목, `eval` 결과, 스크립트가 남긴 전역을 검사 4개로 확인한다
+- `MODE=wasix ./scripts/verify-m0.sh`: 16개 통과. 연달아 실행해도 통과한다
+- WASIX 모듈 크기는 1.6MB다 (QuickJS 이전에는 272KB)
+- WASIX에서 `--engine html`로 픽스처를 열어 인라인 스크립트, `eval`, DOM
+  읽기, `Date`가 동작하는 것을 손으로 확인했다
 
-확인이 끝나면 아래 항목의 체크를 채우고 이 절을 지웁니다.
+검증하면서 고친 것:
 
-- [ ] 워크스페이스 전체 `cargo test` 통과
-- [ ] `./scripts/verify-m0.sh` 통과 (가짜 엔진, 영향 없어야 함)
-- [ ] `./scripts/verify-m1.sh` 통과. 픽스처에 인라인 스크립트를 넣어
-      스크립트가 실제로 도는지도 확인할 가치가 있습니다
-- [ ] `MODE=wasix ./scripts/verify-m0.sh` 통과. WASIX 빌드에 QuickJS가
-      들어갔으므로 `WASI_SDK`를 지정하거나 sysroot를 다시 받습니다
-- [ ] WASIX 모듈 크기 확인 (QuickJS가 들어가면 1MB를 넘습니다)
+- **`textContent`에 setter가 없었다.** rquickjs는 기본이 strict 모드라
+  대입하면 "no setter for property" 예외가 났다. setter를 붙이고,
+  `id`·`className`·`title`·`href` 같은 속성 반영 프로퍼티에도 setter를 붙였다
+- **평가를 sloppy 모드로 바꿨다.** 브라우저의 일반 `<script>`와
+  `Runtime.evaluate`는 sloppy다. strict면 선언 없는 대입 같은 흔한 페이지
+  코드가 예외를 던진다
+- **DOM 객체가 클래스 이름을 `Object`로 냈다.** 래퍼에 `Symbol.toStringTag`를
+  붙여 `HTMLParagraphElement` 같은 인터페이스 이름을 낸다.
+  `DOM.resolveNode`와 같은 `class_for` 표를 쓴다
+- **정수가 `42.0`으로 나갔다.** Chrome처럼 `42`로 낸다
+- **테스트 6개가 스스로 교착했다.** `engine.doc().find_id(engine.doc()...)`가
+  한 문장에서 같은 뮤텍스를 두 번 잡는다. 엔진 코드의 문제가 아니라 테스트의
+  문제였다
+- **`full-wasi` feature를 뺐다.** §6의 `rquickjs-macro` 항목 참조
 
-### 어디까지 쓰여 있는지
-
-| 파일 | 상태 |
-|---|---|
-| `crates/engine/src/js.rs` | `JsRuntime`과 `ScriptHost`. 80개 테스트 통과 시점에 검증됨 |
-| `crates/engine/src/dom.js` | JS 쪽 DOM 래퍼. 같은 시점에 검증됨 |
-| `crates/engine/src/bindings.rs` | DOM 원시 접근자. 같은 시점에 검증됨 |
-| `crates/engine/src/browser.rs` | 실제 JS로 교체. **미검증** |
-
-바인딩까지는 테스트가 통과했습니다. 특히 다음 두 개가 통과한 것이 M2의
-핵심이었습니다.
-
-- `the_clients_click_scan_expression_runs_without_throwing`
-- `the_clients_click_point_expression_runs_without_throwing`
-
-agent-browser가 실제로 보내는 무거운 표현식 두 개가 이제 예외 없이 끝까지
-실행됩니다. 임시 규칙표(`evaluate_expression`)는 삭제했습니다.
-
-미검증인 것은 그 위에 얹은 `browser.rs`의 연결부입니다. 내비게이션 후
-인라인 스크립트 실행, `Runtime.evaluate` 위임, 스크립트가 요청한 이동 처리
-세 가지입니다.
+남은 것: `Runtime.callFunctionOn`은 아직 실제 JS가 아니다. 함수 선언 문자열에
+`textContent`나 `value`가 들어 있는지만 본다. M2.4에서 원격 객체 핸들과 함께
+바꾼다.
 
 ### 설계상 알아둘 것
 
@@ -103,7 +93,8 @@ DOM은 가두지 않았습니다. `Arc<Mutex<Document>>`로 엔진과 공유하�
 | 브라우저 샌드박스 안에서도 loopback이 동작한다. 엔진과 클라이언트를 한 샌드박스에 함께 둘 수 있다 (E1) | 같은 문서 |
 | 호스트 페이지에서 안으로 들어오는 경로(E3)는 필요 없다. 설령 되더라도 HTTP 전용이라 CDP의 WebSocket 업그레이드는 지나가지 못한다 | [harness/README.md](../harness/README.md) |
 | 브라우저 샌드박스에서 외부 TCP·HTTPS가 된다. WISP 릴레이를 쓴다 (E4·E5) | 이 문서의 §3 |
-| QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `full-wasi` + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다 | [docs/quickjs.md](quickjs.md) |
+| QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다. 엔진에서는 `full-wasi`를 쓸 수 없다 (§6) | [docs/quickjs.md](quickjs.md) |
+| QuickJS를 넣은 WASIX 모듈은 1.6MB다 | 이 문서의 §1.5 |
 | `Context::full`이 죽는 원인은 sysroot 불일치 하나다. `CLOCK_MONOTONIC`이 포인터 인코딩(1058440)으로 컴파일되고 WASIX는 정수 1을 기대한다 | 같은 문서 |
 | 참조 사이트 사이트는 SPA 셸만 돌려준다. HTML만 받아서는 아무것도 얻을 수 없다 | 이 문서의 §3 |
 
@@ -187,16 +178,22 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 
 ### 4.3 M2 JavaScript (P0, 큼)
 
-- [ ] M2.1 QuickJS를 엔진 모듈에 통합한다. `Context::custom` 경로를 쓴다.
+- [x] M2.1 QuickJS를 엔진 모듈에 통합한다. `Context::custom` 경로를 쓴다.
       `wasixcc`를 설치하면 `Context::full`로 단순해진다 (§5 참조).
-- [ ] M2.2 DOM 바인딩을 만든다. `document`, `window`, `querySelector`,
+- [x] M2.2 DOM 바인딩을 만든다. `document`, `window`, `querySelector`,
       `getComputedStyle`, `getBoundingClientRect`, `focus`, `scrollIntoView`,
       `elementFromPoint`가 필요하다. 앞의 다섯 개는 `agent-browser`가 실제로
-      호출하는 것을 캡처로 확인했다.
-- [ ] M2.3 `Runtime.evaluate`가 규칙표가 아니라 진짜 JS를 실행하게 한다.
-      `engine-fake/src/eval.rs`를 삭제한다.
+      호출하는 것을 캡처로 확인했다. 레이아웃이 없으므로 사각형은 0이고
+      `elementFromPoint`는 `null`이다.
+- [x] M2.3 `Runtime.evaluate`가 규칙표가 아니라 진짜 JS를 실행하게 한다.
+      `crates/engine`의 규칙표는 삭제했다. `engine-fake/src/eval.rs`는 M0의
+      가짜 엔진이 쓰므로 남겨 두었다.
 - [ ] M2.4 원격 객체 핸들을 관리한다. `Runtime.callFunctionOn`이
-      `objectId`로 객체를 참조하므로 필요하다.
+      `objectId`로 객체를 참조하므로 필요하다. 지금 `call_function`은 함수
+      문자열을 보고 추측한다. 실제 JS로 바꿔야 한다.
+- [ ] M2.7 외부 스크립트(`src`)와 모듈을 실행한다. 지금은 건너뛴다.
+- [ ] M2.8 `input.value`에 setter를 붙인다. 비밀번호 필드를 어떻게 다룰지
+      M4와 함께 정해야 해서 이번에는 넣지 않았다.
 - [ ] M2.5 클릭 자동화를 연결한다. `Input.dispatchMouseEvent`와 히트테스트가
       만나야 비로소 `click`이 동작한다.
 - [ ] M2.6 이벤트 루프를 만든다. `setTimeout`, 마이크로태스크, `Promise`가
@@ -254,6 +251,31 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
   직접 구현이 있다.
 - **`cargo-wasix`가 `.cargo/config.toml`을 쓴다.** crates.io를 WASIX 오버레이
   레지스트리로 바꿔치기하므로 gitignore에 두었다.
+- **`Cargo.lock` 하나로 두 레지스트리를 다 맞출 수 없다.** WASIX 레지스트리에는
+  `libc`와 `cc`의 `+wasix` 빌드만 있고 crates.io에는 그것이 없다. 그래서
+  서로의 락파일에서 해석에 실패한다. 커밋하는 락파일은 crates.io용이다.
+  `scripts/wasix-build.sh`가 빌드 동안만 그 두 패키지를 다시 고정하고, 끝나면
+  락파일을 되돌리고 `.cargo/config.toml`을 지운다. 그 파일이 남아 있으면
+  네이티브 빌드가 깨지기 때문이다.
+- **엔진에서 `rquickjs`의 `full-wasi`를 쓰면 WASIX 빌드가 깨진다.**
+  `full-wasi`가 `rquickjs-macro`를 끌어오는데, WASIX 툴체인의 rustc가
+  cargo가 만든 그 proc-macro를 읽지 못한다 (E0463 "can't find crate").
+  단순한 proc-macro는 읽으므로 원인은 아직 모른다. 엔진은 매크로를 쓰지 않으므로
+  `bindgen`만 켠다.
+- **rquickjs의 `eval`은 기본이 strict 모드다.** 페이지 스크립트는
+  `EvalOptions`로 strict를 끄고 평가한다.
+- **`agent-browser`는 0.38.2로 검증했다.** 0.16.3에서는 모든 명령이
+  "No page found"로 실패한다. 다른 버전을 쓸 때는
+  `npm install --prefix /tmp/ab agent-browser@0.38.2`로 따로 받아 `PATH` 앞에 둔다.
+- **Wasmer는 최신이 필요하다.** 지금 WASIX 툴체인은 wasm 예외 제안을 쓴다.
+  Wasmer 4.2.6은 "exceptions proposal not enabled"로 모듈을 거부하고,
+  7.5.0은 동작한다.
+- **Wasmer의 소켓은 주소를 재사용하지 않는다.** 앞선 실행이 포트를 놓고
+  약 30초(macOS의 TIME_WAIT) 동안은 bind가 `AddrInUse`로 실패한다. 네이티브
+  빌드는 바로 bind한다. `verify-m0.sh`는 WASIX 모드에서 이 오류가 나면
+  다시 시도한다.
+- **테스트에서 `engine.doc()`을 한 문장에 두 번 쓰면 교착한다.** 첫 번째
+  가드가 문장 끝까지 살아 있기 때문이다. 문서 ID를 먼저 변수로 받는다.
 - **`rquickjs`의 `intrinsic::Performance`는 존재하지 않는 심볼을 가리킨다.**
   실제 이름은 `JS_AddPerformance`다. WASIX와 무관한 rquickjs 쪽 문제이므로
   그 타입은 쓰지 않는다.

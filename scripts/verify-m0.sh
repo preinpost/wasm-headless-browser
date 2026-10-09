@@ -43,10 +43,11 @@ start_server() {
       "$ROOT/target/debug/wasm-headless-browser" "127.0.0.1:${PORT}" &
       ;;
     wasix)
-      "$ROOT/scripts/wasix-build.sh" >/dev/null
+      [[ -n "${WASIX_BUILT:-}" ]] || "$ROOT/scripts/wasix-build.sh" >/dev/null
+      WASIX_BUILT=1
       wasmer run --net \
         "$ROOT/target/wasm32-wasmer-wasi/release/wasm-headless-browser.wasm" \
-        -- "127.0.0.1:${PORT}" &
+        -- "127.0.0.1:${PORT}" 2>"$SERVER_ERR" &
       ;;
     *)
       echo "unknown MODE '$MODE' (expected native or wasix)" >&2
@@ -62,15 +63,29 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
+  if [[ -s "${SERVER_ERR:-}" ]]; then
+    echo "server stderr:" >&2
+    cat "$SERVER_ERR" >&2
+  fi
+  rm -f "${SERVER_ERR:-}"
 }
 trap cleanup EXIT
 
 echo "mode: ${MODE}"
 echo "starting wasm-headless-browser on ${PORT}"
+# Wasmer's sockets do not reuse an address, so for about 30 seconds after an
+# earlier run released the port (TIME_WAIT on macOS) the bind fails with
+# AddrInUse. A native build binds straight away. Retry rather than fail.
+SERVER_ERR="$(mktemp)"
 start_server
 
-for _ in $(seq 1 100); do
+for _ in $(seq 1 450); do
   curl -sf "$BASE/json/version" >/dev/null 2>&1 && break
+  if ! kill -0 "$SERVER_PID" 2>/dev/null && grep -q AddrInUse "$SERVER_ERR"; then
+    : >"$SERVER_ERR"
+    sleep 1
+    start_server
+  fi
   sleep 0.1
 done
 

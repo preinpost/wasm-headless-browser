@@ -71,9 +71,20 @@
   function makeNode(id) {
     const node = {};
 
-    const define = (name, getter) => {
-      Object.defineProperty(node, name, { get: getter, configurable: true, enumerable: true });
+    // A property without a setter throws on assignment in strict code, so the
+    // ones page script writes to get one.
+    const define = (name, getter, setter) => {
+      Object.defineProperty(node, name, { get: getter, set: setter, configurable: true, enumerable: true });
     };
+    // A string property that mirrors an attribute, as `el.id` mirrors `id`.
+    const reflect = (name, attribute) => {
+      define(
+        name,
+        () => api.attr(id, attribute) || '',
+        (value) => api.setAttr(id, attribute, String(value)),
+      );
+    };
+    const setText = (value) => api.setTextContent(id, value == null ? '' : String(value));
     const method = (name, fn) => {
       Object.defineProperty(node, name, { value: fn, configurable: true, enumerable: false });
     };
@@ -83,8 +94,8 @@
     define('tagName', () => api.tagName(id).toUpperCase());
     define('nodeName', () => api.nodeName(id));
     define('localName', () => api.tagName(id));
-    define('id', () => api.attr(id, 'id') || '');
-    define('className', () => api.attr(id, 'class') || '');
+    reflect('id', 'id');
+    reflect('className', 'class');
     define('parentNode', () => wrap(api.parent(id)));
     define('parentElement', () => {
       const parent = api.parent(id);
@@ -115,18 +126,26 @@
     });
 
     // ---- attributes and content ----
-    define('textContent', () => api.textContent(id));
-    define('innerText', () => api.textContent(id));
+    define('textContent', () => api.textContent(id), setText);
+    define('innerText', () => api.textContent(id), setText);
     define('innerHTML', () => api.innerHTML(id));
     define('outerHTML', () => api.outerHTML(id));
-    define('hidden', () => api.hasAttr(id, 'hidden'));
-    define('title', () => api.attr(id, 'title') || '');
-    define('href', () => api.attr(id, 'href') || '');
-    define('src', () => api.attr(id, 'src') || '');
-    define('alt', () => api.attr(id, 'alt') || '');
-    define('name', () => api.attr(id, 'name') || '');
-    define('type', () => api.attr(id, 'type') || (api.tagName(id) === 'input' ? 'text' : ''));
-    define('placeholder', () => api.attr(id, 'placeholder') || '');
+    define(
+      'hidden',
+      () => api.hasAttr(id, 'hidden'),
+      (value) => (value ? api.setAttr(id, 'hidden', '') : api.removeAttr(id, 'hidden')),
+    );
+    reflect('title', 'title');
+    reflect('href', 'href');
+    reflect('src', 'src');
+    reflect('alt', 'alt');
+    reflect('name', 'name');
+    define(
+      'type',
+      () => api.attr(id, 'type') || (api.tagName(id) === 'input' ? 'text' : ''),
+      (value) => api.setAttr(id, 'type', String(value)),
+    );
+    reflect('placeholder', 'placeholder');
     define('value', () => api.value(id));
     define('checked', () => api.checked(id));
     define('disabled', () => api.hasAttr(id, 'disabled'));
@@ -237,6 +256,9 @@
     method('cloneNode', () => wrap(api.cloneNode(id)));
 
     Object.defineProperty(node, '__nodeId', { value: id, enumerable: false });
+    // `Object.prototype.toString` and the engine's CDP description both read
+    // the interface name from here.
+    Object.defineProperty(node, Symbol.toStringTag, { get: () => api.interfaceName(id) });
     return node;
   }
 

@@ -182,6 +182,25 @@ impl Document {
         self.push(Node { data: NodeData::Text, text, ..Node::default() })
     }
 
+    /// `textContent = text`. An element loses its children and gains one text
+    /// node, or none when the text is empty; a text or comment node is edited
+    /// in place. The detached children stay in the arena, unreachable.
+    pub fn set_text_content(&mut self, id: NodeId, text: &str) {
+        match self.nodes[id].data {
+            NodeData::Text | NodeData::Comment => self.nodes[id].text = text.to_string(),
+            NodeData::Element { .. } => {
+                for child in self.nodes[id].children.clone() {
+                    self.detach(child);
+                }
+                if !text.is_empty() {
+                    let node = self.create_text(text.to_string());
+                    self.append_child(id, node);
+                }
+            }
+            NodeData::Document | NodeData::Doctype { .. } => {}
+        }
+    }
+
     /// Deep copy, returned detached. `cloneNode(true)` in the specification.
     pub fn clone_subtree(&mut self, id: NodeId) -> NodeId {
         let source = self.nodes[id].clone();

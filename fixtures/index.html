@@ -32,6 +32,14 @@
     <img src="x.png" alt="A described image">
     <div hidden>you should not see this</div>
     <button aria-label="Close dialog">×</button>
+    <div id="scripted"></div>
+    <script>
+      // Proves the page's own script runs: the heading exists only if it did.
+      const heading = document.createElement('h2');
+      heading.textContent = 'Added by page script';
+      document.getElementById('scripted').appendChild(heading);
+      fixtureScriptRan = true;
+    </script>
   </main>
 </body>
 </html>

@@ -194,10 +194,16 @@ WASIX overlay registry:
 replace-with = "wasix"
 ```
 
-The file is gitignored so a fresh clone resolves from crates.io. Native builds
-happen to work either way, because every dependency here exists in both
-registries, but depending on a third-party mirror for the default build is not
-something to leave in place by accident.
+The file is gitignored so a fresh clone resolves from crates.io. Depending on a
+third-party mirror for the default build is not something to leave in place by
+accident.
+
+**One `Cargo.lock` cannot serve both registries.** Once QuickJS came in, `cc`
+and `libc` are locked, and the overlay registry carries only `+wasix` builds of
+them (`libc 0.2.186+wasix.1`), which crates.io does not have. Each registry
+therefore fails to resolve the other's lockfile. The committed lockfile is the
+crates.io one; `scripts/wasix-build.sh` re-pins those two packages for the
+build, then restores the lockfile and removes `.cargo/config.toml`.
 
 ## Commands
 

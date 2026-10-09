@@ -12,8 +12,11 @@ markup5ever = "0.40"
 serde_json.workspace = true
 base64.workspace = true
 
-# `full-wasi` is rquickjs's feature set for WASI targets: it excludes `dyn-load`,
-# which cannot work in a sandbox. `bindgen` is not optional, because rquickjs
-# ships no pre-generated bindings for wasm32-wasmer-wasi and its fallback looks
-# them up by exact target triple. See docs/quickjs.md.
-rquickjs = { version = "0.14", features = ["full-wasi", "bindgen"] }
+# Only `std` (the default) and `bindgen`. `full-wasi` was used at first, but it
+# pulls in `rquickjs-macro`, and the WASIX toolchain's rustc refuses to load
+# that proc-macro (E0463, "can't find crate") even though cargo built it. The
+# engine uses none of the macros, loaders or conversions that feature adds.
+# `bindgen` is not optional, because rquickjs ships no pre-generated bindings
+# for wasm32-wasmer-wasi and its fallback looks them up by exact target triple.
+# See docs/quickjs.md.
+rquickjs = { version = "0.14", features = ["bindgen"] }

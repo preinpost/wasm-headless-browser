@@ -23,6 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use rquickjs::context::intrinsic;
+use rquickjs::atom::PredefinedAtom;
+use rquickjs::context::EvalOptions;
 use rquickjs::{CatchResultExt, CaughtError, Context, Ctx, Runtime, Value};
 
 /// Everything `JS_NewContext` installs, minus `JS_AddPerformance`.
@@ -143,8 +145,14 @@ impl JsRuntime {
     }
 
     /// Evaluates and converts the result.
+    ///
+    /// Sloppy mode, not rquickjs's default of strict: a classic `<script>` and
+    /// `Runtime.evaluate` both run sloppy in a browser, and page code that
+    /// assigns an undeclared variable would otherwise throw.
     pub fn evaluate(&self, source: &str) -> Result<JsValue, JsError> {
-        self.context.with(|ctx| match ctx.eval::<Value, _>(source).catch(&ctx) {
+        let mut options = EvalOptions::default();
+        options.strict = false;
+        self.context.with(|ctx| match ctx.eval_with_options::<Value, _>(source, options).catch(&ctx) {
             Ok(value) => Ok(to_js_value(&value)),
             Err(caught) => Err(caught_error(caught)),
         })
@@ -220,9 +228,19 @@ fn to_js_value(value: &Value<'_>) -> JsValue {
     if value.is_function() {
         return JsValue::Object { class: "Function".to_string(), is_function: true };
     }
+    // `Symbol.toStringTag` is where the DOM wrappers name their interface, and
+    // what `Object.prototype.toString` reads. A plain object has none.
     let class = value
         .as_object()
-        .and_then(|o| o.get::<_, Option<String>>("constructor").ok().flatten())
+        .and_then(|o| {
+            o.get::<_, Option<String>>(PredefinedAtom::SymbolToStringTag).ok().flatten().or_else(|| {
+                o.get::<_, Option<rquickjs::Object>>("constructor")
+                    .ok()
+                    .flatten()
+                    .and_then(|c| c.get::<_, Option<String>>("name").ok().flatten())
+            })
+        })
+        .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "Object".to_string());
     JsValue::Object { class, is_function: false }
 }
@@ -292,6 +310,23 @@ mod tests {
         js.run("globalThis.counter = 0").unwrap();
         js.run("globalThis.counter += 5").unwrap();
         assert_eq!(js.eval_to_string("String(globalThis.counter)").unwrap(), "5");
+    }
+
+    #[test]
+    fn scripts_run_in_sloppy_mode_like_a_classic_script() {
+        // Assigning an undeclared name is a ReferenceError in strict mode, and
+        // plenty of page code does it.
+        let js = runtime();
+        js.run("undeclared = 3").unwrap();
+        assert_eq!(js.eval_to_string("String(undeclared)").unwrap(), "3");
+    }
+
+    #[test]
+    fn objects_report_their_constructor() {
+        let js = runtime();
+        assert_eq!(js.eval_to_string("[]").unwrap(), "Array");
+        assert_eq!(js.eval_to_string("({})").unwrap(), "Object");
+        assert_eq!(js.eval_to_string("new Map()").unwrap(), "Map");
     }
 
     #[test]

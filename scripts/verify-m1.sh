@@ -7,8 +7,11 @@
 # The fixture page is served by a plain HTTP server, so the fetch path, the
 # parser, the selector engine and the accessibility projection all run for real.
 #
-# Not covered, and asserted as such: layout and JavaScript. Screenshots and
-# input are expected to fail with a message that says why.
+# The fixture carries an inline script, so the page's own JavaScript runs too,
+# and `eval` goes through the real engine.
+#
+# Not covered, and asserted as such: layout. Screenshots and input are expected
+# to fail with a message that says why.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -100,6 +103,14 @@ check "table semantics" 'table' "$snap"
 check "column headers" 'columnheader "Name"' "$snap"
 check "cells" 'cell "alpha"' "$snap"
 check "alt text names an image" 'img "A described image"' "$snap"
+
+echo "the page's own script"
+check "an inline script mutated the document" 'heading "Added by page script" \[level=2' "$snap"
+check "eval runs real JavaScript" '^42$' "$(agent-browser --cdp "$BASE" eval '6 * 7' 2>&1 || true)"
+check "eval sees the script's global" 'true' \
+  "$(agent-browser --cdp "$BASE" eval 'typeof fixtureScriptRan !== "undefined" && fixtureScriptRan' 2>&1 || true)"
+check "eval reads the document" 'Added by page script' \
+  "$(agent-browser --cdp "$BASE" eval "document.querySelector('#scripted h2').textContent" 2>&1 || true)"
 
 echo "what must stay out"
 check_absent "hidden subtrees are excluded" "you should not see this" "$snap"

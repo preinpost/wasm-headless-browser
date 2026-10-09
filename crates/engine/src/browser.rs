@@ -686,7 +686,7 @@ fn cdp_result(value: JsValue) -> Value {
         JsValue::Bool(b) => json!({ "type": "boolean", "value": b }),
         JsValue::Number(n) => json!({
             "type": "number",
-            "value": n,
+            "value": number_json(n),
             "description": if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n}") },
         }),
         JsValue::String(s) => json!({ "type": "string", "value": s }),
@@ -695,6 +695,17 @@ fn cdp_result(value: JsValue) -> Value {
             "className": class,
             "description": class,
         }),
+    }
+}
+
+/// A whole number goes out as `42`, the way Chrome sends it, not `42.0`.
+/// `-0` stays a float so its sign survives.
+fn number_json(n: f64) -> Value {
+    let whole = n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0;
+    if whole && !(n == 0.0 && n.is_sign_negative()) {
+        json!(n as i64)
+    } else {
+        json!(n)
     }
 }
 
@@ -709,7 +720,16 @@ fn now() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn class_for(doc: &Document, node: NodeId) -> &'static str {
+/// The DOM interface a node presents as. Shared with the JavaScript wrappers'
+/// `Symbol.toStringTag`, so `DOM.resolveNode` and `Runtime.evaluate` agree.
+pub(crate) fn class_for(doc: &Document, node: NodeId) -> &'static str {
+    match &doc.node(node).data {
+        NodeData::Document => return "HTMLDocument",
+        NodeData::Doctype { .. } => return "DocumentType",
+        NodeData::Text => return "Text",
+        NodeData::Comment => return "Comment",
+        NodeData::Element { .. } => {}
+    }
     match doc.tag(node) {
         Some("html") => "HTMLHtmlElement",
         Some("body") => "HTMLBodyElement",
@@ -842,11 +862,18 @@ mod tests {
     #[test]
     fn evaluates_real_page_javascript() {
         let mut engine = engine_with("<title>Real</title><body><h1>Heading</h1></body>");
-        assert_eq!(evaluate(&mut engine, "1 + 1")["value"], 2.0);
-        assert_eq!(evaluate(&mut engine, "location.href")["value"], "http://example.test/page");
-        assert_eq!(evaluate(&mut engine, "document.title")["value"], "Real");
-        assert_eq!(evaluate(&mut engine, "document.querySelector('h1').textContent")["value"], "Heading");
-        assert_eq!(evaluate(&mut engine, "window.innerWidth")["value"], 800.0);
+        assert_eq!(evaluate(&mut engine, "1 + 1")["result"]["value"], 2.0);
+        assert_eq!(evaluate(&mut engine, "location.href")["result"]["value"], "http://example.test/page");
+        assert_eq!(evaluate(&mut engine, "document.title")["result"]["value"], "Real");
+        assert_eq!(evaluate(&mut engine, "document.querySelector('h1').textContent")["result"]["value"], "Heading");
+        assert_eq!(evaluate(&mut engine, "window.innerWidth")["result"]["value"], 800.0);
+    }
+
+    #[test]
+    fn whole_numbers_go_out_without_a_fraction() {
+        let mut engine = engine_with("<body>x</body>");
+        assert_eq!(evaluate(&mut engine, "6 * 7")["result"]["value"].to_string(), "42");
+        assert_eq!(evaluate(&mut engine, "1.5")["result"]["value"].to_string(), "1.5");
     }
 
     #[test]
@@ -937,12 +964,12 @@ mod tests {
         // JavaScript answers, so an arbitrary expression has a real value.
         let mut engine = engine_with("<body><p id='p'>hello</p></body>");
         assert_eq!(
-            evaluate(&mut engine, "document.querySelector('#p').textContent.length")["value"],
+            evaluate(&mut engine, "document.querySelector('#p').textContent.length")["result"]["value"],
             5.0
         );
-        assert_eq!(evaluate(&mut engine, "['a','b'].join('-')")["value"], "a-b");
+        assert_eq!(evaluate(&mut engine, "['a','b'].join('-')")["result"]["value"], "a-b");
         assert_eq!(
-            evaluate(&mut engine, "JSON.stringify({n: [1,2]})")["value"],
+            evaluate(&mut engine, "JSON.stringify({n: [1,2]})")["result"]["value"],
             r#"{"n":[1,2]}"#
         );
     }
@@ -954,7 +981,7 @@ mod tests {
         // Evaluate returns a description, not a handle; resolve through DOM.
         assert_eq!(object["result"]["className"], "HTMLParagraphElement");
 
-        let node = engine.doc().find_id(engine.doc().document_id(), "p").unwrap();
+        let node = { let doc = engine.doc(); doc.find_id(doc.document_id(), "p") }.unwrap();
         let handle = engine.store_object(node);
         let id = handle["objectId"].as_str().unwrap().to_string();
         let text = engine.call_function(&id, "function() { return this.textContent; }");
@@ -964,7 +991,7 @@ mod tests {
     #[test]
     fn call_function_does_not_leak_a_password() {
         let mut engine = engine_with("<body><input type='password' id='pw' value='secret'></body>");
-        let node = engine.doc().find_id(engine.doc().document_id(), "pw").unwrap();
+        let node = { let doc = engine.doc(); doc.find_id(doc.document_id(), "pw") }.unwrap();
         let handle = engine.store_object(node);
         let id = handle["objectId"].as_str().unwrap().to_string();
         let value = engine.call_function(&id, "function() { return this.value; }");
@@ -974,18 +1001,19 @@ mod tests {
     #[test]
     fn dom_node_ids_round_trip() {
         let engine = engine_with("<body><p id='p'>x</p></body>");
-        let p = engine.doc().find_id(engine.doc().document_id(), "p").unwrap();
+        let p = { let doc = engine.doc(); doc.find_id(doc.document_id(), "p") }.unwrap();
         assert_eq!(HtmlEngine::dom_from_backend(HtmlEngine::backend_id(p)), Some(p));
     }
 
     #[test]
     fn describe_reports_node_types_and_attributes() {
         let engine = engine_with("<body><a href='/x' id='l'>t</a></body>");
-        let document = engine.describe(engine.doc().document_id());
+        let root = engine.doc().document_id();
+        let document = engine.describe(root);
         assert_eq!(document["nodeType"], 9);
         assert_eq!(document["nodeName"], "#document");
 
-        let a = engine.doc().find_id(engine.doc().document_id(), "l").unwrap();
+        let a = { let doc = engine.doc(); doc.find_id(doc.document_id(), "l") }.unwrap();
         let described = engine.describe(a);
         assert_eq!(described["nodeType"], 1);
         assert_eq!(described["nodeName"], "A");
@@ -995,14 +1023,14 @@ mod tests {
     #[test]
     fn serialize_round_trips_a_small_fragment() {
         let engine = engine_with("<body><div id=\"a\"><p>hi</p></div></body>");
-        let div = engine.doc().find_id(engine.doc().document_id(), "a").unwrap();
+        let div = { let doc = engine.doc(); doc.find_id(doc.document_id(), "a") }.unwrap();
         assert_eq!(serialize(&engine.doc(), div), "<div id=\"a\"><p>hi</p></div>");
     }
 
     #[test]
     fn serialize_does_not_invent_closing_tags_for_void_elements() {
         let engine = engine_with("<body><img src=\"x.png\" alt=\"a\"><br></body>");
-        let img = engine.doc().find_tag(engine.doc().document_id(), "img").unwrap();
+        let img = { let doc = engine.doc(); doc.find_tag(doc.document_id(), "img") }.unwrap();
         assert_eq!(serialize(&engine.doc(), img), "<img src=\"x.png\" alt=\"a\">");
     }
 
@@ -1051,7 +1079,8 @@ mod tests {
         // the client can read rather than as a protocol failure.
         assert!(engine.last_error.as_deref().unwrap_or("").contains("TLS"));
         assert_eq!(engine.info().title, "Navigation failed");
-        assert!(engine.doc().text_content(engine.doc().document_id()).contains("TLS"));
+        let doc = engine.doc();
+        assert!(doc.text_content(doc.document_id()).contains("TLS"));
     }
 
     #[test]
