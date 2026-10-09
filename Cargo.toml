@@ -3,6 +3,7 @@ resolver = "2"
 exclude = [
     "experiments/quickjs",
     "experiments/tls",
+    "vendor/rquickjs-sys",
 ]
 
 members = [
@@ -30,3 +31,7 @@ base64 = "0.22"
 opt-level = "s"
 lto = true
 panic = "abort"
+
+# QuickJS with our patches. See vendor/README.md.
+[patch.crates-io]
+rquickjs-sys = { path = "vendor/rquickjs-sys" }

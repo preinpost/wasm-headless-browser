@@ -1,0 +1,68 @@
+--- a/quickjs/quickjs.c
++++ b/quickjs/quickjs.c
+@@ -16562,6 +16562,39 @@
+         return JS_ThrowTypeError(ctx, "invalid property access");
+     }
+     return JS_UNDEFINED;
++}
++
++/* wasm-headless-browser: Function.prototype.caller for sloppy functions.
++   Upstream answers undefined. V8 and SpiderMonkey answer the function that
++   called this one, and old class libraries (the grid library's `this._super.caller`)
++   use it to find the overridden method. Walks the stack to the newest frame
++   running `this_val`, then returns the nearest bytecode function below it.
++   Native frames such as Function.prototype.apply are skipped, as V8 skips
++   them, and a strict caller is reported as null. See vendor/patches. */
++static JSValue js_function_proto_caller(JSContext *ctx, JSValueConst this_val,
++                                        int argc, JSValueConst *argv)
++{
++    JSFunctionBytecode *b = JS_GetFunctionBytecode(this_val);
++    JSStackFrame *sf;
++
++    if (!b || b->is_strict_mode || !b->has_prototype)
++        return JS_ThrowTypeError(ctx, "invalid property access");
++    for (sf = ctx->rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
++        if (JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT &&
++            JS_VALUE_GET_OBJ(sf->cur_func) == JS_VALUE_GET_OBJ(this_val))
++            break;
++    }
++    if (sf == NULL)
++        return JS_NULL;
++    for (sf = sf->prev_frame; sf != NULL; sf = sf->prev_frame) {
++        JSFunctionBytecode *cb = JS_GetFunctionBytecode(sf->cur_func);
++        if (cb == NULL)
++            continue;
++        if (cb->is_strict_mode)
++            return JS_NULL;
++        return js_dup(sf->cur_func);
++    }
++    return JS_NULL;
+ }
+ 
+ static JSValue js_function_proto_fileName(JSContext *ctx,
+@@ -58758,11 +58791,20 @@
+     if (JS_IsException(ctx->throw_type_error))
+         return -1;
+     /* add caller and arguments properties to throw a TypeError */
+-    if (JS_DefineProperty(ctx, ctx->function_proto, JS_ATOM_caller, JS_UNDEFINED,
+-                          ctx->throw_type_error, ctx->throw_type_error,
+-                          JS_PROP_HAS_GET | JS_PROP_HAS_SET |
+-                          JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE) < 0)
+-        return -1;
++    /* wasm-headless-browser: `caller` reads the stack (js_function_proto_caller) */
++    {
++        JSValue caller_getter = JS_NewCFunction(ctx, js_function_proto_caller, "caller", 0);
++        int ret;
++        if (JS_IsException(caller_getter))
++            return -1;
++        ret = JS_DefineProperty(ctx, ctx->function_proto, JS_ATOM_caller, JS_UNDEFINED,
++                                caller_getter, ctx->throw_type_error,
++                                JS_PROP_HAS_GET | JS_PROP_HAS_SET |
++                                JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE);
++        JS_FreeValue(ctx, caller_getter);
++        if (ret < 0)
++            return -1;
++    }
+     if (JS_DefineProperty(ctx, ctx->function_proto, JS_ATOM_arguments, JS_UNDEFINED,
+                           ctx->throw_type_error, ctx->throw_type_error,
+                           JS_PROP_HAS_GET | JS_PROP_HAS_SET |

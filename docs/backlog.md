@@ -97,6 +97,8 @@ DOM은 가두지 않았습니다. `Arc<Mutex<Document>>`로 엔진과 공유하�
 | QuickJS를 넣은 WASIX 모듈은 1.6MB다. TLS를 넣으면 2.3MB다 | 이 문서의 §1.5, [docs/wasix.md](wasix.md) |
 | WASIX에서 rustls + ring이 TLS 1.3으로 동작한다. 참조 사이트 인증서는 공개 루트로 검증된다 | [docs/wasix.md](wasix.md) |
 | example.com은 이제 본문이 문단 하나와 `<script src=/s.js>`뿐이다. 외부 스크립트 없이는 제목과 링크가 없다 | 2026-10-09 측정 |
+| 참조 사이트의 로그인 화면이 WASIX에서 그려진다. 첫 입력란·아이디·비밀번호 입력란과 "다음" 버튼이 스냅샷에 나온다. CSS로 숨긴 추가 인증 화면들도 함께 나온다(캐스케이드 없음) | 2026-10-09 agent-browser |
+| QuickJS 호출은 V8보다 네이티브 스택을 훨씬 많이 쓴다. 기본 한도 1MB로는 React 렌더링이 넘친다. 스크립트 스레드는 32MB 스택에 한도 24MB로 돈다 | 같은 측정 |
 | 참조 사이트는 React 번들 3개와 the grid library·jQuery·lottie를 싣는다. jQuery는 초기화 때 `createHTMLDocument`를, lottie는 캔버스 2D 컨텍스트를 요구하고, the grid library는 `Function.caller`를 요구한다 | 2026-10-09 `probe_a_url` |
 | agent-browser의 `back`·`forward`는 CDP 메서드가 아니라 `Runtime.evaluate("history.back()")`이다 | [docs/capture/required-expressions.txt](capture/required-expressions.txt) |
 | `Context::full`이 죽는 원인은 sysroot 불일치 하나다. `CLOCK_MONOTONIC`이 포인터 인코딩(1058440)으로 컴파일되고 WASIX는 정수 1을 기대한다 | 같은 문서 |
@@ -136,7 +138,8 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 
 1. **네트워크 기반.** HTTPS(M1.11), POST와 쿠키 저장소(M3.2). **완료**
 2. **JS가 화면을 그린다.** 외부 스크립트(M2.7), 이벤트 루프와 Promise(M2.6),
-   `fetch`/XHR(M2.9). **기반 완료.** 참조 사이트는 `Function.caller`(M2.10)에서 막힌다
+   `fetch`/XHR(M2.9). **완료.** 참조 사이트의 로그인 화면이 네이티브와 WASIX에서
+   그려진다. 다만 열리는 데 12초가 걸린다(M2.13)
 3. **입력과 제출.** `Input.insertText`가 포커스된 입력란을 바꾸고 이벤트를 낸다
    (M2.8). 엔터와 제출 버튼이 폼 제출로 이어진다. `callFunctionOn`을 실제 JS로
    (M2.4)
@@ -228,10 +231,13 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 - [x] M2.8 폼 컨트롤 상태. 입력값·체크·선택을 속성과 따로 `dom::Control`에 둔다.
       페이지 스크립트는 비밀번호 값을 읽는다. 로그인 폼을 제출하려면 읽어야 한다.
       접근성 트리와 CDP 설명에는 나오지 않는다.
-- [ ] M2.10 `Function.prototype.caller`. 참조 사이트의 the grid library가
-      `this._super.caller`로 부모 메서드를 찾는데 QuickJS는 늘 `undefined`를 준다.
-      메인 번들이 초기화 때 `the grid library's setup`를 부르므로 앱 전체가 멈춘다.
-      QuickJS C 코드의 수정이 필요하다 (§5 참조).
+- [x] M2.10 `Function.prototype.caller`. 참조 사이트의 the grid library가
+      `this._super.caller`로 부모 메서드를 찾는데 QuickJS는 늘 `undefined`를 줬다.
+      rquickjs-sys를 `vendor/`에 들여와 QuickJS를 패치했다
+      ([vendor/README.md](../vendor/README.md)).
+- [ ] M2.13 참조 사이트를 여는 데 릴리스 빌드로도 12초가 걸린다. 번들 파싱인지,
+      `Connection: close`로 매번 새로 맺는 TLS인지, 가상 시간 5초 동안 도는
+      폴링 작업인지 아직 재지 않았다.
 - [ ] M2.11 ES 모듈(`type=module`)과 `import()`.
 - [ ] M2.12 `popstate`. 지금은 `pushState`로 만든 항목으로 뒤로 가면 그 URL을
       새로 읽는다.
@@ -267,11 +273,10 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 
 ## 5. 미결 사항
 
-- [ ] **QuickJS를 패치할지 (M2.10).** `Function.prototype.caller`는 C 코드
-      (`JS_AddIntrinsicBaseObjects`) 안에 있어 JS나 rquickjs로는 바꿀 수 없다.
-      rquickjs-sys(9.5MB)를 리포에 들여와 `[patch.crates-io]`로 바꿔 끼우고,
-      스택 프레임을 따라 호출자를 돌려주는 C 수정을 넣어야 한다. 하면 `Context::full`
-      문제(sysroot)도 같은 자리에서 고칠 수 있다.
+- [x] **QuickJS를 패치할지 (M2.10).** 했다. rquickjs-sys를 빌드에 쓰는 파일만
+      남겨 `vendor/rquickjs-sys`(4.4MB)에 두고 `[patch.crates-io]`로 바꿔 끼웠다.
+      패치는 `vendor/patches/`에 diff로도 둔다. `Context::full` 문제(sysroot)도
+      이제 같은 자리에서 고칠 수 있다.
 
 - [ ] **wasixcc를 설치할지.** 설치하면 `Context::full`이 살아나고
       `performance.now()`가 동작하며 QuickJS 빌드 우회가 사라진다. 대신
@@ -350,6 +355,10 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
   아직 없다.
 - **테스트에서 `engine.doc()`을 한 문장에 두 번 쓰면 교착한다.** 첫 번째
   가드가 문장 끝까지 살아 있기 때문이다. 문서 ID를 먼저 변수로 받는다.
+- **QuickJS는 `vendor/rquickjs-sys`에서 온다.** rquickjs를 올릴 때는 새
+  rquickjs-sys를 같은 방식으로 복사하고 `vendor/patches/`를 다시 적용한다.
+  경로 의존성이 되면서 빌드 때 "using bundled bindings" 경고가 보이는데, 원래도
+  나던 것이 이제 숨겨지지 않을 뿐이다.
 - **`rquickjs`의 `intrinsic::Performance`는 존재하지 않는 심볼을 가리킨다.**
   실제 이름은 `JS_AddPerformance`다. WASIX와 무관한 rquickjs 쪽 문제이므로
   그 타입은 쓰지 않는다.
