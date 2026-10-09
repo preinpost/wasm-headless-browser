@@ -5,7 +5,10 @@
 //! inside `Input.insertText`, and only into a page from the origin the secret
 //! is bound to. Everything the engine sends back over CDP has the value
 //! replaced by the placeholder again, so a client that reads the field, or a
-//! snapshot that shows a username, gets the placeholder.
+//! snapshot that shows a username, gets the placeholder. So does a
+//! `Network.requestWillBeSent` carrying the login `POST`, where the value is
+//! escaped in JSON or percent-encoded in a form: those forms are scrubbed
+//! too.
 //!
 //! Values arrive on stdin (see the `browser` binary), never on the command
 //! line or in the environment, live only in this process's memory, and are
@@ -25,19 +28,75 @@ pub struct Secret {
     name: String,
     origin: String,
     value: String,
+    /// The value as it appears in what a page sends, other than as typed:
+    /// escaped in a JSON string, and percent-encoded in a form body (`+` for
+    /// a space) or a URL (`%20`). Copies of the value, so wiped with it.
+    encoded: Vec<String>,
+}
+
+impl Secret {
+    fn new(name: &str, origin: String, value: String) -> Self {
+        let mut encoded: Vec<String> = Vec::new();
+        for form in [json_escaped(&value), form_encoded(&value, "+"), form_encoded(&value, "%20")] {
+            if form != value && !encoded.contains(&form) {
+                encoded.push(form);
+            } else {
+                let mut form = form;
+                wipe(&mut form);
+            }
+        }
+        Secret { name: name.to_string(), origin, value, encoded }
+    }
+
+    /// Every form of the value the scrub looks for.
+    fn forms(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.value.as_str()).chain(self.encoded.iter().map(String::as_str)).filter(|f| !f.is_empty())
+    }
+
+    fn placeholder(&self) -> String {
+        format!("{{{{secret:{}}}}}", self.name)
+    }
 }
 
 impl Drop for Secret {
     /// Overwrites the value, so it does not outlive its use in freed memory.
     fn drop(&mut self) {
-        // SAFETY: writing zero bytes keeps the string valid UTF-8, and the
-        // volatile writes keep the compiler from eliding them.
-        unsafe {
-            for byte in self.value.as_mut_vec().iter_mut() {
-                std::ptr::write_volatile(byte, 0);
-            }
+        wipe(&mut self.value);
+        self.encoded.iter_mut().for_each(wipe);
+    }
+}
+
+/// Overwrites a string's bytes in place.
+fn wipe(text: &mut String) {
+    // SAFETY: writing zero bytes keeps the string valid UTF-8, and the
+    // volatile writes keep the compiler from eliding them.
+    unsafe {
+        for byte in text.as_mut_vec().iter_mut() {
+            std::ptr::write_volatile(byte, 0);
         }
     }
+}
+
+// The encoders write into buffers sized for the worst case up front, so no
+// copy of the value is left behind in a buffer that grew and was freed.
+
+/// The value inside a JSON string, without the quotes.
+fn json_escaped(value: &str) -> String {
+    let mut buffer = Vec::with_capacity(value.len() * 6 + 2);
+    let _ = serde_json::to_writer(&mut buffer, value);
+    buffer.pop();
+    buffer.remove(0);
+    String::from_utf8(buffer).unwrap_or_default()
+}
+
+/// The value percent-encoded as `application/x-www-form-urlencoded` does,
+/// with `space` for a space.
+fn form_encoded(value: &str, space: &str) -> String {
+    let mut out = String::with_capacity(value.len() * 3);
+    for piece in url::form_urlencoded::byte_serialize(value.as_bytes()) {
+        out.push_str(if piece == "+" { space } else { piece });
+    }
+    out
 }
 
 impl std::fmt::Debug for Secret {
@@ -101,7 +160,7 @@ impl Secrets {
             return Err(bad());
         }
         self.secrets.retain(|s| s.name != name);
-        self.secrets.push(Secret { name: name.to_string(), origin: origin.ascii_serialization(), value });
+        self.secrets.push(Secret::new(name, origin.ascii_serialization(), value));
         Ok(())
     }
 
@@ -143,11 +202,31 @@ impl Secrets {
     pub fn scrub_str(&self, text: &str) -> String {
         let mut out = text.to_string();
         for secret in &self.secrets {
-            if !secret.value.is_empty() && out.contains(&secret.value) {
-                out = out.replace(&secret.value, &format!("{{{{secret:{}}}}}", secret.name));
+            for form in secret.forms() {
+                if out.contains(form) {
+                    out = out.replace(form, &secret.placeholder());
+                }
             }
         }
         out
+    }
+
+    /// [`scrub_str`](Self::scrub_str) for bytes that may not be text, such
+    /// as a response body sent base64-encoded, where the string scrub
+    /// cannot see the value.
+    pub fn scrub_bytes(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        for secret in &self.secrets {
+            let placeholder = secret.placeholder();
+            for form in secret.forms() {
+                out = replace_bytes(&out, form.as_bytes(), placeholder.as_bytes());
+            }
+        }
+        out
+    }
+
+    fn leaks(&self, text: &str) -> bool {
+        self.secrets.iter().any(|secret| secret.forms().any(|form| text.contains(form)))
     }
 
     /// Replaces every value in every string of a CDP message, keys included,
@@ -158,14 +237,14 @@ impl Secrets {
         }
         match value {
             Value::String(s) => {
-                if self.secrets.iter().any(|secret| !secret.value.is_empty() && s.contains(&secret.value)) {
+                if self.leaks(s) {
                     *s = self.scrub_str(s);
                 }
             }
             Value::Array(items) => items.iter_mut().for_each(|v| self.scrub(v)),
             Value::Object(map) => {
                 let leaking: Vec<String> =
-                    map.keys().filter(|k| self.secrets.iter().any(|s| !s.value.is_empty() && k.contains(&s.value))).cloned().collect();
+                    map.keys().filter(|k| self.leaks(k)).cloned().collect();
                 for key in leaking {
                     if let Some(v) = map.remove(&key) {
                         map.insert(self.scrub_str(&key), v);
@@ -176,6 +255,24 @@ impl Secrets {
             _ => {}
         }
     }
+}
+
+fn replace_bytes(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < haystack.len() {
+        if haystack[i..].starts_with(needle) {
+            out.extend_from_slice(with);
+            i += needle.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -218,6 +315,18 @@ mod tests {
         assert!(!text.contains("hunter2") && !text.contains("as kim"), "{text}");
         assert_eq!(message["result"]["value"], "{{secret:gw}}");
         assert_eq!(message["nodes"][0]["name"]["value"], "logged in as {{secret:user}}");
+    }
+
+    #[test]
+    fn encoded_values_are_scrubbed_too() {
+        let mut s = Secrets::new();
+        s.add("pw@https://gw.example.com", "p@ss w\"rd&1".into()).unwrap();
+        let body = r#"{"password":"p@ss w\"rd&1"} password=p%40ss+w%22rd%261 q=p%40ss%20w%22rd%261"#;
+        assert_eq!(
+            s.scrub_str(body),
+            r#"{"password":"{{secret:pw}}"} password={{secret:pw}} q={{secret:pw}}"#
+        );
+        assert_eq!(s.scrub_bytes(b"\x00p@ss w\"rd&1\xff"), b"\x00{{secret:pw}}\xff");
     }
 
     #[test]

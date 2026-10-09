@@ -18,6 +18,10 @@
 # The wrong password is typed as plain text and submitted by clicking the
 # button; the right one is a placeholder submitted by pressing Enter, so both
 # input paths are covered.
+#
+# A HAR is recorded throughout, as a client would to debug a login, and the
+# network log is read back: the login POST carries the password, so the
+# request body is where a leak through Network.* events would show.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -74,6 +78,7 @@ ref_of() {
 }
 
 SERVER_ERR="$(mktemp)"
+HAR_DIR="$(mktemp -d)"
 start_engine() {
   local command
   case "$MODE" in
@@ -97,6 +102,7 @@ cleanup() {
     [[ -n "$pid" ]] && { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
   done
   rm -f "$SERVER_ERR"
+  rm -rf "$HAR_DIR"
 }
 trap cleanup EXIT
 
@@ -123,6 +129,7 @@ for _ in $(seq 1 450); do
 done
 
 echo "the page its script renders"
+check "HAR recording starts" "HAR recording started" "$(ab network har start)"
 check "open reads the title" "Fixture Login" "$(ab open "$SITE/")"
 snap="$(ab snapshot -i)"
 check "the user field is there" 'textbox "User"' "$snap"
@@ -148,6 +155,16 @@ check "the url moved with pushState" "$SITE/home" "$(ab get url)"
 check "the session cookie is in the jar" "sid=" "$(ab cookies get)"
 check_absent "page script cannot see the HttpOnly cookie" "sid=" "$(ab eval 'document.cookie')"
 
+echo "the network log"
+requests="$(ab network requests)"
+check "the document is in it" "GET $SITE/ (Document) 200" "$requests"
+check "so is the script" "GET $SITE/app.js (Script) 200" "$requests"
+check "so is the login POST" "POST $SITE/api/login (Fetch) 200" "$requests"
+login_id="$(grep "POST $SITE/api/login (Fetch) 200" <<<"$requests" | grep -o '^\[[^]]*' | tr -d '[')"
+detail="$(ab --json network request "$login_id")"
+check "its body went out with placeholders" '"postData":"{\\"user\\":\\"{{secret:fixture_user}}\\",\\"password\\":\\"{{secret:fixture_pw}}\\"}"' "$detail"
+check "the response body is there" '"responseBody":"{\\"ok\\":true}"' "$detail"
+
 echo "the session survives a reload"
 check "reopening /home is still signed in" "Fixture Login" "$(ab open "$SITE/home")"
 check "the cookie authenticated the API call" 'heading "Welcome, ' "$(ab snapshot)"
@@ -158,8 +175,12 @@ check "another origin's field refuses it" "is for $SITE" \
   "$(ab fill '#x' '{{secret:fixture_pw}}')"
 check "and stays empty" '""' "$(ab eval "document.getElementById('x').value")"
 
+check "the HAR is saved" "HAR saved" "$(ab network har stop "$HAR_DIR/login.har")"
+TRANSCRIPT+="$(cat "$HAR_DIR/login.har" 2>/dev/null)"$'\n'
+check "the HAR has the login POST" '"url": *"'"$SITE"'/api/login"' "$(cat "$HAR_DIR/login.har" 2>/dev/null)"
+
 echo "what must not leak"
-check_absent "the client never saw the password" "$PASSWORD" "$TRANSCRIPT"
+check_absent "the client never saw the password, HAR included" "$PASSWORD" "$TRANSCRIPT"
 check_absent "the client never saw the user name" "Welcome, $USER_NAME" "$TRANSCRIPT"
 check_absent "the engine's stderr, traced, does not carry it" "$PASSWORD" "$(cat "$SERVER_ERR")"
 check "the trace did run" "Input.insertText" "$(cat "$SERVER_ERR")"

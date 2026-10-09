@@ -23,6 +23,7 @@ use crate::cookies::{self, Source};
 use crate::dom::{Document, NodeData, NodeId};
 use crate::fetch;
 use crate::js::JsError;
+use crate::network::ResourceType;
 use crate::parse::parse_fragment;
 use crate::select;
 
@@ -801,17 +802,24 @@ fn http_request(
     url: String,
     headers: Vec<String>,
     body: String,
+    kind: String,
 ) -> fetch::Request {
     let base = with_doc(doc, |d| d.url().to_string()).unwrap_or_default();
     let url = resolve_url(&base, &url).unwrap_or(url);
-    let headers = headers
+    let mut headers: Vec<(String, String)> = headers
         .chunks(2)
         .filter_map(|pair| match pair {
             [name, value] => Some((name.clone(), value.clone())),
             _ => None,
         })
         .collect();
-    fetch::Request { method, url, headers, body: body.into_bytes() }
+    let kind = ResourceType::parse(&kind);
+    // What `fetch` and XHR send when the page sets none, rather than the
+    // client's default, which is a document's.
+    if matches!(kind, ResourceType::Fetch | ResourceType::Xhr) && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")) {
+        headers.push(("Accept".into(), "*/*".into()));
+    }
+    fetch::Request { method, url, headers, body: body.into_bytes(), kind }
 }
 
 /// A response as the prelude reads it: `[status, statusText, finalUrl,
@@ -856,8 +864,8 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         // preloaded. Returns what `http_answer` makes.
         let doc = Arc::clone(&state.doc);
         let client = state.client.clone();
-        install_fn!(ctx, api, "http", move |method: String, url: String, headers: Vec<String>, body: String| {
-            let request = http_request(&doc, method, url, headers, body);
+        install_fn!(ctx, api, "http", move |method: String, url: String, headers: Vec<String>, body: String, kind: String| {
+            let request = http_request(&doc, method, url, headers, body, kind);
             let url = request.url.clone();
             http_answer(client.send(request), url)
         });
@@ -873,8 +881,8 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         let client = state.client.clone();
         let requests = Arc::clone(&state.requests);
         let next = Arc::new(Mutex::new(0u32));
-        install_fn!(ctx, api, "httpStart", move |method: String, url: String, headers: Vec<String>, body: String| {
-            let request = http_request(&doc, method, url, headers, body);
+        install_fn!(ctx, api, "httpStart", move |method: String, url: String, headers: Vec<String>, body: String, kind: String| {
+            let request = http_request(&doc, method, url, headers, body, kind);
             let url = request.url.clone();
             let pending = client.start(request);
             let mut next = next.lock().unwrap_or_else(|p| p.into_inner());

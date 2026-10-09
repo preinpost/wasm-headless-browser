@@ -43,9 +43,14 @@ what this exists to avoid.
   sends, and the target's title and URL, has each value replaced by its
   placeholder. A client that reads the field (`input.value`), snapshots a page
   showing a username, or sees an error message quoting the field gets
-  `{{secret:NAME}}`. This holds for events that do not exist yet, such as
-  `Network.requestWillBeSent` with a POST body, because the scrub is applied
-  to all outgoing traffic rather than method by method.
+  `{{secret:NAME}}`. The scrub is applied to all outgoing traffic rather
+  than method by method, so it covers `Network.requestWillBeSent` with the
+  login POST's body, `Network.getResponseBody`, and whatever is added later.
+- **Encoded copies are caught too.** A page sends the value escaped in a
+  JSON string or percent-encoded in a form, so `p@ss"1` goes out as
+  `p@ss\"1` or `p%40ss%221`. The scrub looks for those forms as well as the
+  value as typed. A response body sent base64-encoded is scrubbed as bytes
+  before it is encoded, where the string scrub could not see it.
 - **It never reaches a log.** `WHB_TRACE_CDP` logs typed text as its length,
   and everything else it logs has already been scrubbed. The engine writes
   no files at all: cookies and `localStorage` live in memory.
@@ -64,6 +69,12 @@ what this exists to avoid.
 - **Not in the page's memory.** The page copies the value into its own
   JavaScript strings, which cannot be wiped. They go with the page: a
   navigation discards the document's script context.
+- **Other encodings are not caught.** Base64 of the value inside a page's
+  own request, a hash of it, or a value split across two strings goes out as
+  it is. The JSON and form encodings are the ones a login form produces.
+- **A client's HAR file is written by the client.** Its `postData` holds the
+  placeholder, as `verify-login.sh` checks, but where the file goes is the
+  client's business.
 - **Short values scrub broadly.** Every occurrence is replaced, so a username
   like `kim` also turns `skim` into `s{{secret:user}}`.
 
@@ -75,6 +86,7 @@ The M4.3 list, and where each stands.
 |---|---|---|
 | CDP results and errors | Scrubbed | `verify-login.sh` reads the field back and gets the placeholder; an engine test throws an error quoting it |
 | CDP events | Scrubbed | Same path as results; covered by the engine tests |
+| `Network.*` events and response bodies | Scrubbed, encoded forms included | `verify-login.sh` records a HAR through the login and checks the POST's `postData` and the HAR file on disk; an engine test uses a password with a quote in it |
 | Accessibility tree and snapshots | Scrubbed, and a password field never shows its value | `verify-login.sh` keeps every snapshot and checks the transcript |
 | Engine stderr, including `WHB_TRACE_CDP` | Never written | `verify-login.sh` runs traced and checks stderr |
 | Disk | Never written | The engine has no file writes |

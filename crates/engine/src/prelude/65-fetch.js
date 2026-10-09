@@ -19,24 +19,24 @@ function parseRawHeaders(raw) {
 }
 
 // One request through the engine. Status 0 means it failed, and
-// `statusText` says why.
-function performRequest(method, url, headers, body) {
+// `statusText` says why. `kind` is the CDP resource type it is reported as.
+function performRequest(method, url, headers, body, kind = 'Other') {
   if (String(url).startsWith('blob:')) {
     const blob = blobUrls.get(String(url));
     if (!blob) return { status: 0, statusText: 'unknown blob URL', url, headers: [], body: '' };
     return { status: 200, statusText: 'OK', url, headers: [['content-type', blob.type]], body: utf8Decode(blobBytes.get(blob)) };
   }
-  return responseFrom(api.http(String(method), String(url), headers, body ?? ''));
+  return responseFrom(api.http(String(method), String(url), headers, body ?? '', kind));
 }
 
 // [`performRequest`], started now. Returns a function that waits for the
 // response, for the task that uses it; `finish.cancel()` gives up on it.
-function startRequest(method, url, headers, body) {
+function startRequest(method, url, headers, body, kind = 'Other') {
   if (String(url).startsWith('blob:')) {
-    const response = performRequest(method, url, headers, body);
+    const response = performRequest(method, url, headers, body, kind);
     return Object.assign(() => response, { cancel() {} });
   }
-  const handle = api.httpStart(String(method), String(url), headers, body ?? '');
+  const handle = api.httpStart(String(method), String(url), headers, body ?? '', kind);
   return Object.assign(() => responseFrom(api.httpFinish(handle)), { cancel: () => api.httpDrop(handle) });
 }
 
@@ -190,7 +190,7 @@ function fetch(input, init) {
       reject(abortError(signal));
       return;
     }
-    const finish = startRequest(request.method, request.url, flatHeaders(request.headers), bodies.get(request).text);
+    const finish = startRequest(request.method, request.url, flatHeaders(request.headers), bodies.get(request).text, 'Fetch');
     const handle = schedule(() => {
       const r = finish();
       if (r.status === 0) {
@@ -373,12 +373,12 @@ class XMLHttpRequest extends XMLHttpRequestEventTarget {
     const { text, contentType } = hasBody ? encodeBody(body) : { text: '', contentType: null };
     if (contentType && !s.headers.some((h, i) => i % 2 === 0 && h.toLowerCase() === 'content-type')) s.headers.push('Content-Type', contentType);
     if (!s.async) {
-      const r = performRequest(s.method, s.url, s.headers, text);
+      const r = performRequest(s.method, s.url, s.headers, text, 'XHR');
       finishXhr(this, r);
       if (r.status === 0) throw domError('NetworkError', `Failed to execute 'send' on 'XMLHttpRequest': Failed to load '${s.url}'.`);
       return;
     }
-    const finish = startRequest(s.method, s.url, s.headers, text);
+    const finish = startRequest(s.method, s.url, s.headers, text, 'XHR');
     s.finish = finish;
     dispatch(this, new ProgressEvent('loadstart'));
     s.handle = schedule(() => {

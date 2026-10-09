@@ -24,6 +24,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use crate::cookies::{self, CookieJar, Source};
+use crate::network::{NetLog, Recording, ResourceType};
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_BODY: usize = 16 * 1024 * 1024;
@@ -203,11 +204,23 @@ pub struct Request {
     /// `Cookie` are the client's to set and are ignored here.
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// What it fetches, for `Network.*`.
+    pub kind: ResourceType,
 }
 
 impl Request {
     pub fn get(url: &str) -> Self {
-        Request { method: "GET".into(), url: url.to_string(), headers: Vec::new(), body: Vec::new() }
+        Request {
+            method: "GET".into(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            kind: ResourceType::Other,
+        }
+    }
+
+    pub fn of_kind(self, kind: ResourceType) -> Self {
+        Request { kind, ..self }
     }
 
     pub fn post(url: &str, content_type: &str, body: Vec<u8>) -> Self {
@@ -216,6 +229,7 @@ impl Request {
             url: url.to_string(),
             headers: vec![("Content-Type".into(), content_type.to_string())],
             body,
+            kind: ResourceType::Other,
         }
     }
 }
@@ -236,6 +250,8 @@ pub struct Client {
     preloads: Arc<Mutex<HashMap<String, Pending>>>,
     /// Requests in flight on their own threads, by host.
     slots: Arc<Slots>,
+    /// What `Network.*` reports. Every clone records into the same log.
+    log: Arc<NetLog>,
 }
 
 /// Idle connections kept per host, as browsers bound theirs.
@@ -307,11 +323,16 @@ impl Client {
             idle: Arc::new(Mutex::new(HashMap::new())),
             preloads: Arc::new(Mutex::new(HashMap::new())),
             slots: Arc::new(Slots::default()),
+            log: Arc::new(NetLog::default()),
         }
     }
 
     pub fn cookies(&self) -> &Arc<Mutex<CookieJar>> {
         &self.cookies
+    }
+
+    pub fn log(&self) -> &Arc<NetLog> {
+        &self.log
     }
 
     pub fn get(&self, url: &str) -> Result<Response, FetchError> {
@@ -352,13 +373,13 @@ impl Client {
     /// Starts a `GET` for `url` now, for a [`send`](Self::send) that will ask
     /// for it later. A browser's preload scanner does this for the scripts
     /// and stylesheets it finds while parsing. Asking twice starts it once.
-    pub fn preload(&self, url: &str) {
+    pub fn preload(&self, url: &str, kind: ResourceType) {
         if url.starts_with("data:") {
             return;
         }
         let mut preloads = self.preloads();
         if !preloads.contains_key(url) {
-            preloads.insert(url.to_string(), self.start(Request::get(url)));
+            preloads.insert(url.to_string(), self.start(Request::get(url).of_kind(kind)));
         }
     }
 
@@ -391,7 +412,26 @@ impl Client {
         if let Some(response) = local_response(&request.url)? {
             return Ok(response);
         }
+        let recording = self.log.begin(
+            request.kind,
+            &request.method.to_ascii_uppercase(),
+            &request.url,
+            &outgoing_headers(&request.headers),
+            &request.body,
+        );
+        let result = self.follow_redirects(request, recording.as_ref());
+        if let Some(recording) = recording {
+            match &result {
+                Ok(response) => self.log.finish(recording, response),
+                Err(e) => self.log.fail(recording, e),
+            }
+        }
+        result
+    }
 
+    /// Sends `request`, and again wherever it is redirected, storing the
+    /// cookies every response sets.
+    fn follow_redirects(&self, request: Request, recording: Option<&Recording>) -> Result<Response, FetchError> {
         let mut method = request.method.to_ascii_uppercase();
         let mut headers = request.headers;
         let mut body = request.body;
@@ -420,6 +460,10 @@ impl Client {
                         method = "GET".into();
                         body.clear();
                         headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
+                    }
+                    if let Some(recording) = recording {
+                        let next = current.to_string_with_path();
+                        self.log.redirect(recording, &response, &method, &next, &outgoing_headers(&headers), &body);
                     }
                     continue;
                 }
@@ -603,6 +647,34 @@ fn connect(url: &Url, tls: &Arc<ClientConfig>) -> Result<Connection, FetchError>
 /// Headers a caller may not set, because the client owns them.
 const RESERVED: [&str; 4] = ["host", "connection", "content-length", "cookie"];
 
+/// The headers a request goes out with, other than those the client owns
+/// (`Host`, `Cookie`, `Content-Length`, `Connection`, `Accept-Encoding`):
+/// the caller's, with defaults for what it left out. These are what
+/// `Network.requestWillBeSent` reports, as Chrome leaves the others to its
+/// extra-info event.
+fn outgoing_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let has = |name: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+    let mut out = Vec::new();
+    if !has("user-agent") {
+        out.push(("User-Agent".into(), "wasm-headless-browser/0.0.1".into()));
+    }
+    if !has("accept") {
+        out.push(("Accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into()));
+    }
+    if !has("accept-language") {
+        out.push(("Accept-Language".into(), "en".into()));
+    }
+    out.extend(
+        headers
+            .iter()
+            .filter(|(name, _)| {
+                !RESERVED.iter().any(|r| name.eq_ignore_ascii_case(r)) && !name.eq_ignore_ascii_case("accept-encoding")
+            })
+            .cloned(),
+    );
+    out
+}
+
 fn request_bytes(
     url: &Url,
     method: &str,
@@ -611,23 +683,8 @@ fn request_bytes(
     body: &[u8],
 ) -> Vec<u8> {
     let mut head = format!("{method} {} HTTP/1.1\r\nHost: {}\r\n", url.path, url.authority());
-    let has = |name: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
-    if !has("user-agent") {
-        head.push_str("User-Agent: wasm-headless-browser/0.0.1\r\n");
-    }
-    if !has("accept") {
-        head.push_str("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n");
-    }
     head.push_str("Accept-Encoding: identity\r\n");
-    if !has("accept-language") {
-        head.push_str("Accept-Language: en\r\n");
-    }
-    for (name, value) in headers {
-        if RESERVED.iter().any(|r| name.eq_ignore_ascii_case(r))
-            || name.eq_ignore_ascii_case("accept-encoding")
-        {
-            continue;
-        }
+    for (name, value) in outgoing_headers(headers) {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     if let Some(cookie) = cookie {
@@ -1025,7 +1082,7 @@ mod tests {
         // serve_once answers one connection: a second request would fail.
         let url = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".into());
         let client = client();
-        client.preload(&url);
+        client.preload(&url, ResourceType::Other);
         let with_header = Request { headers: vec![("Authorization".into(), "x".into())], ..Request::get(&url) };
         assert!(client.take_preload(&with_header).is_none());
         let response = client.send(Request { headers: vec![("Accept".into(), "*/*".into())], ..Request::get(&url) });

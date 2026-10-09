@@ -20,6 +20,7 @@ use crate::dom::{Document, NodeData, NodeId};
 use crate::fetch::{self, Request};
 use crate::bindings::Navigation;
 use crate::js::{JsValue, ScriptHost};
+use crate::network::ResourceType;
 use crate::parse::{parse_html, parse_html_bytes};
 use crate::select;
 
@@ -80,6 +81,8 @@ impl HtmlEngine {
         let viewport = (800.0, 600.0);
         let client = fetch::Client::new(cookies);
         let script = ScriptHost::spawn(Arc::clone(&doc), client.clone(), viewport, USER_AGENT).ok();
+        let frame_id = ids::token(&mut counter);
+        client.log().set_frame(&frame_id);
 
         HtmlEngine {
             target_id: target_id.to_string(),
@@ -88,7 +91,7 @@ impl HtmlEngine {
             client,
             secrets,
             url: "about:blank".to_string(),
-            frame_id: ids::token(&mut counter),
+            frame_id,
             loader_id: ids::token(&mut counter),
             context_id: 1,
             history: vec!["about:blank".to_string()],
@@ -158,6 +161,9 @@ impl HtmlEngine {
     }
 
     fn emit_lifecycle(&self, out: &mut EngineEmit) {
+        // The requests the load made come first, as the document's own
+        // request does in Chrome.
+        self.emit_network(out);
         let timestamp = now();
         out("Page.frameStartedLoading", json!({ "frameId": self.frame_id }));
         out("Page.frameNavigated", json!({ "frame": self.frame_json(), "type": "Navigation" }));
@@ -165,6 +171,16 @@ impl HtmlEngine {
         self.emit_context(out);
         out("Page.domContentEventFired", json!({ "timestamp": timestamp }));
         out("Page.loadEventFired", json!({ "timestamp": timestamp }));
+    }
+
+    /// Sends the `Network.*` events recorded since the last call. Requests
+    /// run on other threads and inside script, where no emitter is at hand,
+    /// so they are recorded and sent from here: before the lifecycle events
+    /// of a load, and at the end of every command.
+    fn emit_network(&self, out: &mut EngineEmit) {
+        for (method, params) in self.client.log().take_events() {
+            out(&method, params);
+        }
     }
 
     /// Fetches, parses, and runs the page's own script.
@@ -206,6 +222,7 @@ impl HtmlEngine {
     fn replace_document(&mut self, request: Request) {
         // The document lock borrows `self`, so everything that touches other
         // fields is collected here and applied once the guard is dropped.
+        let request = request.of_kind(ResourceType::Document);
         let requested = request.url.clone();
         self.client.clear_preloads();
         let fetched = self.client.send(request);
@@ -268,23 +285,23 @@ impl HtmlEngine {
     /// parsed and while earlier scripts run.
     fn preload_subresources(&self) {
         let Ok(base) = url::Url::parse(&self.url) else { return };
-        let urls: Vec<String> = {
+        let urls: Vec<(String, ResourceType)> = {
             let doc = self.doc();
             doc.descendants(doc.document_id())
                 .filter_map(|id| {
-                    let href = if doc.is_tag(id, "link") && has_token(doc.attr(id, "rel"), "stylesheet") {
-                        doc.attr(id, "href")
+                    let (href, kind) = if doc.is_tag(id, "link") && has_token(doc.attr(id, "rel"), "stylesheet") {
+                        (doc.attr(id, "href"), ResourceType::Stylesheet)
                     } else if doc.is_tag(id, "script") && is_classic_script_type(doc.attr(id, "type")) {
-                        doc.attr(id, "src")
+                        (doc.attr(id, "src"), ResourceType::Script)
                     } else {
-                        None
+                        return None;
                     };
-                    base.join(href?).ok().map(String::from)
+                    Some((base.join(href?).ok()?.into(), kind))
                 })
                 .collect()
         };
-        for url in urls {
-            self.client.preload(&url);
+        for (url, kind) in urls {
+            self.client.preload(&url, kind);
         }
     }
 
@@ -302,7 +319,8 @@ impl HtmlEngine {
         };
         for (id, href) in links {
             let Ok(url) = url::Url::parse(&self.url).and_then(|base| base.join(&href)) else { continue };
-            let Ok(response) = self.client.get(url.as_str()) else { continue };
+            let request = Request::get(url.as_str()).of_kind(ResourceType::Stylesheet);
+            let Ok(response) = self.client.send(request) else { continue };
             if (200..300).contains(&response.status) {
                 let text = String::from_utf8_lossy(&response.body).into_owned();
                 self.doc().set_stylesheet(id, text);
@@ -428,6 +446,7 @@ impl HtmlEngine {
             url: target,
             headers: Vec::new(),
             body: requested.body,
+            kind: ResourceType::Document,
         };
         if let Some(content_type) = requested.content_type {
             request.headers.push(("Content-Type".into(), content_type));
@@ -878,9 +897,33 @@ impl HtmlEngine {
             }
 
             // ---- Network -------------------------------------------------
-            // The cookie jar is real and shared by every target. Network
-            // events are not emitted yet (M3.1).
-            "Network.enable" | "Network.disable" => Ok(json!({})),
+            // The cookie jar is real and shared by every target. Requests are
+            // reported from `Network.enable` on; see `crate::network`.
+            "Network.enable" => {
+                let size = |name: &str| params.get(name).and_then(|v| v.as_u64()).map(|n| n as usize);
+                self.client.log().enable(size("maxTotalBufferSize"), size("maxResourceBufferSize"));
+                Ok(json!({}))
+            }
+            "Network.disable" => {
+                self.client.log().disable();
+                Ok(json!({}))
+            }
+            "Network.getResponseBody" => {
+                let id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(body) = self.client.log().body(id) else {
+                    return Err(CdpError::internal("No resource with given identifier found"));
+                };
+                Ok(match String::from_utf8(body) {
+                    Ok(text) => json!({ "body": text, "base64Encoded": false }),
+                    // The string scrub cannot see into base64, so the bytes
+                    // are scrubbed before encoding.
+                    Err(e) => {
+                        use base64::Engine as _;
+                        let bytes = self.secrets.scrub_bytes(e.as_bytes());
+                        json!({ "body": base64::engine::general_purpose::STANDARD.encode(bytes), "base64Encoded": true })
+                    }
+                })
+            }
 
             // With `urls`, the cookies those URLs would be sent; without, the
             // current page's. That is Chrome's reading of the parameter.
@@ -1018,7 +1061,9 @@ impl Engine for HtmlEngine {
             secrets.scrub(&mut params);
             out(method, params)
         };
-        match self.dispatch_raw(method, params, &mut scrubbed) {
+        let result = self.dispatch_raw(method, params, &mut scrubbed);
+        self.emit_network(&mut scrubbed);
+        match result {
             Ok(mut value) => {
                 self.secrets.scrub(&mut value);
                 Ok(value)
@@ -1766,6 +1811,127 @@ mod tests {
             json!({ "expression": "throw new Error('pw is ' + document.getElementById('p').value)" }),
         );
         assert!(!thrown.to_string().contains("hunter2"), "{thrown}");
+    }
+
+    /// Every event a command or navigation sends, through the scrubbing
+    /// exit a client sees.
+    fn events_of(engine: &mut HtmlEngine, action: impl FnOnce(&mut HtmlEngine, &mut EngineEmit)) -> Vec<(String, Value)> {
+        let mut events = Vec::new();
+        let mut sink = |method: &str, params: Value| events.push((method.to_string(), params));
+        action(engine, &mut sink);
+        events
+    }
+
+    fn network_only(events: &[(String, Value)]) -> Vec<(&str, &Value)> {
+        events.iter().filter(|(m, _)| m.starts_with("Network.")).map(|(m, p)| (m.as_str(), p)).collect()
+    }
+
+    #[test]
+    fn network_events_report_a_login_post_with_its_secret_scrubbed() {
+        let base = crate::test_server::serve_together(
+            vec![
+                (
+                    "/",
+                    "text/html",
+                    "<input id=p><script src=app.js></script>".into(),
+                ),
+                (
+                    "/app.js",
+                    "text/javascript",
+                    "window.login = () => fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                       body: JSON.stringify({ password: document.getElementById('p').value }) });"
+                        .into(),
+                ),
+                ("/api/login", "application/json", r#"{"ok":true}"#.into()),
+            ],
+            vec![],
+        );
+        let mut secrets = Secrets::new();
+        secrets.add(&format!("pw@{base}"), r#"hunt"er2"#.into()).unwrap();
+        let mut engine = HtmlEngine::with_shared("t", Arc::new(Mutex::new(CookieJar::new())), Arc::new(secrets));
+
+        // Nothing is recorded before Network.enable.
+        engine.load(&format!("{base}/"));
+        assert!(network_only(&events_of(&mut engine, |e, out| { e.dispatch("Page.enable", &json!({}), out).unwrap(); })).is_empty());
+
+        dispatch(&mut engine, "Network.enable", json!({}));
+        let events = events_of(&mut engine, |e, out| e.navigate(&format!("{base}/"), out).unwrap());
+        let network = network_only(&events);
+        let summary: Vec<String> =
+            network.iter().map(|(m, p)| format!("{m} {}", p["type"].as_str().unwrap_or(""))).collect();
+        assert_eq!(
+            summary,
+            [
+                "Network.requestWillBeSent Document",
+                "Network.responseReceived Document",
+                "Network.dataReceived ",
+                "Network.loadingFinished ",
+                "Network.requestWillBeSent Script",
+                "Network.responseReceived Script",
+                "Network.dataReceived ",
+                "Network.loadingFinished ",
+            ]
+        );
+        // The load's requests come before the page says it navigated.
+        let navigated = events.iter().position(|(m, _)| m == "Page.frameNavigated").unwrap();
+        let last_network = events.iter().rposition(|(m, _)| m.starts_with("Network.")).unwrap();
+        assert!(last_network < navigated);
+        let document = network[0].1;
+        assert_eq!(document["requestId"], document["loaderId"]);
+        assert_eq!(document["frameId"], json!(engine.frame_id));
+        assert_eq!(network[1].1["response"]["mimeType"], "text/html");
+
+        evaluate(&mut engine, "document.getElementById('p').focus()");
+        dispatch(&mut engine, "Input.insertText", json!({ "text": "{{secret:pw}}" }));
+        let events = events_of(&mut engine, |e, out| {
+            e.dispatch("Runtime.evaluate", &json!({ "expression": "login()", "awaitPromise": true }), out).unwrap();
+        });
+        let network = network_only(&events);
+        let (_, post) = network.iter().find(|(m, _)| *m == "Network.requestWillBeSent").unwrap();
+        assert_eq!(post["type"], "Fetch");
+        assert_eq!(post["request"]["method"], "POST");
+        // `Headers` lowercases names, as the Fetch standard says.
+        assert_eq!(post["request"]["headers"]["content-type"], "application/json");
+        assert_eq!(post["request"]["headers"]["Accept"], "*/*");
+        // The value went out escaped in JSON; the client sees the placeholder.
+        assert_eq!(post["request"]["postData"], r#"{"password":"{{secret:pw}}"}"#);
+        assert!(!events.iter().any(|(_, p)| p.to_string().contains("er2")));
+
+        let id = post["requestId"].clone();
+        let body = dispatch(&mut engine, "Network.getResponseBody", json!({ "requestId": id }));
+        assert_eq!(body, json!({ "body": r#"{"ok":true}"#, "base64Encoded": false }));
+        let mut sink = |_: &str, _: Value| {};
+        let missing = engine.dispatch("Network.getResponseBody", &json!({ "requestId": "nope" }), &mut sink);
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn network_events_follow_redirects_and_report_failures() {
+        let (base, _requests) = crate::test_server::serve_script(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 4\r\nConnection: close\r\n\r\nhere".into(),
+        ]);
+        let mut engine = HtmlEngine::new("t");
+        dispatch(&mut engine, "Network.enable", json!({}));
+        let events = events_of(&mut engine, |e, out| e.navigate(&format!("{base}/start"), out).unwrap());
+        let network = network_only(&events);
+        assert_eq!(network[0].0, "Network.requestWillBeSent");
+        assert_eq!(network[0].1["request"]["url"], format!("{base}/start"));
+        assert_eq!(network[1].0, "Network.requestWillBeSent");
+        assert_eq!(network[1].1["request"]["url"], format!("{base}/final"));
+        assert_eq!(network[1].1["redirectResponse"]["status"], 302);
+        assert_eq!(network[1].1["requestId"], network[0].1["requestId"]);
+        assert_eq!(network[2].0, "Network.responseReceived");
+        assert_eq!(network[2].1["response"]["url"], format!("{base}/final"));
+
+        // Port 1 refuses connections.
+        let events = events_of(&mut engine, |e, out| {
+            e.dispatch("Runtime.evaluate", &json!({ "expression": "fetch('http://127.0.0.1:1/').catch(() => 0)", "awaitPromise": true }), out)
+                .unwrap();
+        });
+        let network = network_only(&events);
+        assert_eq!(network.last().unwrap().0, "Network.loadingFailed");
+        assert_eq!(network.last().unwrap().1["type"], "Fetch");
     }
 
     #[test]

@@ -84,7 +84,7 @@ function runScriptElement(id, finish) {
   let name;
   if (src !== undefined) {
     const url = resolveUrl(src);
-    const response = finish ? finish() : url ? performRequest('GET', url, ['Accept', '*/*'], '') : { status: 0, statusText: 'invalid URL' };
+    const response = finish ? finish() : url ? performRequest('GET', url, ['Accept', '*/*'], '', 'Script') : { status: 0, statusText: 'invalid URL' };
     if (response.status === 0 || response.status >= 400) {
       fire(el, 'error');
       return `could not load ${url ?? src}: ${response.status === 0 ? response.statusText : 'HTTP ' + response.status}`;
@@ -117,7 +117,7 @@ function prepareScript(id) {
   startedScripts.add(id);
   if (hasSrc) {
     const url = scriptKind(id) === 'classic' ? resolveUrl(api.attr(id, 'src')) : null;
-    const finish = url ? startRequest('GET', url, ['Accept', '*/*'], '') : undefined;
+    const finish = url ? startRequest('GET', url, ['Accept', '*/*'], '', 'Script') : undefined;
     schedule(() => runScriptElement(id, finish), 0);
   }
   else runScriptElement(id);

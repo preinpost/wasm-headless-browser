@@ -4,7 +4,8 @@
 문서가 영어로 된 다른 파일들과 섞이지만, 이 문서는 작업용이라 한국어로 씁니다.
 
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
-자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). 다음 후보는 §0.4.
+자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
+이벤트를 낸다(M3.1). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -42,10 +43,10 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 161, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 164, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 39 |
-| `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 23 |
+| `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 31 |
 | `WHB_PROBE_URL=https://login.example.com/ cargo test --release -p engine probe_a_url -- --ignored --nocapture` | 오류 없이 `#/login`까지 |
 
 WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다린다(§6).
@@ -54,8 +55,8 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 - **스크린샷 (M1.5).** 남은 가장 큰 빈칸. 레이아웃이 있으니 박스·글자를 대략
   그릴 수 있다. 비밀번호 칸은 점으로 그려야 한다(M4.3).
-- **`Network.*` 이벤트 (M3.1).** HAR과 `route`. 요청 본문의 비밀번호는 가리기 층이
-  자동으로 덮는다.
+- **요청 가로채기 (M3.3).** agent-browser `network route`. `Fetch.requestPaused`는
+  엔진이 요청 도중 클라이언트의 답을 기다려야 해서 구조가 바뀐다(§4.4).
 - **콘솔 (`Runtime.consoleAPICalled`).** 지금은 `probe_a_url`로만 본다.
 - **스크롤.** `scrollIntoView`가 아무것도 안 한다. 뷰포트 밖 요소의 클릭은 되지만
   `elementFromPoint`는 뷰포트 안만 본다.
@@ -82,6 +83,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `8abfeaa` | 레이아웃(taffy), 히트 테스트, 마우스 입력 (M1.4·M2.5) |
 | `d9c4296` | 자격증명: stdin, 자리표시자, CDP 출력 가리기 (M4) |
 | `ee1a18c` | 백로그 정리 |
+| `f7b8e6c` | 하위 리소스 병렬 다운로드 (M2.13) |
 
 ## 1. 엔진 구조
 
@@ -91,6 +93,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 |---|---|
 | `browser.rs` | `HtmlEngine`. CDP 메서드, 로드 순서(가져오기 → 스타일시트 → 스크립트), 히스토리. 맨 바깥 `impl Engine`이 모든 출력에서 비밀을 가린다 |
 | `fetch.rs` | HTTP/1.1 클라이언트. TLS, keep-alive 풀, 리다이렉트, 쿠키. `start`(스레드에서 요청, 호스트당 6개)와 `preload` |
+| `network.rs` | `Network.*` 기록. 요청마다 이벤트와 응답 본문을 남기고 엔진이 출구에서 내보낸다 |
 | `cookies.rs` | RFC 6265 쿠키 저장소. 메모리 전용, 모든 타깃이 공유 |
 | `dom.rs`, `parse.rs` | 아레나 DOM과 html5ever 싱크. 폼 상태(`Control`), 변경 버전, 스타일·레이아웃 캐시 |
 | `select.rs` | 선택자 파서·매처·명시도 |
@@ -335,7 +338,22 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 
 ### 4.4 M3 네트워크와 저장소 (P1)
 
-- [ ] M3.1 `Network.*` 이벤트를 낸다. `agent-browser`가 HAR과 `route`에 쓴다.
+- [x] M3.1 `Network.*` 이벤트. Chrome과 agent-browser 사이를 캡처해서 맞췄다:
+      클라이언트가 보내는 것은 `Network.enable`(버퍼 크기 인자)과
+      `Network.getResponseBody`뿐이고, 받는 것은 요청마다 `requestWillBeSent` →
+      `responseReceived` → `dataReceived` → `loadingFinished`다. 리다이렉트는 같은
+      ID로 `requestWillBeSent`를 다시 내고 `redirectResponse`를 붙이며, 실패는
+      `loadingFailed`다. 종류는 Document·Stylesheet·Script·Fetch·XHR. `Client`가
+      어느 스레드에서든 `network.rs`에 기록하고, 엔진이 로드의 생명주기 이벤트 앞과
+      모든 명령의 끝에서 가리기 출구로 내보낸다. `network requests`, `network
+      request <id>`(본문 포함), HAR 기록이 Chrome과 같은 모양으로 나온다.
+      Chrome과 다른 점: `*ExtraInfo` 이벤트는 내지 않고 `hasExtraInfo: false`로
+      밝힌다(원시 헤더와 쿠키), 응답 헤더 이름이 소문자다(HTTP 파서가 정규화),
+      `Referer`를 보내지 않는다, 타이밍 세부와 `postDataEntries`가 없다.
+      메모리: 본문을 클라이언트가 준 상한(agent-browser는 100MB)까지 보관하므로
+      참조 사이트를 세 번 열면 RSS가 397MB에서 478MB가 된다.
+      이 작업에서 고친 것: 가리기가 JSON 이스케이프·폼 인코딩된 비밀도 찾는다(로그인
+      POST 본문이 그 모양이다). `fetch`/XHR의 기본 `Accept`가 `*/*`다.
 - [x] M3.2 쿠키를 구현한다. **로그인 흐름에 필수다.** `cookies.rs`의 메모리 전용
       쿠키 저장소를 모든 타깃이 공유한다. RFC 6265의 도메인·경로 매칭, 만료,
       `Secure`·`HttpOnly`를 지킨다. `fetch::Client`가 리다이렉트 응답의 쿠키까지
@@ -344,7 +362,12 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 - [x] M3.5 `localStorage`·`sessionStorage`는 출처별로 나뉘어 엔진 메모리(`DomState`)에
       있어 페이지를 옮겨도 남는다. 디스크에는 쓰지 않는다. 다만 탭(타깃)마다 따로라
       `localStorage`가 탭 사이에 공유되지 않는다. 쿠키는 공유된다.
-- [ ] M3.3 요청 가로채기를 구현한다. `agent-browser network route`.
+- [ ] M3.3 요청 가로채기를 구현한다. `agent-browser network route`. CDP로는
+      `Fetch.enable` 뒤 `Fetch.requestPaused`를 받은 클라이언트가
+      `Fetch.fulfillRequest`/`continueRequest`/`failRequest`로 답한다. 지금 엔진은
+      명령 하나를 처리하는 동안 다음 명령을 받지 않으므로, 페이지 로드 중에 멈춘
+      요청이 그 답을 기다리면 교착한다. 로드를 디스패치 밖으로 빼거나, 규칙을
+      엔진에 미리 넘기는 방식이 필요하다.
 - [ ] M3.4 `Page.captureScreenshot`. M1.5와 같은 일이다.
 
 ### 4.5 M4 자격증명 (P1, 목표의 핵심)

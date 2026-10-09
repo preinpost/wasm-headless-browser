@@ -35,8 +35,11 @@ about four seconds (3.5 native, 4.2 under WASIX), its 71 requests downloading
 in parallel, lays out within a pixel or two of Chrome at the same
 viewport, and takes `fill`, `click` and `press Enter`.
 
-Not there yet: screenshots (no rasterizer), scrolling, ES modules, and
-`Network.*` events. The WASIX module is 3.3 MB.
+`Network.*` events are emitted, so `agent-browser network requests` and HAR
+recording work, with the login POST's body showing placeholders.
+
+Not there yet: screenshots (no rasterizer), scrolling, ES modules, and request
+interception (`network route`). The WASIX module is 3.3 MB.
 
 ## Why the shape is what it is
 
@@ -142,7 +145,7 @@ agent-browser --cdp http://127.0.0.1:9222 fill @e3 '{{secret:gw}}'
 | M0 | Protocol plumbing and the engine seam. **Done** |
 | M1 | Real engine: parsing, DOM, fetching over HTTP(S), CSS cascade, layout. **Done**, except screenshots |
 | M2 | JavaScript: QuickJS (patched, see [`vendor/README.md`](vendor/README.md)), a DOM binding, an event loop, `fetch` and XHR, input. **Done**, except ES modules |
-| M3 | Network: cookies are **done**; `Network.*` events and request interception are not |
+| M3 | Network: cookies and `Network.*` events are **done**; request interception is not |
 | M4 | Credentials held in memory only, typed by placeholder, scrubbed from CDP. **Done** |
 
 The working log, with what was measured and what is left, is
