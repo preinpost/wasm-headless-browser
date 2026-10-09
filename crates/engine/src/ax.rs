@@ -77,9 +77,9 @@ fn is_excluded(doc: &Document, id: NodeId) -> bool {
     if doc.is_tag(id, "input") && doc.attr(id, "type") == Some("hidden") {
         return true;
     }
-    // `display:none` is a CSS question and there is no cascade yet, so this is
-    // the attribute-only subset. M1.4 adds the computed-style half.
-    false
+    // Inline style only until the cascade exists (M1.4). That already covers
+    // React apps that hide a screen with `style="display: none"`.
+    crate::style::hides(doc, id)
 }
 
 /// Walks one node, appending it and its subtree to `out` in document order.
@@ -661,6 +661,17 @@ mod tests {
                 ("four".to_string(), Some(4)),
             ]
         );
+    }
+
+    #[test]
+    fn inline_styles_hide_subtrees() {
+        let doc = parse_html(
+            "<body><div style='display: none'><button>hidden screen</button></div>\
+             <div style='visibility:hidden'><p>invisible</p></div><button>shown</button></body>",
+        );
+        let names: Vec<String> = build(&doc).into_iter().map(|n| n.name).collect();
+        assert!(names.iter().any(|n| n == "shown"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "hidden screen" || n == "invisible"), "{names:?}");
     }
 
     #[test]

@@ -927,17 +927,7 @@ fn document_origin(url: &str) -> String {
 /// throwing, which keeps a page script alive.
 fn computed_style(doc: &Document, id: NodeId) -> Vec<String> {
     let hidden = doc.has_attr(id, "hidden") || doc.attr(id, "aria-hidden") == Some("true");
-    let style_attr = doc.attr(id, "style").unwrap_or("");
-    let from_style = |name: &str| -> Option<String> {
-        style_attr.split(';').find_map(|part| {
-            let (key, value) = part.split_once(':')?;
-            if key.trim().eq_ignore_ascii_case(name) {
-                Some(value.trim().to_string())
-            } else {
-                None
-            }
-        })
-    };
+    let from_style = |name: &str| crate::style::inline_value(doc, id, name);
 
     let default_cursor =
         if doc.is_tag(id, "a") || doc.is_tag(id, "button") || doc.is_tag(id, "summary") {

@@ -97,6 +97,7 @@ DOM은 가두지 않았습니다. `Arc<Mutex<Document>>`로 엔진과 공유하�
 | QuickJS를 넣은 WASIX 모듈은 1.6MB다. TLS를 넣으면 2.3MB다 | 이 문서의 §1.5, [docs/wasix.md](wasix.md) |
 | WASIX에서 rustls + ring이 TLS 1.3으로 동작한다. 참조 사이트 인증서는 공개 루트로 검증된다 | [docs/wasix.md](wasix.md) |
 | example.com은 이제 본문이 문단 하나와 `<script src=/s.js>`뿐이다. 외부 스크립트 없이는 제목과 링크가 없다 | 2026-10-09 측정 |
+| 참조 사이트의 숨은 화면(추가 인증 선택, OTP, 실패 대화상자)은 CSS 클래스가 아니라 인라인 `style="display: none"`으로 숨는다. 인라인 스타일만 반영해도 로그인 화면의 인터랙티브 스냅샷이 25개 넘던 것에서 4개(첫 입력란, 아이디, 다음, 체크박스)로 준다 | 2026-10-09 측정 (M1.6) |
 | 참조 사이트에 가짜 계정으로 로그인하면 실패가 화면에 나온다. Enter 한 번에 아이디 단계(`POST /api/login-step`, a result code), 버튼이 "로그인"으로 바뀐 뒤 Enter 한 번 더에 인증(a result code "실패 문구")이고, 그 문구가 폼 아래 문단과 확인 대화상자로 스냅샷에 나온다. 클릭 없이 Enter만으로 된다 | 2026-10-09, 사용자 승인 아래 가짜 계정 `nonexistent-test-account`로 |
 | 참조 사이트의 React 입력란에 agent-browser `fill`이 동작한다. 아이디는 스냅샷에 나오고 비밀번호는 나오지 않는다 | 2026-10-09 agent-browser |
 | 참조 사이트의 로그인 화면이 WASIX에서 그려진다. 첫 입력란·아이디·비밀번호 입력란과 "다음" 버튼이 스냅샷에 나온다. CSS로 숨긴 추가 인증 화면들도 함께 나온다(캐스케이드 없음) | 2026-10-09 agent-browser |
@@ -197,6 +198,8 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       손실 변환하고 그 사실을 `last_error`에 남긴다.
 - [ ] M1.10 `select.rs`가 의사 클래스와 자손 외 결합자를 지원하지 않는다.
       지금은 매칭 실패로 처리해서 잘못된 요소를 고르지는 않는다.
+- [x] M1.4a 인라인 `style`의 `display: none`·`visibility: hidden`을 접근성 트리가
+      반영한다(`style.rs`). `visibility`의 상속은 아직 하위 트리 전체로 근사한다.
 - [ ] M1.4 `taffy`로 블록·플렉스 레이아웃을 근사한다. 목표는 픽셀이 아니라
       `getBoundingClientRect`가 0이 아닌 사각형을 돌려주고 가시성을 판정하는
       것이다. 최소 CSS 캐스케이드(태그·클래스·인라인)가 함께 필요하다.

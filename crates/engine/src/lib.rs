@@ -26,6 +26,7 @@ pub mod fetch;
 pub mod js;
 pub mod parse;
 pub mod select;
+pub mod style;
 #[cfg(test)]
 mod test_server;
 
