@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use browser_core::{ids, CdpError, Engine, EngineEmit, TargetInfo};
 use serde_json::{json, Value};
 
+use crate::cookies::{self, Cookie, CookieJar};
 use crate::dom::{Document, NodeData, NodeId};
-use crate::fetch;
+use crate::fetch::{self, Request};
 use crate::js::{JsError, JsValue, ScriptHost};
 use crate::parse::{parse_html, parse_html_bytes};
 use crate::select;
@@ -34,6 +35,8 @@ pub struct HtmlEngine {
     /// serves navigation and the accessibility tree, and reports why
     /// `Runtime.evaluate` is unavailable instead of failing silently.
     script: Option<ScriptHost>,
+    /// Fetches with the jar every target shares.
+    client: fetch::Client,
     url: String,
     frame_id: String,
     loader_id: String,
@@ -46,16 +49,24 @@ pub struct HtmlEngine {
 }
 
 impl HtmlEngine {
+    /// An engine with a cookie jar of its own.
     pub fn new(target_id: &str) -> Self {
+        Self::with_cookies(target_id, Arc::new(Mutex::new(CookieJar::new())))
+    }
+
+    /// An engine sharing `cookies` with others, as tabs in one browser do.
+    pub fn with_cookies(target_id: &str, cookies: Arc<Mutex<CookieJar>>) -> Self {
         let mut counter = ids::seed();
         let doc = Arc::new(Mutex::new(Document::new()));
         let viewport = (800.0, 600.0);
-        let script = ScriptHost::spawn(Arc::clone(&doc), viewport, USER_AGENT).ok();
+        let script =
+            ScriptHost::spawn(Arc::clone(&doc), Arc::clone(&cookies), viewport, USER_AGENT).ok();
 
         HtmlEngine {
             target_id: target_id.to_string(),
             doc,
             script,
+            client: fetch::Client::new(cookies),
             url: "about:blank".to_string(),
             frame_id: ids::token(&mut counter),
             loader_id: ids::token(&mut counter),
@@ -68,8 +79,16 @@ impl HtmlEngine {
         }
     }
 
+    /// Every target the factory creates shares one cookie jar.
     pub fn factory() -> browser_core::EngineFactory {
-        Box::new(|target_id: &str| Box::new(HtmlEngine::new(target_id)) as Box<dyn Engine>)
+        let cookies = Arc::new(Mutex::new(CookieJar::new()));
+        Box::new(move |target_id: &str| {
+            Box::new(HtmlEngine::with_cookies(target_id, Arc::clone(&cookies))) as Box<dyn Engine>
+        })
+    }
+
+    fn jar(&self) -> MutexGuard<'_, CookieJar> {
+        self.client.cookies().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Borrows the document. Never held across a call into JavaScript: the
@@ -124,14 +143,29 @@ impl HtmlEngine {
         out("Page.loadEventFired", json!({ "timestamp": timestamp }));
     }
 
-    /// Fetches, parses, and runs the page's own script. A fetch failure becomes
-    /// an error page, which is what a browser shows and a client can read.
+    /// Fetches, parses, and runs the page's own script.
     fn load(&mut self, url: &str) {
+        self.load_request(Request::get(url));
+    }
+
+    /// [`load`](Self::load) for any request, such as a form's `POST`.
+    fn load_request(&mut self, request: Request) {
+        self.replace_document(request);
+        self.run_document_scripts();
+        self.follow_script_navigation();
+        self.push_history();
+    }
+
+    /// Fetches `request` and makes the result the document. A fetch failure
+    /// becomes an error page, which is what a browser shows and a client can
+    /// read.
+    fn replace_document(&mut self, request: Request) {
         // The document lock borrows `self`, so everything that touches other
         // fields is collected here and applied once the guard is dropped.
-        let fetched = fetch::get(url);
-        let mut new_url = url.to_string();
-        let mut new_error = None;
+        let requested = request.url.clone();
+        let fetched = self.client.send(request);
+        let mut new_url = requested.clone();
+        let new_error;
 
         {
             let mut doc = self.doc();
@@ -158,8 +192,8 @@ impl HtmlEngine {
                 }
                 Err(e) => {
                     let message = e.to_string();
-                    *doc = parse_html(&error_page(url, &message));
-                    doc.set_url(url);
+                    *doc = parse_html(&error_page(&requested, &message));
+                    doc.set_url(&requested);
                     new_error = Some(message);
                 }
             }
@@ -168,9 +202,13 @@ impl HtmlEngine {
         self.url = new_url;
         self.last_error = new_error;
 
-        self.run_document_scripts();
-        self.follow_script_navigation();
-        self.push_history();
+        // A new document gets a new global environment, as in a browser. The
+        // document lock is released above, which this needs.
+        if let Some(script) = &self.script {
+            if let Err(e) = script.reset() {
+                self.last_error = Some(format!("could not reset the script context: {}", e.message));
+            }
+        }
     }
 
     /// Runs inline `<script>` elements in document order.
@@ -230,29 +268,7 @@ impl HtmlEngine {
                 None => requested,
             };
 
-            let fetched = fetch::get(&target);
-            let mut new_url = target.clone();
-            let mut new_error = None;
-            {
-                let mut doc = self.doc();
-                match fetched {
-                    Ok(response) => {
-                        *doc = parse_html_bytes(&response.body);
-                        doc.set_url(&response.url);
-                        new_url = response.url.clone();
-                    }
-                    Err(e) => {
-                        let message = e.to_string();
-                        *doc = parse_html(&error_page(&target, &message));
-                        doc.set_url(&target);
-                        new_error = Some(message);
-                    }
-                }
-            }
-            self.url = new_url;
-            if new_error.is_some() {
-                self.last_error = new_error;
-            }
+            self.replace_document(Request::get(&target));
             self.run_document_scripts();
         }
     }
@@ -338,53 +354,53 @@ impl HtmlEngine {
         json!({ "type": "undefined" })
     }
 
-    fn go_back(&mut self) {
-        if self.history_index == 0 {
-            return;
+    /// Moves `steps` entries through history, as `history.go(steps)` does.
+    /// Returns whether a page was loaded; a move past either end is ignored,
+    /// as a browser ignores it.
+    fn go(&mut self, steps: i32) -> bool {
+        let target = self.history_index as i64 + steps as i64;
+        if target < 0 || target >= self.history.len() as i64 {
+            return false;
         }
-        self.history_index -= 1;
+        self.history_index = target as usize;
         let url = self.history[self.history_index].clone();
         self.load_preserving_history(&url);
-    }
-
-    fn go_forward(&mut self) {
-        if self.history_index + 1 >= self.history.len() {
-            return;
-        }
-        self.history_index += 1;
-        let url = self.history[self.history_index].clone();
-        self.load_preserving_history(&url);
+        true
     }
 
     fn load_preserving_history(&mut self, url: &str) {
         let history = self.history.clone();
         let index = self.history_index;
 
-        let fetched = fetch::get(url);
-        let mut new_url = url.to_string();
-        let mut new_error = None;
-        {
-            let mut doc = self.doc();
-            match fetched {
-                Ok(response) => {
-                    *doc = parse_html_bytes(&response.body);
-                    doc.set_url(&response.url);
-                    new_url = response.url.clone();
-                }
-                Err(e) => {
-                    let message = e.to_string();
-                    *doc = parse_html(&error_page(url, &message));
-                    doc.set_url(url);
-                    new_error = Some(message);
-                }
-            }
-        }
-        self.url = new_url;
-        self.last_error = new_error;
-
+        self.replace_document(Request::get(url));
         self.run_document_scripts();
         self.history = history;
         self.history_index = index;
+    }
+
+    /// `Network.setCookie`. Without a `url` or a `domain` there is nothing to
+    /// scope the cookie to, and Chrome refuses it too.
+    fn set_cookie(&self, params: &Value) -> bool {
+        let text = |key: &str| params.get(key).and_then(|v| v.as_str());
+        let flag = |key: &str| params.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+        let url = text("url").and_then(|u| fetch::Url::parse(u).ok());
+        let Some(cookie) = cookies::from_parts(
+            url.as_ref(),
+            text("name").unwrap_or(""),
+            text("value").unwrap_or(""),
+            text("domain"),
+            text("path"),
+            flag("secure"),
+            flag("httpOnly"),
+            text("sameSite"),
+            params.get("expires").and_then(|v| v.as_f64()).filter(|e| *e > 0.0),
+        ) else {
+            return false;
+        };
+        if cookie.name.is_empty() {
+            return false;
+        }
+        self.jar().set(cookie, cookies::now())
     }
 
     /// `DOM.describeNode`-shaped output for one node.
@@ -533,15 +549,22 @@ impl Engine for HtmlEngine {
                     params.get("expression").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let result = self.evaluate(&source);
 
-                // A script may have asked to navigate; act on it after the
-                // evaluation has finished rather than re-entering the runtime.
-                if let Some(script) = &self.script {
-                    if let Some(requested) = script.state().take_requested_navigation() {
-                        if requested != self.url {
-                            self.load(&requested);
-                            self.emit_lifecycle(out);
-                        }
-                    }
+                // A script may have asked to navigate or to move through
+                // history; act on it after the evaluation has finished rather
+                // than re-entering the runtime. `back` in agent-browser is
+                // `history.back()` evaluated this way.
+                let (requested, steps) = match &self.script {
+                    Some(script) => (
+                        script.state().take_requested_navigation(),
+                        script.state().take_requested_history(),
+                    ),
+                    None => (None, 0),
+                };
+                if let Some(requested) = requested.filter(|r| *r != self.url) {
+                    self.load(&requested);
+                    self.emit_lifecycle(out);
+                } else if steps != 0 && self.go(steps) {
+                    self.emit_lifecycle(out);
                 }
                 Ok(result)
             }
@@ -639,12 +662,58 @@ impl Engine for HtmlEngine {
             }
 
             // ---- Network -------------------------------------------------
-            // No cookie jar or cache yet. Pretending otherwise would make a
-            // login flow look like it worked.
+            // The cookie jar is real and shared by every target. Network
+            // events are not emitted yet (M3.1).
             "Network.enable" | "Network.disable" => Ok(json!({})),
-            "Network.getCookies" | "Network.getAllCookies" => Ok(json!({ "cookies": [] })),
-            "Network.setCookie" | "Network.deleteCookies" | "Network.clearBrowserCookies" => {
-                Err(not_yet(method, "there is no cookie jar yet"))
+
+            // With `urls`, the cookies those URLs would be sent; without, the
+            // current page's. That is Chrome's reading of the parameter.
+            "Network.getCookies" => {
+                let urls: Vec<String> = match params.get("urls").and_then(|v| v.as_array()) {
+                    Some(list) => list.iter().filter_map(|u| u.as_str().map(str::to_string)).collect(),
+                    None => vec![self.url.clone()],
+                };
+                let now = cookies::now();
+                let jar = self.jar();
+                let mut seen: Vec<&Cookie> = Vec::new();
+                for url in urls.iter().filter_map(|u| fetch::Url::parse(u).ok()) {
+                    for cookie in jar.matching(&url, cookies::Source::Http, now) {
+                        if !seen.iter().any(|c| std::ptr::eq(*c, cookie)) {
+                            seen.push(cookie);
+                        }
+                    }
+                }
+                Ok(json!({ "cookies": seen.into_iter().map(cookie_json).collect::<Vec<_>>() }))
+            }
+            "Network.getAllCookies" | "Storage.getCookies" => {
+                let jar = self.jar();
+                let all: Vec<Value> = jar.all(cookies::now()).into_iter().map(cookie_json).collect();
+                Ok(json!({ "cookies": all }))
+            }
+            "Network.setCookie" => Ok(json!({ "success": self.set_cookie(params) })),
+            "Network.setCookies" | "Storage.setCookies" => {
+                if let Some(list) = params.get("cookies").and_then(|v| v.as_array()) {
+                    for cookie in list {
+                        self.set_cookie(cookie);
+                    }
+                }
+                Ok(json!({}))
+            }
+            "Network.deleteCookies" => {
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let url = params.get("url").and_then(|v| v.as_str()).and_then(|u| fetch::Url::parse(u).ok());
+                let domain = params
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| url.as_ref().map(|u| u.host.clone()));
+                let path = params.get("path").and_then(|v| v.as_str());
+                self.jar().delete(name, domain.as_deref(), path);
+                Ok(json!({}))
+            }
+            "Network.clearBrowserCookies" | "Storage.clearCookies" => {
+                self.jar().clear();
+                Ok(json!({}))
             }
 
             // ---- Input ---------------------------------------------------
@@ -676,6 +745,30 @@ impl Engine for HtmlEngine {
             _ => Ok(json!({})),
         }
     }
+}
+
+/// A cookie in `Network.Cookie` shape.
+fn cookie_json(cookie: &Cookie) -> Value {
+    let mut value = json!({
+        "name": cookie.name,
+        "value": cookie.value,
+        // Chrome marks a domain cookie with a leading dot and a host-only one
+        // without.
+        "domain": if cookie.host_only { cookie.domain.clone() } else { format!(".{}", cookie.domain) },
+        "path": cookie.path,
+        "expires": cookie.expires.unwrap_or(-1.0),
+        "size": cookie.name.len() + cookie.value.len(),
+        "httpOnly": cookie.http_only,
+        "secure": cookie.secure,
+        "session": cookie.expires.is_none(),
+        "priority": "Medium",
+        "sameParty": false,
+        "sourceScheme": if cookie.secure { "Secure" } else { "NonSecure" },
+    });
+    if let Some(same_site) = &cookie.same_site {
+        value["sameSite"] = json!(same_site);
+    }
+    value
 }
 
 /// Maps a JavaScript value onto the CDP shapes clients read.
@@ -869,6 +962,135 @@ mod tests {
         assert_eq!(evaluate(&mut engine, "window.innerWidth")["result"]["value"], 800.0);
     }
 
+    fn dispatch(engine: &mut HtmlEngine, method: &str, params: Value) -> Value {
+        let mut sink = |_: &str, _: Value| {};
+        engine.dispatch(method, &params, &mut sink).expect(method)
+    }
+
+    fn cookie_names(value: &Value) -> Vec<String> {
+        let mut names: Vec<String> = value["cookies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn server_cookies_come_back_on_the_next_navigation_and_through_cdp() {
+        let (base, requests) = crate::test_server::serve_script(vec![
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+             Set-Cookie: sid=s3cret; Path=/; HttpOnly\r\nSet-Cookie: theme=dark; Path=/\r\n\
+             Content-Length: 21\r\n\r\n<title>one</title>one"
+                .to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 21\r\n\r\n<title>two</title>two"
+                .to_string(),
+        ]);
+        let mut engine = HtmlEngine::new("t");
+        engine.load(&format!("{base}/one"));
+        engine.load(&format!("{base}/two"));
+        let _ = requests.recv().unwrap();
+        let second = requests.recv().unwrap();
+        assert!(second.contains("Cookie: sid=s3cret; theme=dark\r\n"), "{second}");
+
+        let cookies = dispatch(&mut engine, "Network.getCookies", json!({}));
+        assert_eq!(cookie_names(&cookies), ["sid", "theme"]);
+        let sid = &cookies["cookies"].as_array().unwrap().iter().find(|c| c["name"] == "sid").unwrap();
+        assert_eq!(sid["httpOnly"], true);
+        assert_eq!(sid["session"], true);
+        assert_eq!(sid["domain"], "127.0.0.1");
+
+        // Page script sees only what is not HttpOnly.
+        assert_eq!(evaluate(&mut engine, "document.cookie")["result"]["value"], "theme=dark");
+    }
+
+    #[test]
+    fn script_cookies_land_in_the_shared_jar() {
+        let mut engine = engine_with("<body>x</body>");
+        evaluate(&mut engine, "document.cookie = 'lang=ko; path=/'");
+        let all = dispatch(&mut engine, "Network.getAllCookies", json!({}));
+        assert_eq!(cookie_names(&all), ["lang"]);
+        assert_eq!(all["cookies"][0]["domain"], "example.test");
+    }
+
+    #[test]
+    fn cdp_can_set_delete_and_clear_cookies() {
+        let mut engine = engine_with("<body>x</body>");
+        let ok = dispatch(
+            &mut engine,
+            "Network.setCookie",
+            json!({ "name": "a", "value": "1", "url": "http://example.test/" }),
+        );
+        assert_eq!(ok["success"], true);
+        dispatch(
+            &mut engine,
+            "Network.setCookies",
+            json!({ "cookies": [{ "name": "b", "value": "2", "domain": "example.test", "path": "/" }] }),
+        );
+        assert_eq!(evaluate(&mut engine, "document.cookie")["result"]["value"], "a=1; b=2");
+
+        dispatch(&mut engine, "Network.deleteCookies", json!({ "name": "a", "url": "http://example.test/" }));
+        assert_eq!(cookie_names(&dispatch(&mut engine, "Network.getAllCookies", json!({}))), ["b"]);
+
+        dispatch(&mut engine, "Network.clearBrowserCookies", json!({}));
+        assert!(cookie_names(&dispatch(&mut engine, "Network.getAllCookies", json!({}))).is_empty());
+
+        // Nothing to scope it to.
+        let refused = dispatch(&mut engine, "Network.setCookie", json!({ "name": "c", "value": "3" }));
+        assert_eq!(refused["success"], false);
+    }
+
+    #[test]
+    fn targets_from_one_factory_share_cookies() {
+        let factory = HtmlEngine::factory();
+        let mut first = factory("one");
+        let mut second = factory("two");
+        let mut sink = |_: &str, _: Value| {};
+        first
+            .dispatch(
+                "Network.setCookie",
+                &json!({ "name": "shared", "value": "1", "url": "http://example.test/" }),
+                &mut sink,
+            )
+            .unwrap();
+        let all = second.dispatch("Network.getAllCookies", &json!({}), &mut sink).unwrap();
+        assert_eq!(cookie_names(&all), ["shared"]);
+    }
+
+    #[test]
+    fn history_back_and_forward_from_script_move_through_history() {
+        let mut engine = HtmlEngine::new("t");
+        engine.load("data:text/html,<title>first</title>");
+        engine.load("data:text/html,<title>second</title>");
+        dispatch(&mut engine, "Runtime.evaluate", json!({ "expression": "history.back()" }));
+        assert_eq!(engine.info().title, "first");
+        dispatch(&mut engine, "Runtime.evaluate", json!({ "expression": "history.forward()" }));
+        assert_eq!(engine.info().title, "second");
+        // Past the end is ignored.
+        dispatch(&mut engine, "Runtime.evaluate", json!({ "expression": "history.forward()" }));
+        assert_eq!(engine.info().title, "second");
+        assert_eq!(engine.history.len(), 3, "{:?}", engine.history);
+    }
+
+    #[test]
+    fn each_document_gets_a_fresh_global_environment() {
+        let page = "data:text/html,<div id=\"o\"></div><script>const once = 1; \
+                    document.getElementById('o').textContent = 'ran'; leaked = 'yes';</script>";
+        let mut engine = HtmlEngine::new("t");
+        engine.load(page);
+        engine.load("data:text/html,<title>other</title>");
+        // The previous page's globals are gone.
+        assert_eq!(evaluate(&mut engine, "typeof leaked")["result"]["value"], "undefined");
+        // And the same page loads again without redeclaring its `const`.
+        engine.load(page);
+        assert_eq!(engine.last_error, None);
+        let doc = engine.doc();
+        let o = doc.find_id(doc.document_id(), "o").unwrap();
+        assert_eq!(doc.text_content(o), "ran");
+    }
+
     #[test]
     fn whole_numbers_go_out_without_a_fraction() {
         let mut engine = engine_with("<body>x</body>");
@@ -1038,7 +1260,7 @@ mod tests {
     fn methods_that_would_lie_return_an_error_instead() {
         let mut engine = engine_with("<body>x</body>");
         let mut events = Vec::new();
-        for method in ["Page.captureScreenshot", "Network.setCookie", "Input.dispatchMouseEvent"] {
+        for method in ["Page.captureScreenshot", "Input.dispatchMouseEvent"] {
             let mut sink = |m: &str, p: Value| events.push((m.to_string(), p));
             let error = engine.dispatch(method, &Value::Null, &mut sink).expect_err(method);
             assert!(

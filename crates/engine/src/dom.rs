@@ -12,7 +12,7 @@
 //! Nothing here knows about CSS or layout. This is the tree, and only the tree.
 
 use markup5ever::interface::QualName;
-use markup5ever::{local_name, ns, LocalName};
+use markup5ever::{ns, LocalName};
 
 pub type NodeId = usize;
 

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use rquickjs::{Ctx, Function, Object, Value};
 
+use crate::cookies::{self, CookieJar, Source};
 use crate::dom::{Document, NodeData, NodeId};
 use crate::fetch;
 use crate::js::JsError;
@@ -29,22 +30,35 @@ const PRELUDE: &str = include_str!("dom.js");
 /// State the primitives share with each other and with the engine.
 pub struct DomState {
     pub doc: Arc<Mutex<Document>>,
+    /// The engine's jar, so `document.cookie` reads and writes the same
+    /// cookies the network sends.
+    cookies: Arc<Mutex<CookieJar>>,
     ready_state: Arc<Mutex<String>>,
     focus: Arc<Mutex<NodeId>>,
     /// Set when script asks to navigate, so the engine can act on it after the
     /// evaluation finishes rather than re-entering the runtime.
     requested_navigation: Arc<Mutex<Option<String>>>,
+    /// Net steps through history that script asked for (`history.back()` is
+    /// -1), acted on by the engine the same way as a navigation.
+    requested_history: Arc<Mutex<i32>>,
     viewport: Arc<Mutex<(f64, f64)>>,
     user_agent: Arc<Mutex<String>>,
 }
 
 impl DomState {
-    pub fn new(doc: Arc<Mutex<Document>>, viewport: (f64, f64), user_agent: &str) -> Self {
+    pub fn new(
+        doc: Arc<Mutex<Document>>,
+        cookies: Arc<Mutex<CookieJar>>,
+        viewport: (f64, f64),
+        user_agent: &str,
+    ) -> Self {
         DomState {
             doc,
+            cookies,
             ready_state: Arc::new(Mutex::new("loading".to_string())),
             focus: Arc::new(Mutex::new(0)),
             requested_navigation: Arc::new(Mutex::new(None)),
+            requested_history: Arc::new(Mutex::new(0)),
             viewport: Arc::new(Mutex::new(viewport)),
             user_agent: Arc::new(Mutex::new(user_agent.to_string())),
         }
@@ -58,6 +72,23 @@ impl DomState {
 
     pub fn take_requested_navigation(&self) -> Option<String> {
         self.requested_navigation.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// Forgets what belonged to the previous document: focus, ready state,
+    /// and any navigation it asked for but did not get.
+    pub fn reset_page(&self) {
+        if let Ok(mut focus) = self.focus.lock() {
+            *focus = 0;
+        }
+        if let Ok(mut ready) = self.ready_state.lock() {
+            *ready = "loading".to_string();
+        }
+        let _ = self.take_requested_navigation();
+        let _ = self.take_requested_history();
+    }
+
+    pub fn take_requested_history(&self) -> i32 {
+        self.requested_history.lock().map(|mut steps| std::mem::take(&mut *steps)).unwrap_or(0)
     }
 
     pub fn ready_state(&self) -> String {
@@ -506,9 +537,43 @@ fn put_navigation<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>)
             agent.lock().map(|u| u.clone()).unwrap_or_default()
         });
     }
+    {
+        let doc = Arc::clone(&state.doc);
+        let jar = Arc::clone(&state.cookies);
+        install_fn!(ctx, api, "cookie", move || {
+            let Some(Ok(url)) = with_doc(&doc, |d| fetch::Url::parse(d.url())) else {
+                return String::new();
+            };
+            jar.lock().map(|j| j.script_string(&url, cookies::now())).unwrap_or_default()
+        });
+    }
+    {
+        let doc = Arc::clone(&state.doc);
+        let jar = Arc::clone(&state.cookies);
+        install_fn!(ctx, api, "setCookie", move |value: String| {
+            let Some(Ok(url)) = with_doc(&doc, |d| fetch::Url::parse(d.url())) else { return };
+            if let Ok(mut j) = jar.lock() {
+                j.store(&url, &value, Source::Script, cookies::now());
+            }
+        });
+    }
     install_fn!(ctx, api, "historyLength", || 1u32);
-    install_fn!(ctx, api, "historyBack", || {});
-    install_fn!(ctx, api, "historyForward", || {});
+    {
+        let steps = Arc::clone(&state.requested_history);
+        install_fn!(ctx, api, "historyBack", move || {
+            if let Ok(mut s) = steps.lock() {
+                *s -= 1;
+            }
+        });
+    }
+    {
+        let steps = Arc::clone(&state.requested_history);
+        install_fn!(ctx, api, "historyForward", move || {
+            if let Ok(mut s) = steps.lock() {
+                *s += 1;
+            }
+        });
+    }
     install_fn!(ctx, api, "fireReadyEvents", || {});
     Ok(())
 }
@@ -569,7 +634,8 @@ mod tests {
         if let Ok(mut d) = doc.lock() {
             d.set_url("http://example.test/page");
         }
-        let state = Arc::new(DomState::new(doc, (1024.0, 768.0), "test-agent"));
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let state = Arc::new(DomState::new(doc, jar, (1024.0, 768.0), "test-agent"));
         let js = JsRuntime::new().expect("runtime");
         js.with(|ctx| install(&ctx, &state)).expect("install bindings");
         (js, state)

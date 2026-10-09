@@ -20,11 +20,14 @@
 pub mod ax;
 pub mod bindings;
 pub mod browser;
+pub mod cookies;
 pub mod dom;
 pub mod fetch;
 pub mod js;
 pub mod parse;
 pub mod select;
+#[cfg(test)]
+mod test_server;
 
 pub use ax::AxNode;
 pub use browser::HtmlEngine;

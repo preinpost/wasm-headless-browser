@@ -97,6 +97,7 @@ DOM은 가두지 않았습니다. `Arc<Mutex<Document>>`로 엔진과 공유하�
 | QuickJS를 넣은 WASIX 모듈은 1.6MB다. TLS를 넣으면 2.3MB다 | 이 문서의 §1.5, [docs/wasix.md](wasix.md) |
 | WASIX에서 rustls + ring이 TLS 1.3으로 동작한다. 참조 사이트 인증서는 공개 루트로 검증된다 | [docs/wasix.md](wasix.md) |
 | example.com은 이제 본문이 문단 하나와 `<script src=/s.js>`뿐이다. 외부 스크립트 없이는 제목과 링크가 없다 | 2026-10-09 측정 |
+| agent-browser의 `back`·`forward`는 CDP 메서드가 아니라 `Runtime.evaluate("history.back()")`이다 | [docs/capture/required-expressions.txt](capture/required-expressions.txt) |
 | `Context::full`이 죽는 원인은 sysroot 불일치 하나다. `CLOCK_MONOTONIC`이 포인터 인코딩(1058440)으로 컴파일되고 WASIX는 정수 1을 기대한다 | 같은 문서 |
 | 참조 사이트 사이트는 SPA 셸만 돌려준다. HTML만 받아서는 아무것도 얻을 수 없다 | 이 문서의 §3 |
 
@@ -132,7 +133,7 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 목표는 화면을 읽고, 클릭하고, 아이디와 비밀번호를 넣어 제출하는 것입니다.
 마일스톤 순서대로 하지 않고 이 흐름이 요구하는 순서로 합니다.
 
-1. **네트워크 기반.** HTTPS(M1.11), POST와 쿠키 저장소(M3.2)
+1. **네트워크 기반.** HTTPS(M1.11), POST와 쿠키 저장소(M3.2). **완료**
 2. **JS가 화면을 그린다.** 외부 스크립트(M2.7), 이벤트 루프와 Promise(M2.6),
    `fetch`/XHR(M2.9)
 3. **입력과 제출.** `Input.insertText`가 포커스된 입력란을 바꾸고 이벤트를 낸다
@@ -228,7 +229,13 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 ### 4.4 M3 네트워크와 저장소 (P1)
 
 - [ ] M3.1 `Network.*` 이벤트를 낸다. `agent-browser`가 HAR과 `route`에 쓴다.
-- [ ] M3.2 쿠키와 스토리지를 구현한다. **로그인 흐름에 필수다.**
+- [x] M3.2 쿠키를 구현한다. **로그인 흐름에 필수다.** `cookies.rs`의 메모리 전용
+      쿠키 저장소를 모든 타깃이 공유한다. RFC 6265의 도메인·경로 매칭, 만료,
+      `Secure`·`HttpOnly`를 지킨다. `fetch::Client`가 리다이렉트 응답의 쿠키까지
+      저장하고, POST 뒤 302·303은 GET으로 바꾼다. CDP의 쿠키 메서드와
+      `document.cookie`가 같은 저장소를 쓴다. 공개 접미사 목록은 없다.
+- [ ] M3.5 `localStorage`를 출처별로 나눈다. 지금은 문서마다 새로 만들어지는
+      JS 맵이라 페이지를 옮기면 사라진다.
 - [ ] M3.3 요청 가로채기를 구현한다. `agent-browser network route`.
 - [ ] M3.4 `Page.captureScreenshot`을 실제 렌더 결과에 연결한다.
 
@@ -301,6 +308,9 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
   약 30초(macOS의 TIME_WAIT) 동안은 bind가 `AddrInUse`로 실패한다. 네이티브
   빌드는 바로 bind한다. `verify-m0.sh`는 WASIX 모드에서 이 오류가 나면
   다시 시도한다.
+- **JS 컨텍스트는 문서마다 새로 만든다.** 한때 하나를 계속 썼더니 이전 페이지의
+  전역이 남았고, 같은 페이지를 다시 열면 최상위 `const`가 재선언 오류를 냈다.
+  `replace_document`가 `ScriptHost::reset`을 부른다. 런타임은 그대로 쓴다.
 - **테스트에서 `engine.doc()`을 한 문장에 두 번 쓰면 교착한다.** 첫 번째
   가드가 문장 끝까지 살아 있기 때문이다. 문서 ID를 먼저 변수로 받는다.
 - **`rquickjs`의 `intrinsic::Performance`는 존재하지 않는 심볼을 가리킨다.**

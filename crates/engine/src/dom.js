@@ -284,6 +284,12 @@
       enumerable: true,
     });
     Object.defineProperty(doc, 'URL', { get: () => api.url(), enumerable: true });
+    // The engine's jar, minus HttpOnly cookies, which script may not see.
+    Object.defineProperty(doc, 'cookie', {
+      get: () => api.cookie(),
+      set: (value) => api.setCookie(String(value)),
+      enumerable: true,
+    });
     Object.defineProperty(doc, 'documentURI', { get: () => api.url(), enumerable: true });
     Object.defineProperty(doc, 'readyState', { get: () => api.readyState(), enumerable: true });
     Object.defineProperty(doc, 'activeElement', { get: () => wrap(api.activeElement()), enumerable: true });

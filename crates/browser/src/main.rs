@@ -148,7 +148,7 @@ impl EngineChoice {
     fn label(self) -> &'static str {
         match self {
             EngineChoice::Fake => "M0, fake engine",
-            EngineChoice::Html => "M1, real engine (HTML and accessibility, no JavaScript)",
+            EngineChoice::Html => "real engine (HTML, JavaScript, cookies, accessibility; no layout)",
         }
     }
 }
@@ -157,7 +157,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: wasm-headless-browser [--engine fake|html] [addr]\n\n  \
          --engine fake  fixed page model, no parsing (default)\n  \
-         --engine html  fetches and parses real pages; no JavaScript or layout"
+         --engine html  fetches real pages over HTTP(S) and runs their inline script;\n                \
+         no layout yet"
     );
     std::process::exit(2)
 }

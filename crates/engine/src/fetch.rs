@@ -15,12 +15,14 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+
+use crate::cookies::{self, CookieJar, Source};
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_BODY: usize = 16 * 1024 * 1024;
@@ -190,39 +192,133 @@ fn default_port(scheme: &str) -> Option<u16> {
     }
 }
 
-/// Retrieves a URL. `data:` URLs never touch the network.
-pub fn get(url: &str) -> Result<Response, FetchError> {
-    if url.trim_start().starts_with("data:") {
-        return data_url(url);
-    }
-    if let Some(rest) = url.trim_start().strip_prefix("about:") {
-        // about:blank and friends are a blank document, not an error.
-        return Ok(Response {
-            status: 200,
-            reason: "OK".to_string(),
-            headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
-            body: Vec::new(),
-            url: format!("about:{rest}"),
-        });
+/// One request. `GET` with no body is the common case; a form submission is a
+/// `POST` with an encoded body.
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub method: String,
+    pub url: String,
+    /// Extra request headers. `Host`, `Connection`, `Content-Length` and
+    /// `Cookie` are the client's to set and are ignored here.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Request {
+    pub fn get(url: &str) -> Self {
+        Request { method: "GET".into(), url: url.to_string(), headers: Vec::new(), body: Vec::new() }
     }
 
+    pub fn post(url: &str, content_type: &str, body: Vec<u8>) -> Self {
+        Request {
+            method: "POST".into(),
+            url: url.to_string(),
+            headers: vec![("Content-Type".into(), content_type.to_string())],
+            body,
+        }
+    }
+}
+
+/// Fetches with a cookie jar: cookies matching each request are sent, and
+/// every `Set-Cookie` received is stored, including those on redirects, which
+/// is where login flows usually set their session.
+#[derive(Clone)]
+pub struct Client {
+    tls: Arc<ClientConfig>,
+    cookies: Arc<Mutex<CookieJar>>,
+}
+
+impl Client {
+    pub fn new(cookies: Arc<Mutex<CookieJar>>) -> Self {
+        Client { tls: tls_config(), cookies }
+    }
+
+    pub fn with_tls(cookies: Arc<Mutex<CookieJar>>, tls: Arc<ClientConfig>) -> Self {
+        Client { tls, cookies }
+    }
+
+    pub fn cookies(&self) -> &Arc<Mutex<CookieJar>> {
+        &self.cookies
+    }
+
+    pub fn get(&self, url: &str) -> Result<Response, FetchError> {
+        self.send(Request::get(url))
+    }
+
+    pub fn send(&self, request: Request) -> Result<Response, FetchError> {
+        if let Some(response) = local_response(&request.url)? {
+            return Ok(response);
+        }
+
+        let mut method = request.method.to_ascii_uppercase();
+        let mut headers = request.headers;
+        let mut body = request.body;
+        let mut current = Url::parse(&request.url)?;
+        for _ in 0..=MAX_REDIRECTS {
+            let cookie = self.jar().header(&current, cookies::now());
+            let response = send_once(&current, &method, &headers, cookie.as_deref(), &body, &self.tls)?;
+            {
+                let mut jar = self.jar();
+                let now = cookies::now();
+                for (name, value) in &response.headers {
+                    if name == "set-cookie" {
+                        jar.store(&current, value, Source::Http, now);
+                    }
+                }
+            }
+            if (300..400).contains(&response.status) {
+                if let Some(location) = response.header("location") {
+                    current = current.join(location)?;
+                    // What browsers do, not what RFC 7231 first said: 303
+                    // always becomes GET, and so do 301 and 302 after a POST.
+                    // 307 and 308 repeat the request as it was.
+                    let becomes_get = response.status == 303
+                        || (matches!(response.status, 301 | 302) && method == "POST");
+                    if becomes_get && method != "HEAD" {
+                        method = "GET".into();
+                        body.clear();
+                        headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
+                    }
+                    continue;
+                }
+            }
+            return Ok(response);
+        }
+        Err(FetchError::TooManyRedirects)
+    }
+
+    fn jar(&self) -> std::sync::MutexGuard<'_, CookieJar> {
+        self.cookies.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Retrieves a URL with a jar of its own. `data:` URLs never touch the
+/// network.
+pub fn get(url: &str) -> Result<Response, FetchError> {
     get_with(url, &tls_config())
 }
 
 /// [`get`], trusting the roots in `tls` for `https`.
 pub fn get_with(url: &str, tls: &Arc<ClientConfig>) -> Result<Response, FetchError> {
-    let mut current = Url::parse(url)?;
-    for _ in 0..=MAX_REDIRECTS {
-        let response = get_once(&current, tls)?;
-        if (300..400).contains(&response.status) {
-            if let Some(location) = response.header("location") {
-                current = current.join(location)?;
-                continue;
-            }
-        }
-        return Ok(Response { url: response.url, ..response });
+    Client::with_tls(Arc::new(Mutex::new(CookieJar::new())), Arc::clone(tls)).get(url)
+}
+
+/// `data:` and `about:` URLs, answered without a network.
+fn local_response(url: &str) -> Result<Option<Response>, FetchError> {
+    if url.trim_start().starts_with("data:") {
+        return data_url(url).map(Some);
     }
-    Err(FetchError::TooManyRedirects)
+    if let Some(rest) = url.trim_start().strip_prefix("about:") {
+        // about:blank and friends are a blank document, not an error.
+        return Ok(Some(Response {
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
+            body: Vec::new(),
+            url: format!("about:{rest}"),
+        }));
+    }
+    Ok(None)
 }
 
 /// The client configuration every `https` fetch shares. Built once, because
@@ -311,25 +407,54 @@ fn connect(url: &Url, tls: &Arc<ClientConfig>) -> Result<Connection, FetchError>
     Ok(Connection::Tls(Box::new(StreamOwned::new(session, stream))))
 }
 
-fn get_once(url: &Url, tls: &Arc<ClientConfig>) -> Result<Response, FetchError> {
+/// Headers a caller may not set, because the client owns them.
+const RESERVED: [&str; 4] = ["host", "connection", "content-length", "cookie"];
+
+fn send_once(
+    url: &Url,
+    method: &str,
+    headers: &[(String, String)],
+    cookie: Option<&str>,
+    body: &[u8],
+    tls: &Arc<ClientConfig>,
+) -> Result<Response, FetchError> {
     let address = format!("{}:{}", url.host, url.port);
     let mut stream = connect(url, tls)?;
 
     // `Connection: close` means the response length is delimited by EOF, so a
     // Content-Length is a fast path rather than a requirement.
-    let request = format!(
-        "GET {} HTTP/1.1\r\n\
-         Host: {}\r\n\
-         User-Agent: wasm-headless-browser/0.0.1\r\n\
-         Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
-         Accept-Encoding: identity\r\n\
-         Accept-Language: en\r\n\
-         Connection: close\r\n\r\n",
-        url.path,
-        url.authority()
-    );
+    let mut head = format!("{method} {} HTTP/1.1\r\nHost: {}\r\n", url.path, url.authority());
+    let has = |name: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+    if !has("user-agent") {
+        head.push_str("User-Agent: wasm-headless-browser/0.0.1\r\n");
+    }
+    if !has("accept") {
+        head.push_str("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n");
+    }
+    head.push_str("Accept-Encoding: identity\r\n");
+    if !has("accept-language") {
+        head.push_str("Accept-Language: en\r\n");
+    }
+    for (name, value) in headers {
+        if RESERVED.iter().any(|r| name.eq_ignore_ascii_case(r))
+            || name.eq_ignore_ascii_case("accept-encoding")
+        {
+            continue;
+        }
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if let Some(cookie) = cookie {
+        head.push_str(&format!("Cookie: {cookie}\r\n"));
+    }
+    if !body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH") {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body);
     stream
-        .write_all(request.as_bytes())
+        .write_all(&request)
         .map_err(|e| FetchError::Io(format!("write to {address} failed: {e}")))?;
     let _ = stream.flush();
 
@@ -392,7 +517,7 @@ pub fn parse_response(raw: &[u8], url: &str) -> Result<Response, FetchError> {
 }
 
 /// Returns `(start of the terminator, index just past it)`.
-fn find_header_end(raw: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn find_header_end(raw: &[u8]) -> Option<(usize, usize)> {
     let mut i = 0;
     while i + 1 < raw.len() {
         if raw[i] == b'\n' && raw[i + 1] == b'\n' {
@@ -521,6 +646,73 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{port}/")
+    }
+
+    fn client() -> Client {
+        Client::new(Arc::new(Mutex::new(CookieJar::new())))
+    }
+
+    use crate::test_server::serve_script;
+
+    #[test]
+    fn a_login_post_sets_a_cookie_on_the_redirect_and_the_next_request_sends_it() {
+        let (base, requests) = serve_script(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /home\r\n\
+             Set-Cookie: sid=abc123; Path=/; HttpOnly\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 7\r\n\r\nwelcome".to_string(),
+        ]);
+        let client = client();
+        let got = client
+            .send(Request::post(
+                &format!("{base}/login"),
+                "application/x-www-form-urlencoded",
+                b"user=kim&pass=pw".to_vec(),
+            ))
+            .expect("login");
+        assert_eq!(got.body, b"welcome");
+        assert!(got.url.ends_with("/home"), "final url: {}", got.url);
+
+        let login = requests.recv().unwrap();
+        assert!(login.starts_with("POST /login HTTP/1.1\r\n"), "{login}");
+        assert!(login.contains("Content-Type: application/x-www-form-urlencoded\r\n"), "{login}");
+        assert!(login.contains("Content-Length: 16\r\n"), "{login}");
+        assert!(login.ends_with("\r\n\r\nuser=kim&pass=pw"), "{login}");
+
+        // 302 after POST becomes GET, drops the body, and carries the cookie.
+        let home = requests.recv().unwrap();
+        assert!(home.starts_with("GET /home HTTP/1.1\r\n"), "{home}");
+        assert!(home.contains("Cookie: sid=abc123\r\n"), "{home}");
+        assert!(!home.contains("Content-Type"), "{home}");
+        assert!(!home.contains("user=kim"), "{home}");
+    }
+
+    #[test]
+    fn a_307_repeats_the_post() {
+        let (base, requests) = serve_script(vec![
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_string(),
+        ]);
+        client()
+            .send(Request::post(&format!("{base}/first"), "text/plain", b"data".to_vec()))
+            .expect("post");
+        let _ = requests.recv().unwrap();
+        let again = requests.recv().unwrap();
+        assert!(again.starts_with("POST /again HTTP/1.1\r\n"), "{again}");
+        assert!(again.ends_with("\r\n\r\ndata"), "{again}");
+    }
+
+    #[test]
+    fn the_jar_is_shared_by_clients_that_share_it() {
+        let (base, requests) = serve_script(vec![
+            "HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nContent-Length: 0\r\n\r\n".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+        ]);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        Client::new(Arc::clone(&jar)).get(&format!("{base}/")).unwrap();
+        Client::new(Arc::clone(&jar)).get(&format!("{base}/")).unwrap();
+        let _ = requests.recv().unwrap();
+        assert!(requests.recv().unwrap().contains("Cookie: a=1\r\n"));
     }
 
     #[test]

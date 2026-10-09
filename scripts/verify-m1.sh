@@ -112,6 +112,24 @@ check "eval sees the script's global" 'true' \
 check "eval reads the document" 'Added by page script' \
   "$(agent-browser --cdp "$BASE" eval "document.querySelector('#scripted h2').textContent" 2>&1 || true)"
 
+echo "history"
+agent-browser --cdp "$BASE" open "http://127.0.0.1:${SITE_PORT}/?page=2" >/dev/null 2>&1 || true
+check "back returns to the first page" "http://127.0.0.1:${SITE_PORT}/\$" \
+  "$(agent-browser --cdp "$BASE" back >/dev/null 2>&1; agent-browser --cdp "$BASE" get url 2>&1 || true)"
+check "the page's script runs again after back" 'heading "Added by page script"' \
+  "$(agent-browser --cdp "$BASE" snapshot 2>&1 || true)"
+check "forward goes to the second page" "page=2" \
+  "$(agent-browser --cdp "$BASE" forward >/dev/null 2>&1; agent-browser --cdp "$BASE" get url 2>&1 || true)"
+
+echo "cookies"
+check "a cookie can be set" "Done" "$(agent-browser --cdp "$BASE" cookies set whb_token abc 2>&1 || true)"
+check "the jar returns it" "whb_token=abc" "$(agent-browser --cdp "$BASE" cookies get 2>&1 || true)"
+check "page script sees the jar" "whb_token=abc; whb_lang=ko" \
+  "$(agent-browser --cdp "$BASE" eval "document.cookie = 'whb_lang=ko'; document.cookie" 2>&1 || true)"
+check "a script cookie reaches the jar" "whb_lang=ko" "$(agent-browser --cdp "$BASE" cookies get 2>&1 || true)"
+agent-browser --cdp "$BASE" cookies clear >/dev/null 2>&1 || true
+check_absent "clear empties the jar" "whb_" "$(agent-browser --cdp "$BASE" cookies get 2>&1 || true)"
+
 echo "what must stay out"
 check_absent "hidden subtrees are excluded" "you should not see this" "$snap"
 

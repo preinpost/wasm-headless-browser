@@ -104,44 +104,17 @@ impl JsRuntime {
     /// even though the runtime lives on another thread.
     pub fn with_console(console: Arc<Mutex<ConsoleLog>>) -> Result<Self, JsError> {
         let runtime = Runtime::new().map_err(map_error)?;
-        let context = Context::custom::<Intrinsics>(&runtime).map_err(map_error)?;
-
-        let log_sink = Arc::clone(&console);
-        context.with(|ctx| {
-            let globals = ctx.globals();
-            // A host-side `console` rather than QuickJS's own. It is small, it
-            // is where a real browser puts it, and it gives tests something to
-            // assert on.
-            let console_object = rquickjs::Object::new(ctx.clone())
-                .map_err(map_error)
-                .expect("create console object");
-            for method in ["log", "info", "warn", "error", "debug"] {
-                let sink = Arc::clone(&log_sink);
-                let prefix = if method == "log" || method == "info" { "" } else { method };
-                let function = rquickjs::Function::new(
-                    ctx.clone(),
-                    move |args: rquickjs::function::Rest<Value>| {
-                        let mut parts = Vec::new();
-                        for value in args.iter() {
-                            parts.push(stringify(value));
-                        }
-                        let mut line = parts.join(" ");
-                        if !prefix.is_empty() {
-                            line = format!("[{prefix}] {line}");
-                        }
-                        if let Ok(mut log) = sink.lock() {
-                            log.lines.push(line);
-                        }
-                    },
-                )
-                .map_err(map_error)
-                .expect("create console method");
-                let _ = console_object.set(method, function);
-            }
-            globals.set("console", console_object).map_err(map_error).expect("install console");
-        });
-
+        let context = new_context(&runtime, &console)?;
         Ok(JsRuntime { runtime, context, console })
+    }
+
+    /// Replaces the context with a fresh one on the same runtime. A browser
+    /// gives every document its own global object; without this, globals from
+    /// the previous page linger, and a page that declares a top-level `const`
+    /// fails the second time it loads.
+    pub fn reset(&mut self) -> Result<(), JsError> {
+        self.context = new_context(&self.runtime, &self.console)?;
+        Ok(())
     }
 
     /// Evaluates and converts the result.
@@ -204,6 +177,47 @@ impl JsRuntime {
             JsValue::Object { class, .. } => Ok(class),
         }
     }
+}
+
+/// A context with every intrinsic except `Performance`, plus a host `console`
+/// that writes to `console`.
+fn new_context(runtime: &Runtime, console: &Arc<Mutex<ConsoleLog>>) -> Result<Context, JsError> {
+    let context = Context::custom::<Intrinsics>(runtime).map_err(map_error)?;
+    let log_sink = Arc::clone(console);
+    context.with(|ctx| {
+        let globals = ctx.globals();
+        // A host-side `console` rather than QuickJS's own. It is small, it
+        // is where a real browser puts it, and it gives tests something to
+        // assert on.
+        let console_object = rquickjs::Object::new(ctx.clone())
+            .map_err(map_error)
+            .expect("create console object");
+        for method in ["log", "info", "warn", "error", "debug"] {
+            let sink = Arc::clone(&log_sink);
+            let prefix = if method == "log" || method == "info" { "" } else { method };
+            let function = rquickjs::Function::new(
+                ctx.clone(),
+                move |args: rquickjs::function::Rest<Value>| {
+                    let mut parts = Vec::new();
+                    for value in args.iter() {
+                        parts.push(stringify(value));
+                    }
+                    let mut line = parts.join(" ");
+                    if !prefix.is_empty() {
+                        line = format!("[{prefix}] {line}");
+                    }
+                    if let Ok(mut log) = sink.lock() {
+                        log.lines.push(line);
+                    }
+                },
+            )
+            .map_err(map_error)
+            .expect("create console method");
+            let _ = console_object.set(method, function);
+        }
+        globals.set("console", console_object).map_err(map_error).expect("install console");
+    });
+    Ok(context)
 }
 
 fn to_js_value(value: &Value<'_>) -> JsValue {
@@ -430,6 +444,8 @@ pub struct ScriptHost {
 
 enum Request {
     Evaluate { source: String, reply: Sender<Result<JsValue, JsError>> },
+    /// A fresh context with the bindings reinstalled, for a new document.
+    Reset { reply: Sender<Result<(), JsError>> },
     Shutdown,
 }
 
@@ -439,12 +455,13 @@ impl ScriptHost {
     /// than on the first evaluation.
     pub fn spawn(
         doc: Arc<Mutex<crate::dom::Document>>,
+        cookies: Arc<Mutex<crate::cookies::CookieJar>>,
         viewport: (f64, f64),
         user_agent: &str,
     ) -> Result<Self, JsError> {
         let (requests, inbox) = channel::<Request>();
         let console = Arc::new(Mutex::new(ConsoleLog::default()));
-        let state = Arc::new(crate::bindings::DomState::new(doc, viewport, user_agent));
+        let state = Arc::new(crate::bindings::DomState::new(doc, cookies, viewport, user_agent));
         let (ready_tx, ready_rx) = channel::<Result<(), JsError>>();
 
         let thread_state = Arc::clone(&state);
@@ -452,7 +469,7 @@ impl ScriptHost {
         let thread = std::thread::Builder::new()
             .name("script".to_string())
             .spawn(move || {
-                let js = match JsRuntime::with_console(thread_console) {
+                let mut js = match JsRuntime::with_console(thread_console) {
                     Ok(js) => js,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -469,6 +486,13 @@ impl ScriptHost {
                     match request {
                         Request::Evaluate { source, reply } => {
                             let _ = reply.send(js.evaluate(&source));
+                        }
+                        Request::Reset { reply } => {
+                            thread_state.reset_page();
+                            let result = js
+                                .reset()
+                                .and_then(|()| js.with(|ctx| crate::bindings::install(&ctx, &thread_state)));
+                            let _ = reply.send(result);
                         }
                         Request::Shutdown => break,
                     }
@@ -501,6 +525,18 @@ impl ScriptHost {
     /// Runs a snippet for its side effects.
     pub fn run(&self, source: &str) -> Result<(), JsError> {
         self.evaluate(source).map(|_| ())
+    }
+
+    /// Starts a new global environment for a new document. The document
+    /// lock must not be held: installing the bindings reads the document.
+    pub fn reset(&self) -> Result<(), JsError> {
+        let (reply_tx, reply_rx) = channel();
+        self.requests
+            .send(Request::Reset { reply: reply_tx })
+            .map_err(|_| JsError { message: "the script thread is gone".to_string() })?;
+        reply_rx.recv().map_err(|_| JsError {
+            message: "the script thread stopped while resetting".to_string(),
+        })?
     }
 
     pub fn state(&self) -> &Arc<crate::bindings::DomState> {
