@@ -310,6 +310,15 @@ function nodeInserted(id) {
   for (const link of links) linkInserted(link);
 }
 
+// A selector a method was given, checked as a browser checks it.
+function checkedSelector(selector, method) {
+  const text = String(selector);
+  if (!api.validSelector(text)) {
+    throw domError('SyntaxError', `Failed to execute '${method}': '${text}' is not a valid selector.`);
+  }
+  return text;
+}
+
 // Strings become text nodes; several nodes become one fragment.
 function toNode(nodes) {
   const converted = nodes.map((n) => (nodeIds.has(n) ? n : document.createTextNode(String(n))));
@@ -344,10 +353,10 @@ const ParentNode = {
     if (nodes.length) this.appendChild(toNode(nodes));
   },
   querySelector(selector) {
-    return wrap(api.query(own(this), String(selector)));
+    return wrap(api.query(own(this), checkedSelector(selector, 'querySelector')));
   },
   querySelectorAll(selector) {
-    return nodeList(wrapAll(api.queryAll(own(this), String(selector))));
+    return nodeList(wrapAll(api.queryAll(own(this), checkedSelector(selector, 'querySelectorAll'))));
   },
   getElementsByTagName(tag) {
     return htmlCollection(wrapAll(api.byTag(own(this), String(tag))));

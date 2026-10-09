@@ -362,14 +362,15 @@ class Element extends Node {
     return want;
   }
   matches(selector) {
-    return api.matches(own(this), String(selector));
+    return api.matches(own(this), checkedSelector(selector, 'matches'));
   }
   webkitMatchesSelector(selector) {
     return this.matches(selector);
   }
   closest(selector) {
+    const text = checkedSelector(selector, 'closest');
     for (let id = own(this); id !== undefined; id = api.parent(id)) {
-      if (isElementId(id) && api.matches(id, String(selector))) return wrap(id);
+      if (isElementId(id) && api.matches(id, text)) return wrap(id);
     }
     return null;
   }

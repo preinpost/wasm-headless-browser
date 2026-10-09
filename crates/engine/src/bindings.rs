@@ -194,6 +194,7 @@ pub fn install(ctx: &Ctx<'_>, state: &Arc<DomState>) -> Result<(), JsError> {
     let doc = Arc::clone(&state.doc);
 
     put_reads(ctx, &api, &doc)?;
+    put_selectors(ctx, &api, state)?;
     put_mutations(ctx, &api, &doc)?;
     put_geometry(ctx, &api, state)?;
     put_navigation(ctx, &api, state)?;
@@ -358,24 +359,7 @@ fn put_reads<'js>(
             .unwrap_or_default()
         });
     }
-    {
-        let doc = Arc::clone(doc);
-        install_fn!(ctx, api, "matches", move |id: usize, selector: String| {
-            with_doc(&doc, |d| select::matches(d, id, &selector)).unwrap_or(false)
-        });
-    }
-    {
-        let doc = Arc::clone(doc);
-        install_fn!(ctx, api, "query", move |root: usize, selector: String| {
-            with_doc(&doc, |d| select::query(d, root, &selector)).flatten()
-        });
-    }
-    {
-        let doc = Arc::clone(doc);
-        install_fn!(ctx, api, "queryAll", move |root: usize, selector: String| {
-            with_doc(&doc, |d| select::query_all(d, root, &selector)).unwrap_or_default()
-        });
-    }
+    install_fn!(ctx, api, "validSelector", |selector: String| select::parse_list(&selector).is_some());
     {
         let doc = Arc::clone(doc);
         install_fn!(ctx, api, "byTag", move |root: usize, tag: String| {
@@ -451,6 +435,36 @@ fn put_reads<'js>(
         let doc = Arc::clone(doc);
         install_fn!(ctx, api, "interfaceName", move |id: usize| {
             with_doc(&doc, |d| crate::browser::class_for(d, id).to_string()).unwrap_or_default()
+        });
+    }
+    Ok(())
+}
+
+/// Selector matching, which needs the focused element for `:focus`. An
+/// invalid selector matches nothing here; the prelude checks `validSelector`
+/// first and throws the SyntaxError a browser throws.
+fn put_selectors<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -> Result<(), JsError> {
+    {
+        let (doc, focus) = (Arc::clone(&state.doc), Arc::clone(&state.focus));
+        install_fn!(ctx, api, "matches", move |id: usize, selector: String| {
+            let focused = focus.lock().ok().and_then(|f| *f);
+            with_doc(&doc, |d| select::matches_with(d, id, &selector, focused)).flatten().unwrap_or(false)
+        });
+    }
+    {
+        let (doc, focus) = (Arc::clone(&state.doc), Arc::clone(&state.focus));
+        install_fn!(ctx, api, "queryAll", move |root: usize, selector: String| {
+            let focused = focus.lock().ok().and_then(|f| *f);
+            with_doc(&doc, |d| select::query_all_with(d, root, &selector, focused)).flatten().unwrap_or_default()
+        });
+    }
+    {
+        let (doc, focus) = (Arc::clone(&state.doc), Arc::clone(&state.focus));
+        install_fn!(ctx, api, "query", move |root: usize, selector: String| {
+            let focused = focus.lock().ok().and_then(|f| *f);
+            with_doc(&doc, |d| select::query_all_with(d, root, &selector, focused))
+                .flatten()
+                .and_then(|all| all.into_iter().next())
         });
     }
     Ok(())
@@ -1211,6 +1225,20 @@ mod tests {
         assert_eq!(state.doc.lock().unwrap().title().as_deref(), Some("New"));
         js.evaluate("document.title = 'Newest'").unwrap();
         assert_eq!(state.doc.lock().unwrap().title().as_deref(), Some("Newest"));
+    }
+
+    #[test]
+    fn selectors_behave_like_a_browser() {
+        let (js, _) = host("<body><ul><li id='a'>1</li><li id='b'>2</li></ul><input id='i'></body>");
+        assert_eq!(text(&js, "document.querySelector('li:last-child').id"), "b");
+        assert_eq!(text(&js, "document.querySelectorAll('ul > li:nth-child(odd)').length"), "1");
+        assert_eq!(
+            text(&js, "(() => { try { document.querySelector('li:'); return 'no'; } catch (e) { return e.name; } })()"),
+            "SyntaxError"
+        );
+        js.evaluate("document.getElementById('i').focus()").unwrap();
+        assert_eq!(text(&js, "document.querySelector(':focus').id"), "i");
+        assert_eq!(text(&js, "document.body.matches(':focus-within')"), "true");
     }
 
     #[test]

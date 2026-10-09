@@ -196,8 +196,11 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       [docs/wasix.md](wasix.md)의 "TLS inside the guest".
 - [ ] M1.9 UTF-8이 아닌 문자셋을 디코딩한다. 지금은 헤더가 UTF-8이 아니면
       손실 변환하고 그 사실을 `last_error`에 남긴다.
-- [ ] M1.10 `select.rs`가 의사 클래스와 자손 외 결합자를 지원하지 않는다.
-      지금은 매칭 실패로 처리해서 잘못된 요소를 고르지는 않는다.
+- [x] M1.10 선택자 엔진을 새로 썼다(`select.rs`). 결합자 넷, 속성 연산자 전부와
+      `i` 플래그, `:nth-child(An+B of S)`를 포함한 구조 의사 클래스, `:not`·`:is`·
+      `:where`·`:has`, 폼 상태 의사 클래스, `:focus`, 명시도. `:hover`처럼 포인터가
+      있어야 참인 것은 거짓이고, 의사 요소로 끝나는 선택자는 요소와 맞지 않는다.
+      잘못된 선택자는 스크립트에서 SyntaxError다. 캐스케이드가 같은 파서를 쓴다.
 - [x] M1.4a 인라인 `style`의 `display: none`·`visibility: hidden`을 접근성 트리가
       반영한다(`style.rs`). `visibility`의 상속은 아직 하위 트리 전체로 근사한다.
 - [ ] M1.4 `taffy`로 블록·플렉스 레이아웃을 근사한다. 목표는 픽셀이 아니라
