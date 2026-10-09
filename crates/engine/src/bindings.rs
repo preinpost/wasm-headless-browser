@@ -619,27 +619,41 @@ fn put_geometry<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
     install_fn!(ctx, api, "rect", |_id: usize| { vec![0.0f64, 0.0, 0.0, 0.0] });
 
     {
+        // The cascade's answer for one property, or its initial value.
         let doc = Arc::clone(&state.doc);
-        install_fn!(ctx, api, "computedStyle", move |id: usize| {
-            with_doc(&doc, |d| computed_style(d, id)).unwrap_or_default()
+        install_fn!(ctx, api, "computedValue", move |id: usize, name: String| {
+            with_doc(&doc, |d| {
+                crate::style::document_styles(d)
+                    .get(id)
+                    .map(|s| s.get(&name).to_string())
+                    .unwrap_or_else(|| crate::style::initial_value(&name).to_string())
+            })
+            .unwrap_or_default()
         });
     }
     {
         let doc = Arc::clone(&state.doc);
-        install_fn!(ctx, api, "stylePairs", move |id: usize| {
+        install_fn!(ctx, api, "computedNames", move |id: usize| {
             with_doc(&doc, |d| {
-                d.attr(id, "style")
-                    .unwrap_or("")
-                    .split(';')
-                    .filter_map(|part| {
-                        let (key, value) = part.split_once(':')?;
-                        let key = key.trim();
-                        (!key.is_empty()).then(|| [key.to_string(), value.trim().to_string()])
-                    })
-                    .flatten()
-                    .collect::<Vec<_>>()
+                let styles = crate::style::document_styles(d);
+                let mut names: Vec<String> =
+                    styles.get(id).map(|s| s.properties().map(|(n, _)| n.to_string()).collect()).unwrap_or_default();
+                names.sort();
+                names
             })
             .unwrap_or_default()
+        });
+    }
+    {
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "setStylesheet", move |id: usize, text: String| {
+            let _ = with_doc_mut(&doc, |d| d.set_stylesheet(id, text));
+        });
+    }
+    {
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "setCssom", move |id: usize, text: String| {
+            let _ = with_doc_mut(&doc, |d| d.set_cssom(id, text));
         });
     }
     {
@@ -933,32 +947,6 @@ fn document_origin(url: &str) -> String {
     url::Url::parse(url).map(|u| u.origin().ascii_serialization()).unwrap_or_else(|_| "null".into())
 }
 
-/// The five properties a client reads, in a fixed order:
-/// display, visibility, cursor, opacity, position.
-///
-/// These come from attributes rather than a cascade, because there is no
-/// cascade yet. Anything else a client asks for reads as empty rather than
-/// throwing, which keeps a page script alive.
-fn computed_style(doc: &Document, id: NodeId) -> Vec<String> {
-    let hidden = doc.has_attr(id, "hidden") || doc.attr(id, "aria-hidden") == Some("true");
-    let from_style = |name: &str| crate::style::inline_value(doc, id, name);
-
-    let default_cursor =
-        if doc.is_tag(id, "a") || doc.is_tag(id, "button") || doc.is_tag(id, "summary") {
-            "pointer"
-        } else {
-            "auto"
-        };
-
-    vec![
-        from_style("display").unwrap_or_else(|| if hidden { "none".into() } else { "block".into() }),
-        from_style("visibility").unwrap_or_else(|| "visible".into()),
-        from_style("cursor").unwrap_or_else(|| default_cursor.into()),
-        from_style("opacity").unwrap_or_else(|| "1".into()),
-        from_style("position").unwrap_or_else(|| "static".into()),
-    ]
-}
-
 fn node_type_of(doc: &Document, id: NodeId) -> u32 {
     match &doc.node(id).data {
         NodeData::Element { .. } => 1,
@@ -1056,15 +1044,37 @@ mod tests {
     }
 
     #[test]
-    fn computed_style_reports_what_attributes_say() {
+    fn computed_style_comes_from_the_cascade() {
         let (js, _) = host(
-            "<body><a href='/'>link</a><div hidden id='h'>x</div><p id='c' style='display:flex;cursor:crosshair'>y</p></body>",
+            "<head><style>.card { display: flex; color: rgb(1, 2, 3) } .card > .off { display: none }</style></head>\
+             <body><a href='/'>link</a><div hidden id='h'>x</div>\
+             <p id='c' style='display:flex;cursor:crosshair'>y</p>\
+             <div class='card' id='card'><span id='in'>t</span><b class='off' id='off'>o</b></div></body>",
         );
+        let style = |id: &str, prop: &str| text(&js, &format!("getComputedStyle(document.getElementById('{id}')).{prop}"));
         assert_eq!(text(&js, "getComputedStyle(document.querySelector('a')).cursor"), "pointer");
-        assert_eq!(text(&js, "getComputedStyle(document.getElementById('h')).display"), "none");
-        assert_eq!(text(&js, "getComputedStyle(document.getElementById('c')).display"), "flex");
-        assert_eq!(text(&js, "getComputedStyle(document.getElementById('c')).cursor"), "crosshair");
-        assert_eq!(text(&js, "getComputedStyle(document.body).borderWidth"), "");
+        assert_eq!(style("h", "display"), "none");
+        assert_eq!(style("c", "display"), "flex");
+        assert_eq!(style("c", "cursor"), "crosshair");
+        assert_eq!(style("card", "display"), "flex");
+        assert_eq!(style("in", "color"), "rgb(1, 2, 3)", "inherited");
+        assert_eq!(style("off", "display"), "none");
+        assert_eq!(text(&js, "getComputedStyle(document.body).borderWidth"), "0px");
+        assert_eq!(text(&js, "getComputedStyle(document.body).getPropertyValue('margin-top')"), "8px");
+    }
+
+    #[test]
+    fn script_added_rules_join_the_cascade_and_hide_from_the_tree() {
+        let (js, state) = host("<body><button id='b'>shown</button><button id='g' class='gone'>gone</button></body>");
+        js.evaluate(
+            "const style = document.createElement('style');\
+             document.head.appendChild(style);\
+             style.sheet.insertRule('.gone { display: none }', 0);",
+        )
+        .unwrap();
+        assert_eq!(text(&js, "getComputedStyle(document.getElementById('g')).display"), "none");
+        let tree = crate::ax::to_cdp(&crate::ax::build(&state.doc.lock().unwrap())).to_string();
+        assert!(tree.contains("shown") && !tree.contains("gone"), "{tree}");
     }
 
     #[test]

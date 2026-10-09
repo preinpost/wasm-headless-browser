@@ -213,6 +213,7 @@ impl HtmlEngine {
                         ));
                     }
                     doc.set_url(&response.url);
+                    doc.set_viewport(self.viewport);
                     new_url = response.url.clone();
                     new_error = response
                         .charset()
@@ -223,6 +224,7 @@ impl HtmlEngine {
                     let message = e.to_string();
                     *doc = parse_html(&error_page(&requested, &message));
                     doc.set_url(&requested);
+                    doc.set_viewport(self.viewport);
                     new_error = Some(message);
                 }
             }
@@ -231,11 +233,39 @@ impl HtmlEngine {
         self.url = new_url;
         self.last_error = new_error;
 
+        self.load_stylesheets();
+
         // A new document gets a new global environment, as in a browser. The
         // document lock is released above, which this needs.
         if let Some(script) = &self.script {
             if let Err(e) = script.reset() {
                 self.last_error = Some(format!("could not reset the script context: {}", e.message));
+            }
+        }
+    }
+
+    /// Fetches the stylesheets the parser found, before any script runs, as a
+    /// browser holds scripts back for them. One after another, over the
+    /// client's kept-alive connections. Ones that fail are left out of the
+    /// cascade, as a browser leaves them out.
+    fn load_stylesheets(&mut self) {
+        let links: Vec<(NodeId, String)> = {
+            let doc = self.doc();
+            doc.descendants(doc.document_id())
+                .filter(|id| doc.is_tag(*id, "link"))
+                .filter(|id| {
+                    doc.attr(*id, "rel")
+                        .is_some_and(|rel| rel.split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("stylesheet")))
+                })
+                .filter_map(|id| doc.attr(id, "href").map(|href| (id, href.to_string())))
+                .collect()
+        };
+        for (id, href) in links {
+            let Ok(url) = url::Url::parse(&self.url).and_then(|base| base.join(&href)) else { continue };
+            let Ok(response) = self.client.get(url.as_str()) else { continue };
+            if (200..300).contains(&response.status) {
+                let text = String::from_utf8_lossy(&response.body).into_owned();
+                self.doc().set_stylesheet(id, text);
             }
         }
     }
@@ -842,6 +872,7 @@ impl Engine for HtmlEngine {
                 if let Some(script) = &self.script {
                     script.state().set_viewport(w, h);
                 }
+                self.doc().set_viewport((w, h));
                 Ok(json!({}))
             }
             "Emulation.setUserAgentOverride"

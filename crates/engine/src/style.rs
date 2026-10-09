@@ -11,8 +11,10 @@
 //! The result is computed for the whole document at once and is cheap to
 //! keep: a map from node to properties that differ from the initial value.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use crate::css::{self, Declaration, StyleRule};
 use crate::dom::{Document, NodeData, NodeId};
@@ -71,9 +73,131 @@ impl Styles {
 /// rules it contributes.
 pub type Sheets = Vec<Arc<Vec<StyleRule>>>;
 
-/// Computes every element's style.
+/// Computes every element's style from explicit sheets. The engine uses
+/// [`document_styles`], which finds the sheets and caches; this is for tests.
 pub fn compute(doc: &Document, author: &Sheets, viewport: (f64, f64), focus: Option<NodeId>) -> Styles {
-    let index = RuleIndex::build(author, viewport);
+    compute_with(doc, &RuleIndex::build(author, viewport), focus)
+}
+
+/// What a document keeps between style computations: each sheet parsed once
+/// per text, the rule index for the current sheets and viewport, and the
+/// computed styles for the current version of the tree.
+#[derive(Default)]
+pub struct StyleCache(Mutex<CacheState>);
+
+#[derive(Default)]
+struct CacheState {
+    parsed: HashMap<NodeId, (u64, Arc<Vec<StyleRule>>)>,
+    index: Option<(u64, Arc<RuleIndex>)>,
+    styles: Option<(u64, Arc<Styles>)>,
+}
+
+impl Clone for StyleCache {
+    /// A copy of a document starts with nothing cached.
+    fn clone(&self) -> Self {
+        StyleCache::default()
+    }
+}
+
+impl std::fmt::Debug for StyleCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StyleCache")
+    }
+}
+
+/// Every element's computed style for the document as it is now. Cheap when
+/// nothing changed since the last call; when the tree changed, styles are
+/// recomputed, and sheets are parsed again only if their text changed.
+///
+/// `:focus` does not take part: the focused element lives with the script
+/// state, not the document.
+pub fn document_styles(doc: &Document) -> Arc<Styles> {
+    let mut cache = doc.style_cache.0.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((version, styles)) = &cache.styles {
+        if *version == doc.version() {
+            return Arc::clone(styles);
+        }
+    }
+
+    let viewport = doc.viewport();
+    let texts = author_sheet_texts(doc, viewport);
+    let mut fingerprint = DefaultHasher::new();
+    viewport.0.to_bits().hash(&mut fingerprint);
+    viewport.1.to_bits().hash(&mut fingerprint);
+    let mut sheets: Sheets = Vec::with_capacity(texts.len());
+    let mut parsed = HashMap::new();
+    for (owner, text) in &texts {
+        let hash = hash_text(text);
+        (owner, hash).hash(&mut fingerprint);
+        let rules = match cache.parsed.get(owner) {
+            Some((h, rules)) if *h == hash => Arc::clone(rules),
+            _ => Arc::new(css::parse_stylesheet(text)),
+        };
+        parsed.insert(*owner, (hash, Arc::clone(&rules)));
+        sheets.push(rules);
+    }
+    cache.parsed = parsed;
+    let fingerprint = fingerprint.finish();
+    let index = match &cache.index {
+        Some((f, index)) if *f == fingerprint => Arc::clone(index),
+        _ => {
+            let index = Arc::new(RuleIndex::build(&sheets, viewport));
+            cache.index = Some((fingerprint, Arc::clone(&index)));
+            index
+        }
+    };
+    let styles = Arc::new(compute_with(doc, &index, None));
+    cache.styles = Some((doc.version(), Arc::clone(&styles)));
+    styles
+}
+
+fn hash_text(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The author sheets of a document, in document order, by owner: each
+/// `<style>`'s text and each stylesheet `<link>`'s fetched text, followed by
+/// whatever script inserted through the CSSOM. A sheet whose `media`
+/// attribute does not match the viewport, or that is disabled, is left out.
+fn author_sheet_texts(doc: &Document, viewport: (f64, f64)) -> Vec<(NodeId, String)> {
+    let mut out = Vec::new();
+    for id in doc.descendants(doc.document_id()) {
+        let base = match doc.tag(id) {
+            Some("style") => doc.text_content(id),
+            Some("link") => {
+                let rel = doc.attr(id, "rel").unwrap_or("").to_ascii_lowercase();
+                if !rel.split_ascii_whitespace().any(|r| r == "stylesheet") || rel.contains("alternate") {
+                    continue;
+                }
+                match doc.stylesheet(id) {
+                    Some(text) => text.to_string(),
+                    None => String::new(),
+                }
+            }
+            _ => continue,
+        };
+        if doc.has_attr(id, "disabled") {
+            continue;
+        }
+        if let Some(media) = doc.attr(id, "media") {
+            if !css::media_matches(media, viewport.0, viewport.1) {
+                continue;
+            }
+        }
+        let text = match doc.cssom(id) {
+            Some(extra) if !extra.is_empty() => format!("{base}\n{extra}"),
+            _ => base,
+        };
+        if !text.trim().is_empty() {
+            out.push((id, text));
+        }
+    }
+    out
+}
+
+fn compute_with(doc: &Document, index: &RuleIndex, focus: Option<NodeId>) -> Styles {
     let mut styles = Styles::default();
     let root_font = std::cell::Cell::new(16.0);
     let ctx = Context { scope: None, focus };
@@ -604,6 +728,8 @@ fn user_agent_sheet() -> Arc<Vec<StyleRule>> {
 }
 
 // ---- the inline attribute alone ---------------------------------------------
+//
+// For places that have no document-wide styles to hand.
 
 /// The declarations of the element's `style` attribute, in order, with names
 /// lowercased and `!important` dropped. Later declarations win.
@@ -619,12 +745,6 @@ pub fn inline_declarations(doc: &Document, id: NodeId) -> Vec<(String, String)> 
 /// The last inline value given for `name`.
 pub fn inline_value(doc: &Document, id: NodeId, name: &str) -> Option<String> {
     inline_declarations(doc, id).into_iter().rev().find(|(n, _)| n == name).map(|(_, v)| v)
-}
-
-/// Whether the element's own inline style hides it and its subtree.
-pub fn hides(doc: &Document, id: NodeId) -> bool {
-    let last = |name: &str| inline_value(doc, id, name).map(|v| v.to_ascii_lowercase());
-    last("display").as_deref() == Some("none") || matches!(last("visibility").as_deref(), Some("hidden") | Some("collapse"))
 }
 
 #[cfg(test)]

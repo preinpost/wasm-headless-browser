@@ -12,6 +12,7 @@
 use serde_json::{json, Value};
 
 use crate::dom::{Document, NodeId};
+use crate::style::Styles;
 
 #[derive(Debug, Clone)]
 pub struct AxNode {
@@ -36,8 +37,9 @@ pub fn build(doc: &Document) -> Vec<AxNode> {
     let mut counter = 0usize;
     let mut roots = Vec::new();
     let document = doc.document_id();
+    let styles = crate::style::document_styles(doc);
     for child in doc.children(document).to_vec() {
-        collect(doc, child, None, &mut counter, &mut nodes, &mut roots);
+        collect(doc, &styles, child, None, &mut counter, &mut nodes, &mut roots);
     }
     nodes
 }
@@ -77,9 +79,7 @@ fn is_excluded(doc: &Document, id: NodeId) -> bool {
     if doc.is_tag(id, "input") && doc.attr(id, "type") == Some("hidden") {
         return true;
     }
-    // Inline style only until the cascade exists (M1.4). That already covers
-    // React apps that hide a screen with `style="display: none"`.
-    crate::style::hides(doc, id)
+    false
 }
 
 /// Walks one node, appending it and its subtree to `out` in document order.
@@ -89,6 +89,7 @@ fn is_excluded(doc: &Document, id: NodeId) -> bool {
 /// without a node of their own.
 fn collect(
     doc: &Document,
+    styles: &Styles,
     id: NodeId,
     parent: Option<String>,
     counter: &mut usize,
@@ -98,10 +99,33 @@ fn collect(
     if is_excluded(doc, id) {
         return;
     }
+    let style = styles.get(id);
+    // Not rendered: the node and everything under it. An element outside
+    // the computed tree (inside a template, say) has no style and is not
+    // rendered either.
+    if doc.is_element(id) && style.is_none_or(|s| s.get("display") == "none") {
+        return;
+    }
+    // Invisible but still laid out: no node of its own, but a descendant may
+    // be visible again, so its children are still walked.
+    if style.is_some_and(|s| matches!(s.get("visibility"), "hidden" | "collapse")) {
+        for child in doc.children(id).to_vec() {
+            collect(doc, styles, child, parent.clone(), counter, out, siblings);
+        }
+        return;
+    }
 
     let is_root = doc.is_tag(id, "html");
 
     if doc.is_text(id) {
+        // Text is as visible as the element it is in.
+        let hidden = doc
+            .parent(id)
+            .and_then(|p| styles.get(p))
+            .is_some_and(|s| matches!(s.get("visibility"), "hidden" | "collapse"));
+        if hidden {
+            return;
+        }
         let text = collapse(&doc.node(id).text);
         if text.is_empty() {
             return;
@@ -148,7 +172,7 @@ fn collect(
 
         let mut children = Vec::new();
         for child in doc.children(id).to_vec() {
-            collect(doc, child, Some(node_id.clone()), counter, out, &mut children);
+            collect(doc, styles, child, Some(node_id.clone()), counter, out, &mut children);
         }
         out[slot].children = children;
         siblings.push(node_id);
@@ -158,7 +182,7 @@ fn collect(
     // Comments, doctypes and anything else non-rendered: no node of their own,
     // but their children stay in the tree at the caller's level.
     for child in doc.children(id).to_vec() {
-        collect(doc, child, parent.clone(), counter, out, siblings);
+        collect(doc, styles, child, parent.clone(), counter, out, siblings);
     }
 }
 

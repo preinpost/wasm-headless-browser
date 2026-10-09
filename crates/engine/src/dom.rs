@@ -11,6 +11,8 @@
 //!
 //! Nothing here knows about CSS or layout. This is the tree, and only the tree.
 
+use std::collections::HashMap;
+
 use markup5ever::interface::QualName;
 use markup5ever::{ns, LocalName, Namespace};
 
@@ -96,6 +98,17 @@ pub struct Document {
     document: NodeId,
     quirks: Quirks,
     url: String,
+    /// Bumped by every change that can affect styles, so computed styles are
+    /// recomputed only when something changed.
+    version: u64,
+    /// Fetched stylesheet text, by the `<link>` that asked for it.
+    stylesheets: HashMap<NodeId, String>,
+    /// Rules script added through the CSSOM (`insertRule`), by the owning
+    /// `<style>` or `<link>`, as text.
+    cssom: HashMap<NodeId, String>,
+    viewport: (f64, f64),
+    /// Computed styles and the parsed sheets behind them. See `style.rs`.
+    pub(crate) style_cache: crate::style::StyleCache,
 }
 
 impl Default for Document {
@@ -111,7 +124,52 @@ impl Document {
             document: 0,
             quirks: Quirks::NoQuirks,
             url: String::new(),
+            version: 0,
+            stylesheets: HashMap::new(),
+            cssom: HashMap::new(),
+            viewport: (800.0, 600.0),
+            style_cache: Default::default(),
         }
+    }
+
+    /// Changes whenever something that styles depend on does.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    fn touch(&mut self) {
+        self.version += 1;
+    }
+
+    pub fn viewport(&self) -> (f64, f64) {
+        self.viewport
+    }
+
+    pub fn set_viewport(&mut self, viewport: (f64, f64)) {
+        if self.viewport != viewport {
+            self.viewport = viewport;
+            self.touch();
+        }
+    }
+
+    /// The fetched text of the stylesheet `<link>` `id`.
+    pub fn stylesheet(&self, id: NodeId) -> Option<&str> {
+        self.stylesheets.get(&id).map(String::as_str)
+    }
+
+    pub fn set_stylesheet(&mut self, id: NodeId, text: String) {
+        self.stylesheets.insert(id, text);
+        self.touch();
+    }
+
+    /// Rules script added to `id`'s sheet through the CSSOM.
+    pub fn cssom(&self, id: NodeId) -> Option<&str> {
+        self.cssom.get(&id).map(String::as_str)
+    }
+
+    pub fn set_cssom(&mut self, id: NodeId, text: String) {
+        self.cssom.insert(id, text);
+        self.touch();
     }
 
     pub fn document_id(&self) -> NodeId {
@@ -169,6 +227,7 @@ impl Document {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        self.touch();
         if let Some(existing) = self.nodes[id].attrs.iter_mut().find(|a| a.local_name() == name) {
             existing.value = value.to_string();
             return;
@@ -181,6 +240,7 @@ impl Document {
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        self.touch();
         self.nodes[id].attrs.retain(|a| a.local_name() != name);
     }
 
@@ -201,6 +261,7 @@ impl Document {
     /// node, or none when the text is empty; a text or comment node is edited
     /// in place. The detached children stay in the arena, unreachable.
     pub fn set_text_content(&mut self, id: NodeId, text: &str) {
+        self.touch();
         match self.nodes[id].data {
             NodeData::Text | NodeData::Comment => self.nodes[id].text = text.to_string(),
             NodeData::Element { .. } => {
@@ -280,6 +341,7 @@ impl Document {
     /// no reference. A reference that is not a child of `parent` appends,
     /// rather than inserting somewhere else.
     pub fn insert_child(&mut self, parent: NodeId, child: NodeId, reference: Option<NodeId>) {
+        self.touch();
         match reference {
             Some(r) if r != child && self.nodes[r].parent == Some(parent) => {
                 self.detach(child);
@@ -402,6 +464,7 @@ impl Document {
     }
 
     pub fn control_mut(&mut self, id: NodeId) -> &mut Control {
+        self.touch();
         &mut self.nodes[id].control
     }
 
@@ -466,6 +529,7 @@ impl Document {
     /// Insert `child` as the last child of `parent`, detaching it first if it
     /// already has a parent.
     pub(crate) fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        self.touch();
         self.detach(child);
         self.nodes[child].parent = Some(parent);
         self.nodes[parent].children.push(child);
@@ -473,6 +537,7 @@ impl Document {
 
     /// Remove `id` from its parent, leaving it intact.
     pub(crate) fn detach(&mut self, id: NodeId) {
+        self.touch();
         if let Some(parent) = self.nodes[id].parent.take() {
             if let Some(pos) = self.nodes[parent].children.iter().position(|c| *c == id) {
                 self.nodes[parent].children.remove(pos);
@@ -482,6 +547,7 @@ impl Document {
 
     /// Insert `child` immediately before `sibling`.
     pub(crate) fn insert_before(&mut self, sibling: NodeId, child: NodeId) {
+        self.touch();
         self.detach(child);
         if let Some(parent) = self.nodes[sibling].parent {
             let pos = self.nodes[parent]
@@ -497,6 +563,7 @@ impl Document {
     /// Merge `text` into the node's text, which is what the parser expects when
     /// two text nodes would otherwise become adjacent.
     pub(crate) fn append_text_to(&mut self, id: NodeId, text: &str) {
+        self.touch();
         self.nodes[id].text.push_str(text);
     }
 
@@ -506,6 +573,7 @@ impl Document {
     }
 
     pub(crate) fn push_attr(&mut self, id: NodeId, attr: Attr) {
+        self.touch();
         self.nodes[id].attrs.push(attr);
     }
 

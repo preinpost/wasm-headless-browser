@@ -80,7 +80,7 @@ reflect(HTMLScriptElement, 'boolean', { defer: 'defer', noModule: 'nomodule' });
 
 // ---- stylesheets ------------------------------------------------------------
 //
-// There is no cascade, so rules are kept but not applied. They exist because
+// Rules are kept as text and handed to the engine's cascade (`syncSheet`).
 // CSS-in-JS libraries insert rules through the CSSOM in production builds and
 // fail loudly when there is no sheet to insert into.
 
@@ -99,10 +99,12 @@ class CSSStyleSheet {
   insertRule(rule, index = 0) {
     if (index < 0 || index > this.cssRules.length) throw domError('IndexSizeError', `The index provided (${index}) is outside the range [0, ${this.cssRules.length}].`);
     this.cssRules.splice(index, 0, { cssText: String(rule), type: 1 });
+    syncSheet(this);
     return index;
   }
   deleteRule(index) {
     this.cssRules.splice(index, 1);
+    syncSheet(this);
   }
   addRule(selector, style, index = this.cssRules.length) {
     return this.insertRule(`${selector} { ${style} }`, index);
@@ -112,6 +114,7 @@ class CSSStyleSheet {
   }
   replaceSync(text) {
     this.cssRules = [{ cssText: String(text), type: 1 }];
+    syncSheet(this);
   }
   replace(text) {
     this.replaceSync(text);
@@ -119,6 +122,14 @@ class CSSStyleSheet {
   }
 }
 tagClass(CSSStyleSheet, 'CSSStyleSheet');
+
+// Rules script added reach the engine's cascade as text, under the element
+// that owns the sheet.
+function syncSheet(sheet) {
+  if (sheet.ownerNode && nodeIds.has(sheet.ownerNode)) {
+    api.setCssom(own(sheet.ownerNode), sheet.cssRules.map((r) => r.cssText).join('\n'));
+  }
+}
 
 const sheets = new WeakMap();
 function sheetFor(el) {
@@ -143,9 +154,9 @@ function documentStyleSheets() {
   ).map(sheetFor);
 }
 
-// A stylesheet <link> added by script is fetched, and fires `load` or
-// `error`. Bundlers load CSS chunks this way and wait for the event, so a
-// link that never settles would hang the page. The rules are not applied.
+// A stylesheet <link> added by script is fetched, its rules join the
+// cascade, and it fires `load` or `error`. Bundlers load CSS chunks this way
+// and wait for the event, so a link that never settles would hang the page.
 const requestedLinks = new Set();
 function linkInserted(id) {
   if (requestedLinks.has(id) || !isStylesheetLink(id)) return;
@@ -154,7 +165,9 @@ function linkInserted(id) {
   const href = el.href;
   schedule(() => {
     const response = performRequest('GET', href, ['Accept', 'text/css,*/*;q=0.1'], '');
-    fire(el, response.status >= 200 && response.status < 300 ? 'load' : 'error');
+    const ok = response.status >= 200 && response.status < 300;
+    if (ok) api.setStylesheet(id, response.body);
+    fire(el, ok ? 'load' : 'error');
   }, 0);
 }
 

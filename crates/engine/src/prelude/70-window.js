@@ -342,36 +342,32 @@ function matchMedia(query) {
   return list;
 }
 
-// Five properties come from the engine; the rest from the inline style, or
-// empty. There is no cascade yet.
-const COMPUTED_KEYS = ['display', 'visibility', 'cursor', 'opacity', 'position'];
-function getComputedStyle(element) {
+// The engine's cascade, one property at a time, so a page reading only
+// `display` does not pay for the rest. Pseudo-elements have no computed
+// style here and read as empty.
+function getComputedStyle(element, pseudoElement) {
   const id = element !== null && typeof element === 'object' ? nodeIds.get(element) : undefined;
-  const isElement = id !== undefined && isElementId(id);
-  const values = isElement ? api.computedStyle(id) : COMPUTED_KEYS.map(() => '');
-  const known = Object.fromEntries(COMPUTED_KEYS.map((k, i) => [k, values[i] || '']));
-  const inline = isElement ? parseDeclarations(api.attr(id, 'style')) : [];
-  const lookup = (name) => {
-    name = String(name);
-    if (name in known) return known[name];
-    const d = inline.find(([n]) => n === name);
-    return d ? d[1] : '';
-  };
+  const live = id !== undefined && isElementId(id) && !pseudoElement;
+  const lookup = (name) => (live ? api.computedValue(id, String(name)) : '');
+  const names = () => (live ? api.computedNames(id) : []);
   const readOnly = () => {
     throw domError('NoModificationAllowedError', 'These styles are computed, and therefore read-only.');
   };
   const decl = Object.assign(Object.create(CSSStyleDeclaration.prototype), {
     getPropertyValue: lookup,
     getPropertyPriority: () => '',
-    item: (i) => COMPUTED_KEYS[i] ?? '',
+    item: (i) => names()[i] ?? '',
     setProperty: readOnly,
     removeProperty: readOnly,
-    length: COMPUTED_KEYS.length,
-    cssText: '',
+  });
+  Object.defineProperties(decl, {
+    length: { get: () => names().length },
+    cssText: { get: () => names().map((n) => `${n}: ${lookup(n)};`).join(' ') },
   });
   return new Proxy(decl, {
     get(target, key, receiver) {
       if (typeof key !== 'string' || key in target) return Reflect.get(target, key, receiver);
+      if (/^\d+$/.test(key)) return target.item(Number(key));
       return lookup(kebab(key));
     },
   });

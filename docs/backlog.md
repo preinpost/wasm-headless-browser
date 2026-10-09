@@ -97,6 +97,7 @@ DOM은 가두지 않았습니다. `Arc<Mutex<Document>>`로 엔진과 공유하�
 | QuickJS를 넣은 WASIX 모듈은 1.6MB다. TLS를 넣으면 2.3MB다 | 이 문서의 §1.5, [docs/wasix.md](wasix.md) |
 | WASIX에서 rustls + ring이 TLS 1.3으로 동작한다. 참조 사이트 인증서는 공개 루트로 검증된다 | [docs/wasix.md](wasix.md) |
 | example.com은 이제 본문이 문단 하나와 `<script src=/s.js>`뿐이다. 외부 스크립트 없이는 제목과 링크가 없다 | 2026-10-09 측정 |
+| 캐스케이드를 넣은 뒤 참조 사이트 "다음" 버튼의 계산 스타일은 `display: block`, `cursor: pointer`, `width: 100%`, `height: 54px`, 배경 `#00aaff`(`a CSS variable`에서), 13.33px이다. 전체 스냅샷은 23줄이다 | 2026-10-09 |
 | 참조 사이트의 숨은 화면(추가 인증 선택, OTP, 실패 대화상자)은 CSS 클래스가 아니라 인라인 `style="display: none"`으로 숨는다. 인라인 스타일만 반영해도 로그인 화면의 인터랙티브 스냅샷이 25개 넘던 것에서 4개(첫 입력란, 아이디, 다음, 체크박스)로 준다 | 2026-10-09 측정 (M1.6) |
 | 참조 사이트에 가짜 계정으로 로그인하면 실패가 화면에 나온다. Enter 한 번에 아이디 단계(`POST /api/login-step`, a result code), 버튼이 "로그인"으로 바뀐 뒤 Enter 한 번 더에 인증(a result code "실패 문구")이고, 그 문구가 폼 아래 문단과 확인 대화상자로 스냅샷에 나온다. 클릭 없이 Enter만으로 된다 | 2026-10-09, 사용자 승인 아래 가짜 계정 `nonexistent-test-account`로 |
 | 참조 사이트의 React 입력란에 agent-browser `fill`이 동작한다. 아이디는 스냅샷에 나오고 비밀번호는 나오지 않는다 | 2026-10-09 agent-browser |
@@ -203,6 +204,13 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       잘못된 선택자는 스크립트에서 SyntaxError다. 캐스케이드가 같은 파서를 쓴다.
 - [x] M1.4a 인라인 `style`의 `display: none`·`visibility: hidden`을 접근성 트리가
       반영한다(`style.rs`). `visibility`의 상속은 아직 하위 트리 전체로 근사한다.
+- [x] M1.4b CSS 캐스케이드. `css.rs`가 시트를 읽고 `style.rs`가 계산한다. 출처·
+      중요도·명시도·순서, 상속, 사용자 정의 속성과 `var()`, `inherit`/`initial`/
+      `unset`, `font-size`의 px 계산, 레이아웃에 쓰는 축약 속성. 시트는 `<style>`,
+      파서가 넣은 `<link>`(엔진이 스크립트 전에 가져옴), 스크립트가 넣은 `<link>`,
+      CSSOM의 `insertRule`에서 온다. 문서 버전이 그대로면 캐시를 쓰고, 시트는 텍스트가
+      바뀔 때만 다시 파싱한다. 접근성 트리와 `getComputedStyle`이 이것을 쓴다.
+      `:focus` 규칙은 캐스케이드에 들어가지 않는다(포커스가 스크립트 쪽 상태라서).
 - [ ] M1.4 `taffy`로 블록·플렉스 레이아웃을 근사한다. 목표는 픽셀이 아니라
       `getBoundingClientRect`가 0이 아닌 사각형을 돌려주고 가시성을 판정하는
       것이다. 최소 CSS 캐스케이드(태그·클래스·인라인)가 함께 필요하다.
@@ -253,7 +261,9 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       `this._super.caller`로 부모 메서드를 찾는데 QuickJS는 늘 `undefined`를 줬다.
       rquickjs-sys를 `vendor/`에 들여와 QuickJS를 패치했다
       ([vendor/README.md](../vendor/README.md)).
-- [ ] M2.13 참조 사이트를 여는 데 3.5초 걸린다. 12초 중 9초는 요청 69개가 매번
+- [ ] M2.13 참조 사이트를 여는 데 3.5초, 스타일시트 6개(2.8MB)를 받고 파싱하게 된
+      뒤로는 5.6초 걸린다. 시트를 병렬로 받거나 스크립트와 겹쳐 받으면 줄어든다.
+      이전 기록: 3.5초. 12초 중 9초는 요청 69개가 매번
       새로 맺는 TCP·TLS였고, keep-alive 연결 풀로 줄였다. 남은 시간은 대부분
       7MB 남짓한 번들의 파싱이다(the largest bundle 0.75초, main 0.54초, the grid library 0.43초).
       청크를 병렬로 받으면 조금 더 줄 수 있다.
