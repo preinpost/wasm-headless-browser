@@ -26,6 +26,7 @@ pub mod css;
 pub mod dom;
 pub mod fetch;
 pub mod font;
+pub mod images;
 pub mod js;
 pub mod layout;
 pub mod paint;

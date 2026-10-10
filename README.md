@@ -43,9 +43,13 @@ Sans KR (Hangul included), so `agent-browser screenshot`, `--full` and
 `--annotate` work. A password field paints bullets; other secrets paint as
 their placeholders.
 
-Not there yet: images and gradients in screenshots, scrolling, ES modules,
-and request interception (`network route`). The WASIX module is 5.1 MB, the
-font 1.15 MB of it.
+Images are fetched as a browser fetches them: `<img>` loads fire before the
+window's `load`, layout uses intrinsic sizes, and screenshots paint images
+(PNG, JPEG, GIF, WebP), CSS backgrounds and gradients.
+
+Not there yet: shadows and SVG in screenshots, scrolling, ES modules, and
+request interception (`network route`). The WASIX module is 5.2 MB, the font
+1.15 MB of it.
 
 ## Why the shape is what it is
 
@@ -151,7 +155,7 @@ agent-browser --cdp http://127.0.0.1:9222 fill @e3 '{{secret:gw}}'
 | Milestone | Content |
 |---|---|
 | M0 | Protocol plumbing and the engine seam. **Done** |
-| M1 | Real engine: parsing, DOM, fetching over HTTP(S), CSS cascade, layout, screenshots. **Done**, except images |
+| M1 | Real engine: parsing, DOM, fetching over HTTP(S), CSS cascade, layout, screenshots with images. **Done** |
 | M2 | JavaScript: QuickJS (patched, see [`vendor/README.md`](vendor/README.md)), a DOM binding, an event loop, `fetch` and XHR, input. **Done**, except ES modules |
 | M3 | Network: cookies and `Network.*` events are **done**; request interception is not |
 | M4 | Credentials held in memory only, typed by placeholder, scrubbed from CDP. **Done** |

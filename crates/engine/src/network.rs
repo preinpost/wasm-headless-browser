@@ -25,6 +25,7 @@ pub enum ResourceType {
     Document,
     Stylesheet,
     Script,
+    Image,
     Fetch,
     Xhr,
     #[default]
@@ -37,6 +38,7 @@ impl ResourceType {
             ResourceType::Document => "Document",
             ResourceType::Stylesheet => "Stylesheet",
             ResourceType::Script => "Script",
+            ResourceType::Image => "Image",
             ResourceType::Fetch => "Fetch",
             ResourceType::Xhr => "XHR",
             ResourceType::Other => "Other",
@@ -49,6 +51,7 @@ impl ResourceType {
             "Document" => ResourceType::Document,
             "Stylesheet" => ResourceType::Stylesheet,
             "Script" => ResourceType::Script,
+            "Image" => ResourceType::Image,
             "Fetch" => ResourceType::Fetch,
             "XHR" => ResourceType::Xhr,
             _ => ResourceType::Other,

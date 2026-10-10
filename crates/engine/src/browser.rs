@@ -19,6 +19,7 @@ use crate::secrets::Secrets;
 use crate::dom::{Document, NodeData, NodeId};
 use crate::fetch::{self, Request};
 use crate::bindings::Navigation;
+use crate::images::ImageStore;
 use crate::js::{JsValue, ScriptHost};
 use crate::network::ResourceType;
 use crate::parse::{parse_html, parse_html_bytes};
@@ -50,6 +51,8 @@ pub struct HtmlEngine {
     script: Option<ScriptHost>,
     /// Fetches with the jar every target shares.
     client: fetch::Client,
+    /// This target's images, attached to every document it shows.
+    images: Arc<ImageStore>,
     /// Credentials, typed only through placeholders and scrubbed from
     /// everything the engine says. Shared by every target.
     secrets: Arc<Secrets>,
@@ -83,12 +86,17 @@ impl HtmlEngine {
         let script = ScriptHost::spawn(Arc::clone(&doc), client.clone(), viewport, USER_AGENT).ok();
         let frame_id = ids::token(&mut counter);
         client.log().set_frame(&frame_id);
+        let images = Arc::new(ImageStore::new(client.clone()));
+        if let Ok(mut d) = doc.lock() {
+            d.set_images(Arc::clone(&images));
+        }
 
         HtmlEngine {
             target_id: target_id.to_string(),
             doc,
             script,
             client,
+            images,
             secrets,
             url: "about:blank".to_string(),
             frame_id,
@@ -173,6 +181,20 @@ impl HtmlEngine {
         out("Page.loadEventFired", json!({ "timestamp": timestamp }));
     }
 
+    /// Every image the document shows: `<img>`s and CSS backgrounds.
+    fn image_urls(&self) -> Vec<String> {
+        let doc = self.doc();
+        let mut urls: Vec<String> = doc
+            .descendants(doc.document_id())
+            .filter(|id| doc.is_tag(*id, "img"))
+            .filter_map(|id| doc.image_url(id))
+            .collect();
+        urls.extend(crate::paint::background_urls(&doc));
+        urls.sort();
+        urls.dedup();
+        urls
+    }
+
     /// `Page.captureScreenshot`: the viewport, or `clip`, painted as PNG.
     fn screenshot(&self, params: &Value) -> Result<Value, CdpError> {
         let format = params.get("format").and_then(|v| v.as_str()).unwrap_or("png");
@@ -200,6 +222,10 @@ impl HtmlEngine {
                 region.width, region.height, region.scale, MAX_SCREENSHOT_PIXELS
             )));
         }
+        // Images script added since the load, and backgrounds still on their
+        // way, are waited for, without the document lock.
+        let urls = self.image_urls();
+        self.images.wait_all(&urls);
         let secrets = Arc::clone(&self.secrets);
         let canvas = crate::paint::paint(&self.doc(), region, &|text| secrets.scrub_str(text));
         use base64::Engine as _;
@@ -258,6 +284,7 @@ impl HtmlEngine {
         let request = request.of_kind(ResourceType::Document);
         let requested = request.url.clone();
         self.client.clear_preloads();
+        self.images.clear();
         let fetched = self.client.send(request);
         let mut new_url = requested.clone();
         let new_error;
@@ -280,6 +307,7 @@ impl HtmlEngine {
                     }
                     doc.set_url(&response.url);
                     doc.set_viewport(self.viewport);
+                    doc.set_images(Arc::clone(&self.images));
                     new_url = response.url.clone();
                     new_error = response
                         .charset()
@@ -291,6 +319,7 @@ impl HtmlEngine {
                     *doc = parse_html(&error_page(&requested, &message));
                     doc.set_url(&requested);
                     doc.set_viewport(self.viewport);
+                    doc.set_images(Arc::clone(&self.images));
                     new_error = Some(message);
                 }
             }
@@ -326,6 +355,8 @@ impl HtmlEngine {
                         (doc.attr(id, "href"), ResourceType::Stylesheet)
                     } else if doc.is_tag(id, "script") && is_classic_script_type(doc.attr(id, "type")) {
                         (doc.attr(id, "src"), ResourceType::Script)
+                    } else if doc.is_tag(id, "img") {
+                        return doc.image_url(id).map(|url| (url, ResourceType::Image));
                     } else {
                         return None;
                     };
@@ -334,7 +365,13 @@ impl HtmlEngine {
                 .collect()
         };
         for (url, kind) in urls {
-            self.client.preload(&url, kind);
+            // Images go to the image store, which keeps them for layout and
+            // painting; the rest wait in the client for whoever asks.
+            if kind == ResourceType::Image {
+                self.images.request(&url);
+            } else {
+                self.client.preload(&url, kind);
+            }
         }
     }
 
@@ -355,7 +392,9 @@ impl HtmlEngine {
             let request = Request::get(url.as_str()).of_kind(ResourceType::Stylesheet);
             let Ok(response) = self.client.send(request) else { continue };
             if (200..300).contains(&response.status) {
-                let text = String::from_utf8_lossy(&response.body).into_owned();
+                let text = String::from_utf8_lossy(&response.body);
+                // Its `url()`s are relative to the sheet, not the page.
+                let text = crate::css::absolutize_urls(&text, &response.url);
                 self.doc().set_stylesheet(id, text);
             }
         }
@@ -427,6 +466,11 @@ impl HtmlEngine {
         script.run_tasks(LOAD_BUDGET_MS, MAX_TASKS);
         let _ = script.run("__fireLoad()");
         script.run_tasks(LOAD_BUDGET_MS, MAX_TASKS);
+        // `<img>`s were fetched by their own tasks above. Backgrounds start
+        // now, so they are likely there when a screenshot wants them.
+        for url in self.image_urls() {
+            self.images.request(&url);
+        }
 
         if let Some(first) = errors.into_iter().next() {
             self.last_error = Some(first);
@@ -2089,6 +2133,47 @@ mod tests {
         // The username is painted as its placeholder, as a snapshot shows it.
         assert!(shot(page, "") == shot("<body><p>Welcome, {{secret:user}}</p><input id=p type=password></body>", ""));
         assert!(shot(page, "") != shot("<body><p>Welcome, someone.else</p><input id=p type=password></body>", ""));
+    }
+
+    #[test]
+    fn images_load_like_a_browsers_and_show_in_screenshots() {
+        let mut png = Vec::new();
+        let red = image::RgbaImage::from_pixel(30, 10, image::Rgba([255, 0, 0, 255]));
+        red.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let base = crate::test_server::serve_together(
+            vec![
+                (
+                    "/",
+                    "text/html",
+                    "<body style='margin:0'><img id=i src=red.png>\
+                     <script>window.log = []; const i = document.getElementById('i');\
+                     i.onload = () => log.push('img ' + i.naturalWidth);\
+                     addEventListener('load', () => log.push('window ' + i.complete));\
+                     const late = new Image(); late.onerror = () => log.push('missing'); late.src = 'nope.png';</script></body>"
+                        .into(),
+                ),
+                ("/red.png", "image/png", png),
+            ],
+            vec![],
+        );
+        let mut engine = HtmlEngine::new("t");
+        dispatch(&mut engine, "Network.enable", json!({}));
+        let events = events_of(&mut engine, |e, out| e.navigate(&format!("{base}/"), out).unwrap());
+        // The two images' events come in whatever order they arrive, as in
+        // Chrome; the window's load comes after both.
+        assert_eq!(
+            evaluate(&mut engine, "log.slice(0, 2).sort().join() + ' / ' + log[2]")["result"]["value"],
+            "img 30,missing / window true"
+        );
+        assert!(network_only(&events).iter().any(|(m, p)| *m == "Network.requestWillBeSent" && p["type"] == "Image"));
+        assert_eq!(engine.last_error, None);
+        let image = evaluate(&mut engine, "document.getElementById('i')")["result"]["objectId"].clone();
+        let quads = dispatch(&mut engine, "DOM.getContentQuads", json!({ "objectId": image }));
+        assert_eq!(quads["quads"][0], json!([0.0, 0.0, 30.0, 0.0, 30.0, 10.0, 0.0, 10.0]));
+        let shot = screenshot_png(&mut engine, json!({ "clip": { "x": 0, "y": 0, "width": 40, "height": 10, "scale": 1 } }));
+        let decoded = crate::images::decode(&shot).unwrap();
+        assert_eq!(decoded.pixel(15, 5), [255, 0, 0, 255]);
+        assert_eq!(decoded.pixel(35, 5), [255, 255, 255, 255]);
     }
 
     #[test]

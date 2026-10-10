@@ -493,6 +493,15 @@ pub(crate) fn measure_with(style: &ComputedStyle) -> impl Fn(char) -> f64 {
     move |c| char_width(c, font, monospace)
 }
 
+/// The size an `<img>` has of its own, if its image has arrived. Layout does
+/// not wait for it: the load waits for a page's images, as Chrome's `load`
+/// event does, and a screenshot waits for any that came after.
+fn intrinsic_size(doc: &Document, id: NodeId) -> Option<(f64, f64)> {
+    let url = doc.image_url(id)?;
+    let (w, h) = doc.images()?.size(&url, std::time::Instant::now())?;
+    Some((w as f64, h as f64))
+}
+
 /// Chrome's default size for a replaced element or form control.
 fn replaced_size(doc: &Document, id: NodeId, style: &ComputedStyle) -> Option<(f64, f64)> {
     let tag = doc.tag(id)?;
@@ -527,7 +536,18 @@ fn replaced_size(doc: &Document, id: NodeId, style: &ComputedStyle) -> Option<(f
                 .fold(0.0, f64::max);
             (widest + 28.0, line + 6.0)
         }
-        "img" => (attr("width").unwrap_or(0.0), attr("height").unwrap_or(0.0)),
+        "img" => {
+            // Attributes first; one alone keeps the image's aspect ratio.
+            let natural = intrinsic_size(doc, id);
+            let ratio = natural.filter(|(w, h)| *w > 0.0 && *h > 0.0).map(|(w, h)| w / h);
+            match (attr("width"), attr("height"), natural) {
+                (Some(w), Some(h), _) => (w, h),
+                (Some(w), None, _) => (w, ratio.map(|r| w / r).unwrap_or(0.0)),
+                (None, Some(h), _) => (ratio.map(|r| h * r).unwrap_or(0.0), h),
+                (None, None, Some(size)) => size,
+                (None, None, None) => (0.0, 0.0),
+            }
+        }
         "canvas" | "iframe" | "video" | "embed" | "object" | "svg" => {
             (attr("width").unwrap_or(300.0), attr("height").unwrap_or(150.0))
         }
@@ -940,21 +960,24 @@ fn translation(transform: &str, size: (f64, f64), basis: Basis) -> (f64, f64) {
 /// The document's layout as it is now, computed when the document changed
 /// since the last call.
 pub fn document_layout(doc: &Document) -> Arc<Layout> {
+    // An image arriving changes layout without changing the document.
+    let key = (doc.version(), doc.images().map(|i| i.generation()).unwrap_or(0));
     let mut cache = doc.layout_cache.0.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((version, layout)) = &*cache {
-        if *version == doc.version() {
+    if let Some((cached, layout)) = &*cache {
+        if *cached == key {
             return Arc::clone(layout);
         }
     }
     let styles = style::document_styles(doc);
     let layout = Arc::new(compute(doc, &styles, doc.viewport()));
-    *cache = Some((doc.version(), Arc::clone(&layout)));
+    *cache = Some((key, Arc::clone(&layout)));
     layout
 }
 
-/// What a document keeps of its last layout.
+/// What a document keeps of its last layout, by document version and image
+/// generation.
 #[derive(Default)]
-pub struct LayoutCache(Mutex<Option<(u64, Arc<Layout>)>>);
+pub struct LayoutCache(Mutex<Option<((u64, u64), Arc<Layout>)>>);
 
 impl Clone for LayoutCache {
     fn clone(&self) -> Self {

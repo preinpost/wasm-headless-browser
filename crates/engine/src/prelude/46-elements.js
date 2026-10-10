@@ -166,7 +166,7 @@ function linkInserted(id) {
   schedule(() => {
     const response = finish();
     const ok = response.status >= 200 && response.status < 300;
-    if (ok) api.setStylesheet(id, response.body);
+    if (ok) api.setStylesheet(id, response.body, response.url);
     fire(el, ok ? 'load' : 'error');
   }, 0);
 }
@@ -193,34 +193,66 @@ reflect(HTMLStyleElement, 'boolean', { disabled: 'disabled' });
 
 // ---- images and media -------------------------------------------------------
 
-// Images are not fetched, so they never load and have no natural size.
+// Images are fetched by the engine, as a browser does, from the moment they
+// have a URL, attached or not. `load` or `error` fires from a task that waits
+// for the answer, so a page's `load` comes after its images, as in Chrome.
+// `naturalWidth` and `complete` look without waiting.
+const imageLoads = new Map();
+function startImage(id) {
+  const url = api.imageUrl(id) ?? null;
+  if (imageLoads.get(id) === url) return;
+  imageLoads.set(id, url);
+  if (url === null) return;
+  api.imageRequest(url);
+  schedule(() => {
+    if (imageLoads.get(id) !== url) return;
+    fire(wrap(id), api.imageWait(url).length ? 'load' : 'error');
+  }, 0);
+}
+
+// [0] on its way, [1] failed or none, [2, width, height] arrived.
+function imageState(el) {
+  const url = api.imageUrl(own(el));
+  return url ? api.imageState(url) : [1];
+}
+
 const HTMLImageElement = defineElement('HTMLImageElement', HTMLElement, {
   get width() {
-    return parseInt(this.getAttribute('width'), 10) || 0;
+    const state = imageState(this);
+    return parseInt(this.getAttribute('width'), 10) || (state[0] === 2 ? state[1] : 0);
   },
   set width(v) {
     this.setAttribute('width', String(v));
   },
   get height() {
-    return parseInt(this.getAttribute('height'), 10) || 0;
+    const state = imageState(this);
+    return parseInt(this.getAttribute('height'), 10) || (state[0] === 2 ? state[2] : 0);
   },
   set height(v) {
     this.setAttribute('height', String(v));
   },
   get naturalWidth() {
-    return 0;
+    const state = imageState(this);
+    return state[0] === 2 ? state[1] : 0;
   },
   get naturalHeight() {
-    return 0;
+    const state = imageState(this);
+    return state[0] === 2 ? state[2] : 0;
   },
   get complete() {
-    return true;
+    return imageState(this)[0] !== 0;
   },
   get currentSrc() {
-    return this.src;
+    return api.imageUrl(own(this)) ?? '';
   },
   decode() {
-    return Promise.resolve();
+    const state = imageState(this);
+    if (state[0] === 2) return Promise.resolve();
+    if (state[0] === 1) return Promise.reject(domError('EncodingError', 'The source image cannot be decoded.'));
+    return new Promise((resolve, reject) => {
+      this.addEventListener('load', () => resolve(), { once: true });
+      this.addEventListener('error', () => reject(domError('EncodingError', 'The source image cannot be decoded.')), { once: true });
+    });
   },
 });
 reflect(HTMLImageElement, 'url', { src: 'src' });

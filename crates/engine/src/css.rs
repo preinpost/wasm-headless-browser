@@ -386,8 +386,57 @@ fn length_px(value: &str) -> Option<f64> {
     value.parse().ok()
 }
 
+
+/// Rewrites a sheet's relative `url()`s against `base`, the sheet's own URL,
+/// so they still mean the same once the sheet is applied to a document at
+/// another URL. `data:` URLs, absolute ones and fragments are left alone.
+pub fn absolutize_urls(text: &str, base: &str) -> String {
+    let Ok(base) = url::Url::parse(base) else { return text.to_string() };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("url(") {
+        out.push_str(&rest[..start + 4]);
+        rest = &rest[start + 4..];
+        let Some(end) = rest.find(')') else { break };
+        let inner = rest[..end].trim();
+        let quote = inner.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let target = match quote {
+            Some(q) => inner.trim_matches(q),
+            None => inner,
+        };
+        let keep = target.is_empty()
+            || target.starts_with('#')
+            || target.starts_with("data:")
+            || url::Url::parse(target).is_ok();
+        match base.join(target) {
+            Ok(absolute) if !keep => {
+                out.push('"');
+                out.push_str(absolute.as_str());
+                out.push('"');
+            }
+            _ => out.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relative_urls_are_made_absolute_against_the_sheet() {
+        let sheet = r#"a { background: url(img/a.png) } b { background: url( "../b.jpg" ) } c { background: url('/c.gif') }
+            d { background: url(data:image/png;base64,AAA=) } e { background: url(https://cdn.test/e.png) } f { mask: url(#m) }"#;
+        let out = absolutize_urls(sheet, "https://site.test/static/css/main.css");
+        assert!(out.contains(r#"url("https://site.test/static/css/img/a.png")"#), "{out}");
+        assert!(out.contains(r#"url("https://site.test/static/b.jpg")"#), "{out}");
+        assert!(out.contains(r#"url("https://site.test/c.gif")"#), "{out}");
+        assert!(out.contains("url(data:image/png;base64,AAA=)"), "{out}");
+        assert!(out.contains("url(https://cdn.test/e.png)"), "{out}");
+        assert!(out.contains("url(#m)"), "{out}");
+    }
+
     use super::*;
 
     #[test]

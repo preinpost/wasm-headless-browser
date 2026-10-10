@@ -672,8 +672,10 @@ fn put_geometry<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         });
     }
     {
+        // `url` is where the sheet came from; its `url()`s are relative to it.
         let doc = Arc::clone(&state.doc);
-        install_fn!(ctx, api, "setStylesheet", move |id: usize, text: String| {
+        install_fn!(ctx, api, "setStylesheet", move |id: usize, text: String, url: String| {
+            let text = crate::css::absolutize_urls(&text, &url);
             let _ = with_doc_mut(&doc, |d| d.set_stylesheet(id, text));
         });
     }
@@ -915,6 +917,43 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
     }
 
     install_fn!(ctx, api, "resolveUrl", |base: String, relative: String| resolve_url(&base, &relative));
+
+    // Images, through the target's store. The store is taken out of the
+    // document before waiting: the lock must not be held while a download
+    // finishes.
+    let images = {
+        let doc = Arc::clone(&state.doc);
+        move || with_doc(&doc, |d| d.images().cloned()).flatten()
+    };
+    {
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "imageUrl", move |id: usize| with_doc(&doc, |d| d.image_url(id)).flatten());
+    }
+    {
+        let images = images.clone();
+        install_fn!(ctx, api, "imageRequest", move |url: String| {
+            if let Some(store) = images() {
+                store.request(&url);
+            }
+        });
+    }
+    {
+        // [0] on its way, [1] failed, [2, width, height] arrived.
+        let images = images.clone();
+        install_fn!(ctx, api, "imageState", move |url: String| -> Vec<u32> {
+            match images().and_then(|store| store.state(&url)) {
+                None => vec![0],
+                Some(None) => vec![1],
+                Some(Some((w, h))) => vec![2, w, h],
+            }
+        });
+    }
+    {
+        // [width, height], or nothing when it failed, after waiting for it.
+        install_fn!(ctx, api, "imageWait", move |url: String| -> Vec<u32> {
+            images().and_then(|store| store.wait(&url)).map(|(w, h)| vec![w, h]).unwrap_or_default()
+        });
+    }
 
     // [href, protocol, username, password, host, hostname, port, pathname,
     //  search, hash, origin], or nothing when the input is not a URL.

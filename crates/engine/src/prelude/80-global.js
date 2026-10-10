@@ -138,6 +138,7 @@ function setReadyState(value) {
 }
 
 function documentParsed() {
+  for (const image of api.byTag(documentId, 'img')) startImage(image);
   setReadyState('interactive');
 }
 

@@ -272,6 +272,18 @@ impl Pending {
             .recv()
             .unwrap_or_else(|_| Err(FetchError::Io("the request could not be started on a thread".into())))
     }
+
+    /// Waits at most `limit`; still running after that, the request comes
+    /// back to be waited for again.
+    pub fn wait_for(self, limit: Duration) -> Result<Result<Response, FetchError>, Pending> {
+        match self.0.recv_timeout(limit) {
+            Ok(answer) => Ok(answer),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(self),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Ok(Err(FetchError::Io("the request could not be started on a thread".into())))
+            }
+        }
+    }
 }
 
 /// Counts requests in flight per host and makes the next one wait when a

@@ -18,10 +18,13 @@
 //! appears as its placeholder in a screenshot, as it does in a snapshot.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::color::{self, Rgba};
 use crate::dom::{Document, NodeData, NodeId};
 use crate::font;
+use crate::images::Image;
 use crate::layout::{self, Layout, Rect};
 use crate::style::{self, ComputedStyle, Styles};
 
@@ -411,10 +414,16 @@ impl Painter<'_> {
         let native = control && native_look(style);
         let corner = radius(style, &rect) * scale;
 
+        let shape = Shape { area, radius: corner };
+        // A colour the canvas took over is not painted again; images are.
         if !background_propagated {
             if let Some(bg) = background_color(style) {
                 self.canvas.fill(area, corner, bg.with_alpha(opacity), clip);
             }
+        }
+        self.background_layers(style, &rect, opacity, clip, shape);
+        if tag == "img" {
+            self.replaced_image(id, style, &rect, opacity, clip, shape);
         }
         let widths = border_widths(style).map(|w| w * scale);
         if widths.iter().any(|w| *w > 0.0) {
@@ -754,6 +763,589 @@ impl Painter<'_> {
     }
 }
 
+
+// ---- backgrounds ------------------------------------------------------------
+
+/// One layer of `background-image`.
+#[derive(Debug, Clone, PartialEq)]
+enum Layer {
+    Url(String),
+    Gradient(Gradient),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Gradient {
+    radial: bool,
+    /// Direction of a linear gradient, CSS degrees: 0 is up, 90 right.
+    angle: f64,
+    /// Colours and where they sit, 0 to 1 along the gradient.
+    stops: Vec<(Rgba, f64)>,
+}
+
+/// What `background-*` says, for the first layer's size, position and
+/// repeat; further layers reuse them.
+#[derive(Debug, Default)]
+struct Background {
+    layers: Vec<Layer>,
+    size: String,
+    position: String,
+    repeat: String,
+}
+
+/// Splits on `sep` outside parentheses.
+fn split_outside_parens(value: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0i32, 0);
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c == sep && depth == 0 => {
+                parts.push(value[start..i].trim());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim());
+    parts.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// Whitespace-separated tokens outside parentheses.
+fn tokens(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, None);
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c.is_whitespace() && depth == 0 => {
+                if let Some(s) = start.take() {
+                    out.push(&value[s..i]);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        out.push(&value[s..]);
+    }
+    out
+}
+
+fn is_image_token(token: &str) -> bool {
+    token.starts_with("url(") || token.contains("gradient(")
+}
+
+fn parse_layer(token: &str, current: Rgba) -> Option<Layer> {
+    if let Some(inner) = token.strip_prefix("url(").and_then(|t| t.strip_suffix(')')) {
+        let url = inner.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        return (!url.is_empty()).then_some(Layer::Url(url));
+    }
+    let (name, args) = token.split_once('(')?;
+    let args = args.strip_suffix(')')?;
+    let radial = name.contains("radial");
+    if !radial && !name.contains("linear") {
+        return None;
+    }
+    let mut parts = split_outside_parens(args, ',');
+    let mut angle = 180.0;
+    if let Some(first) = parts.first().copied() {
+        if color::parse(tokens(first).first().copied().unwrap_or(""), current).is_none() {
+            parts.remove(0);
+            if !radial {
+                angle = gradient_angle(first)?;
+            }
+        }
+    }
+    let mut stops: Vec<(Rgba, Option<f64>)> = Vec::new();
+    for part in parts {
+        let words = tokens(part);
+        let color = color::parse(words.first()?, current)?;
+        let positions: Vec<f64> =
+            words[1..].iter().filter_map(|w| w.strip_suffix('%').and_then(|p| p.parse::<f64>().ok())).map(|p| p / 100.0).collect();
+        if positions.is_empty() {
+            stops.push((color, None));
+        }
+        for p in positions {
+            stops.push((color, Some(p)));
+        }
+    }
+    if stops.is_empty() {
+        return None;
+    }
+    // Unplaced stops: the ends at 0 and 1, the rest spread evenly between
+    // their placed neighbours.
+    let n = stops.len();
+    if stops[0].1.is_none() {
+        stops[0].1 = Some(0.0);
+    }
+    if stops[n - 1].1.is_none() {
+        stops[n - 1].1 = Some(1.0);
+    }
+    let mut i = 0;
+    while i < n {
+        if stops[i].1.is_some() {
+            i += 1;
+            continue;
+        }
+        let before = stops[i - 1].1.unwrap_or(0.0);
+        let j = (i..n).find(|k| stops[*k].1.is_some()).unwrap_or(n - 1);
+        let after = stops[j].1.unwrap_or(1.0);
+        for (k, stop) in stops.iter_mut().enumerate().take(j).skip(i) {
+            stop.1 = Some(before + (after - before) * (k - i + 1) as f64 / (j - i + 1) as f64);
+        }
+        i = j;
+    }
+    let mut placed: Vec<(Rgba, f64)> = Vec::new();
+    for (color, at) in stops {
+        let at = at.unwrap_or(0.0);
+        // A stop before the previous one moves up to it.
+        let at = placed.last().map(|(_, prev)| at.max(*prev)).unwrap_or(at);
+        placed.push((color, at));
+    }
+    Some(Layer::Gradient(Gradient { radial, angle, stops: placed }))
+}
+
+/// `45deg`, `0.25turn`, `to right`, `to top left`.
+fn gradient_angle(value: &str) -> Option<f64> {
+    let value = value.trim();
+    if let Some(side) = value.strip_prefix("to ") {
+        let has = |w: &str| side.split_whitespace().any(|s| s == w);
+        let x = if has("right") { 1.0 } else if has("left") { -1.0 } else { 0.0 };
+        let y = if has("top") { 1.0 } else if has("bottom") { -1.0 } else { 0.0 };
+        if x == 0.0 && y == 0.0 {
+            return None;
+        }
+        return Some(f64::atan2(x, y).to_degrees());
+    }
+    let number = |suffix: &str| value.strip_suffix(suffix).and_then(|n| n.trim().parse::<f64>().ok());
+    number("deg")
+        .or_else(|| number("turn").map(|t| t * 360.0))
+        .or_else(|| number("grad").map(|g| g * 0.9))
+        .or_else(|| number("rad").map(f64::to_degrees))
+        .or_else(|| (value == "0").then_some(0.0))
+}
+
+fn background(style: &ComputedStyle) -> Background {
+    let current = text_color(style);
+    let longhand = |name: &str| Some(style.get(name)).filter(|v| !v.is_empty() && *v != "initial").map(str::to_string);
+    let mut out = Background::default();
+    // The shorthand's layers, size, position and repeat; longhands set on
+    // their own (an inline `background-image`, say) override its parts.
+    for (n, layer) in split_outside_parens(style.get("background"), ',').into_iter().enumerate() {
+        let words = tokens(layer);
+        if let Some(found) = words.iter().find(|w| is_image_token(w)).and_then(|w| parse_layer(w, current)) {
+            out.layers.push(found);
+        }
+        if n > 0 {
+            continue;
+        }
+        // The first layer's size (after a slash), repeat and position.
+        let mut position = Vec::new();
+        let mut after_slash = false;
+        for word in words {
+            if word == "/" {
+                after_slash = true;
+            } else if let Some(size) = word.strip_prefix('/') {
+                after_slash = true;
+                if !size.is_empty() {
+                    out.size = size.to_string();
+                }
+            } else if after_slash {
+                out.size = if out.size.is_empty() { word.to_string() } else { format!("{} {word}", out.size) };
+            } else if word.contains("repeat") || matches!(word, "space" | "round") {
+                out.repeat = word.to_string();
+            } else if matches!(word, "left" | "right" | "top" | "bottom" | "center")
+                || word.ends_with('%')
+                || word.ends_with("px")
+                || word == "0"
+            {
+                position.push(word);
+            }
+        }
+        out.position = position.join(" ");
+    }
+    if let Some(image) = longhand("background-image") {
+        out.layers = if image == "none" {
+            Vec::new()
+        } else {
+            split_outside_parens(&image, ',').into_iter().filter_map(|l| parse_layer(l, current)).collect()
+        };
+    }
+    if let Some(size) = longhand("background-size") {
+        out.size = size;
+    }
+    if let Some(position) = longhand("background-position") {
+        out.position = position;
+    }
+    if let Some(repeat) = longhand("background-repeat") {
+        out.repeat = repeat;
+    }
+    out
+}
+
+/// The background images of every element with a box, against the
+/// document's URL. Stylesheets' `url()`s were made absolute when they
+/// loaded, so this only matters for inline styles.
+pub fn background_urls(doc: &Document) -> Vec<String> {
+    let styles = style::document_styles(doc);
+    let layout = layout::document_layout(doc);
+    let base = url::Url::parse(doc.url()).ok();
+    let mut urls = Vec::new();
+    for id in layout.paint_order() {
+        let Some(style) = styles.get(*id) else { continue };
+        if !style.get("background").contains("url(") && !style.get("background-image").contains("url(") {
+            continue;
+        }
+        for layer in background(style).layers {
+            if let Layer::Url(url) = layer {
+                let absolute = match &base {
+                    Some(base) => base.join(&url).ok().map(String::from),
+                    None => url::Url::parse(&url).ok().map(String::from),
+                };
+                urls.extend(absolute);
+            }
+        }
+    }
+    urls
+}
+
+/// A length in a `background-size` or `-position`, against `basis` for
+/// percentages; `None` for `auto` and keywords.
+fn bg_length(value: &str, basis: f64, style: &ComputedStyle) -> Option<f64> {
+    style::length_px(value, style.font_size(), 16.0, basis)
+}
+
+/// Where a `size` image goes in an `area` for one axis's position words:
+/// a keyword with an optional offset, or a length or percentage.
+fn place(words: &[&str], area: f64, size: f64, style: &ComputedStyle, start_word: &str, end_word: &str) -> f64 {
+    let free = area - size;
+    match words {
+        [] => free / 2.0,
+        [w] if *w == start_word => 0.0,
+        [w] if *w == end_word => free,
+        [w] if *w == "center" => free / 2.0,
+        [w] => match w.strip_suffix('%') {
+            Some(p) => p.parse::<f64>().map(|p| free * p / 100.0).unwrap_or(free / 2.0),
+            None => bg_length(w, area, style).unwrap_or(free / 2.0),
+        },
+        [edge, offset, ..] => {
+            let offset = match offset.strip_suffix('%') {
+                Some(p) => p.parse::<f64>().map(|p| area * p / 100.0).unwrap_or(0.0),
+                None => bg_length(offset, area, style).unwrap_or(0.0),
+            };
+            if *edge == end_word { free - offset } else { offset }
+        }
+    }
+}
+
+/// Splits `background-position` into its horizontal and vertical words.
+fn position_axes(position: &str) -> (Vec<&str>, Vec<&str>) {
+    let words: Vec<&str> = position.split_whitespace().collect();
+    let keyword = |w: &str| matches!(w, "left" | "right" | "top" | "bottom" | "center");
+    if words.iter().all(|w| !keyword(w)) {
+        // Lengths only: x then y.
+        return (words.first().map(|w| vec![*w]).unwrap_or_default(), words.get(1).map(|w| vec![*w]).unwrap_or_default());
+    }
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    let mut centres = Vec::new();
+    while i < words.len() {
+        let word = words[i];
+        let offset = words.get(i + 1).filter(|w| !keyword(w)).copied();
+        let group: Vec<&str> = std::iter::once(word).chain(offset).collect();
+        i += group.len();
+        match word {
+            "left" | "right" => x = group,
+            "top" | "bottom" => y = group,
+            "center" => centres.push(group),
+            // A bare length: x when first, else y.
+            _ if x.is_empty() && y.is_empty() => x = group,
+            _ => y = group,
+        }
+    }
+    for centre in centres {
+        if x.is_empty() {
+            x = centre;
+        } else if y.is_empty() {
+            y = centre;
+        }
+    }
+    (x, y)
+}
+
+impl Gradient {
+    fn color_at(&self, t: f64) -> Rgba {
+        let t = t.clamp(0.0, 1.0);
+        let first = self.stops[0];
+        if t <= first.1 {
+            return first.0;
+        }
+        for pair in self.stops.windows(2) {
+            let ((a, at), (b, bt)) = (pair[0], pair[1]);
+            if t <= bt {
+                let f = if bt > at { (t - at) / (bt - at) } else { 1.0 };
+                let mix = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * f).round() as u8;
+                return Rgba { r: mix(a.r, b.r), g: mix(a.g, b.g), b: mix(a.b, b.b), a: a.a + (b.a - a.a) * f };
+            }
+        }
+        self.stops[self.stops.len() - 1].0
+    }
+}
+
+
+
+// ---- images -----------------------------------------------------------------
+
+/// A shape to stay inside: a box with rounded corners.
+#[derive(Clone, Copy)]
+struct Shape {
+    area: Area,
+    radius: f64,
+}
+
+impl Shape {
+    fn coverage(&self, px: f64, py: f64) -> f64 {
+        coverage(self.area.distance(px, py, self.radius))
+    }
+}
+
+impl Canvas {
+    /// `image` stretched over `dest`, within `clip` and `shape`.
+    fn image(&mut self, image: &Image, dest: Area, opacity: f64, clip: Area, shape: Shape) {
+        let visible = dest.intersect(clip).intersect(shape.area);
+        if visible.is_empty() || image.width == 0 || image.height == 0 {
+            return;
+        }
+        let (sx, sy) = (image.width as f64 / dest.width(), image.height as f64 / dest.height());
+        // Shrinking by more than half: average a few samples per pixel, so
+        // detail does not alias into noise.
+        let samples = sx.max(sy).ceil().clamp(1.0, 4.0) as usize;
+        let (x0, y0, x1, y1) = visible.pixels(self);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let amount = clip_coverage(clip, px, py) * shape.coverage(px, py);
+                if amount <= 0.0 {
+                    continue;
+                }
+                let mut sum = [0.0f64; 4];
+                for j in 0..samples {
+                    for i in 0..samples {
+                        let fx = px - 0.5 + (i as f64 + 0.5) / samples as f64;
+                        let fy = py - 0.5 + (j as f64 + 0.5) / samples as f64;
+                        let p = sample(image, (fx - dest.x0) * sx - 0.5, (fy - dest.y0) * sy - 0.5);
+                        for k in 0..4 {
+                            sum[k] += p[k];
+                        }
+                    }
+                }
+                let n = (samples * samples) as f64;
+                let alpha = sum[3] / n;
+                if alpha <= 0.0 {
+                    continue;
+                }
+                // Back from premultiplied.
+                let color = Rgba {
+                    r: (sum[0] / n / alpha).round().clamp(0.0, 255.0) as u8,
+                    g: (sum[1] / n / alpha).round().clamp(0.0, 255.0) as u8,
+                    b: (sum[2] / n / alpha).round().clamp(0.0, 255.0) as u8,
+                    a: alpha * opacity,
+                };
+                self.blend(x, y, color, amount);
+            }
+        }
+    }
+
+    /// A gradient over `area`, within `clip` and `shape`.
+    fn gradient_in(&mut self, gradient: &Gradient, area: Area, opacity: f64, clip: Area, shape: Shape) {
+        let visible = area.intersect(clip).intersect(shape.area);
+        if visible.is_empty() {
+            return;
+        }
+        let (w, h) = (area.width(), area.height());
+        let (cx, cy) = (area.x0 + w / 2.0, area.y0 + h / 2.0);
+        let radians = gradient.angle.to_radians();
+        let (dx, dy) = (radians.sin(), -radians.cos());
+        let length = (w * dx).abs() + (h * dy).abs();
+        let (rx, ry) = (w / 2.0 * std::f64::consts::SQRT_2, h / 2.0 * std::f64::consts::SQRT_2);
+        let (x0, y0, x1, y1) = visible.pixels(self);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let amount = clip_coverage(clip, px, py) * shape.coverage(px, py);
+                if amount <= 0.0 {
+                    continue;
+                }
+                let (ox, oy) = (px - cx, py - cy);
+                let t = if gradient.radial {
+                    ((ox / rx.max(1e-9)).powi(2) + (oy / ry.max(1e-9)).powi(2)).sqrt()
+                } else {
+                    (ox * dx + oy * dy) / length.max(1e-9) + 0.5
+                };
+                self.blend(x, y, gradient.color_at(t).with_alpha(opacity), amount);
+            }
+        }
+    }
+}
+
+/// Premultiplied RGBA at a fractional source position, bilinearly, with
+/// edges clamped.
+fn sample(image: &Image, x: f64, y: f64) -> [f64; 4] {
+    let (w, h) = (image.width as i64, image.height as i64);
+    let (fx, fy) = (x.floor(), y.floor());
+    let (tx, ty) = (x - fx, y - fy);
+    let at = |ix: i64, iy: i64| {
+        let p = image.pixel(ix.clamp(0, w - 1) as u32, iy.clamp(0, h - 1) as u32);
+        let a = p[3] as f64 / 255.0;
+        [p[0] as f64 * a, p[1] as f64 * a, p[2] as f64 * a, a]
+    };
+    let (x0, y0) = (fx as i64, fy as i64);
+    let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+    let mut out = [0.0; 4];
+    for k in 0..4 {
+        let top = a[k] + (b[k] - a[k]) * tx;
+        let bottom = c[k] + (d[k] - c[k]) * tx;
+        out[k] = top + (bottom - top) * ty;
+    }
+    out
+}
+
+impl Painter<'_> {
+    /// An image the page refers to, if it has arrived. Screenshots waited
+    /// for the page's images before painting, so this does not wait.
+    fn image_for(&self, url: &str) -> Option<Arc<Image>> {
+        let absolute = match url::Url::parse(self.doc.url()) {
+            Ok(base) => base.join(url).ok()?.to_string(),
+            Err(_) => url.to_string(),
+        };
+        self.doc.images()?.pixels(&absolute, Instant::now())
+    }
+
+    /// The background's image and gradient layers, last listed painted first.
+    fn background_layers(&mut self, style: &ComputedStyle, rect: &Rect, opacity: f64, clip: Area, shape: Shape) {
+        let bg = background(style);
+        if bg.layers.is_empty() {
+            return;
+        }
+        let border = border_widths(style);
+        // Positioned within the padding box; painted over the border box.
+        let origin = Rect {
+            x: rect.x + border[3],
+            y: rect.y + border[0],
+            width: (rect.width - border[1] - border[3]).max(0.0),
+            height: (rect.height - border[0] - border[2]).max(0.0),
+        };
+        let origin_area = self.area(&origin);
+        for layer in bg.layers.iter().rev() {
+            match layer {
+                Layer::Gradient(gradient) => self.canvas.gradient_in(gradient, origin_area, opacity, clip, shape),
+                Layer::Url(url) => {
+                    let Some(image) = self.image_for(url) else { continue };
+                    let (iw, ih) = (image.width as f64, image.height as f64);
+                    let (ow, oh) = (origin.width, origin.height);
+                    let size_words: Vec<&str> = bg.size.split_whitespace().collect();
+                    let (tw, th) = match size_words.as_slice() {
+                        ["cover"] => {
+                            let s = (ow / iw).max(oh / ih);
+                            (iw * s, ih * s)
+                        }
+                        ["contain"] => {
+                            let s = (ow / iw).min(oh / ih);
+                            (iw * s, ih * s)
+                        }
+                        words => {
+                            let w = words.first().and_then(|w| bg_length(w, ow, style));
+                            let h = words.get(1).and_then(|h| bg_length(h, oh, style));
+                            match (w, h) {
+                                (Some(w), Some(h)) => (w, h),
+                                (Some(w), None) => (w, w * ih / iw),
+                                (None, Some(h)) => (h * iw / ih, h),
+                                (None, None) => (iw, ih),
+                            }
+                        }
+                    };
+                    if tw <= 0.0 || th <= 0.0 {
+                        continue;
+                    }
+                    let (xs, ys) = position_axes(&bg.position);
+                    let x = origin.x + place(&xs, ow, tw, style, "left", "right");
+                    let y = origin.y + place(&ys, oh, th, style, "top", "bottom");
+                    let repeat: Vec<&str> = bg.repeat.split_whitespace().collect();
+                    let (repeat_x, repeat_y) = match repeat.as_slice() {
+                        ["no-repeat"] => (false, false),
+                        ["repeat-x"] => (true, false),
+                        ["repeat-y"] => (false, true),
+                        [x, y] => (*x != "no-repeat", *y != "no-repeat"),
+                        _ => (true, true),
+                    };
+                    // Tiles start far enough back to cover the box.
+                    let span = |start: f64, size: f64, from: f64, to: f64, repeat: bool| -> Vec<f64> {
+                        if !repeat {
+                            return vec![start];
+                        }
+                        let mut first = start - ((start - from) / size).ceil() * size;
+                        let mut out = Vec::new();
+                        while first < to && out.len() < 10_000 {
+                            out.push(first);
+                            first += size;
+                        }
+                        out
+                    };
+                    let columns = span(x, tw, rect.x, rect.x + rect.width, repeat_x);
+                    let rows = span(y, th, rect.y, rect.y + rect.height, repeat_y);
+                    for ty in &rows {
+                        for tx in &columns {
+                            let dest = self.area(&Rect { x: *tx, y: *ty, width: tw, height: th });
+                            self.canvas.image(&image, dest, opacity, clip, shape);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An `<img>`'s picture in its content box, as `object-fit` says.
+    fn replaced_image(&mut self, id: NodeId, style: &ComputedStyle, rect: &Rect, opacity: f64, clip: Area, shape: Shape) {
+        let Some(url) = self.doc.image_url(id) else { return };
+        let Some(image) = self.doc.images().and_then(|store| store.pixels(&url, Instant::now())) else { return };
+        let border = border_widths(style);
+        let pad = padding(style, rect.width);
+        let content = Rect {
+            x: rect.x + border[3] + pad[3],
+            y: rect.y + border[0] + pad[0],
+            width: (rect.width - border[1] - border[3] - pad[1] - pad[3]).max(0.0),
+            height: (rect.height - border[0] - border[2] - pad[0] - pad[2]).max(0.0),
+        };
+        let (iw, ih) = (image.width as f64, image.height as f64);
+        let (w, h) = match style.get("object-fit") {
+            "contain" => {
+                let s = (content.width / iw).min(content.height / ih);
+                (iw * s, ih * s)
+            }
+            "cover" => {
+                let s = (content.width / iw).max(content.height / ih);
+                (iw * s, ih * s)
+            }
+            "none" => (iw, ih),
+            "scale-down" => {
+                let s = (content.width / iw).min(content.height / ih).min(1.0);
+                (iw * s, ih * s)
+            }
+            _ => (content.width, content.height),
+        };
+        let dest = Rect { x: content.x + (content.width - w) / 2.0, y: content.y + (content.height - h) / 2.0, width: w, height: h };
+        let inside = clip.intersect(self.area(&content));
+        let dest = self.area(&dest);
+        self.canvas.image(&image, dest, opacity, inside, shape);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,6 +1403,78 @@ mod tests {
         let outside = dark(rect.width.ceil() as u32 + 2, 200, 0, 100) + dark(0, 200, rect.height.ceil() as u32 + 2, 100);
         assert!(inside > 100, "{inside} dark pixels in the text box");
         assert_eq!(outside, 0);
+    }
+
+    /// A data URL of a 2x2 PNG: red, green / blue, white.
+    fn quadrants() -> String {
+        use base64::Engine as _;
+        let pixels = image::RgbaImage::from_raw(2, 2, vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]).unwrap();
+        let mut png = Vec::new();
+        pixels.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png))
+    }
+
+    /// [`render`], with an image store, after waiting for the page's images
+    /// as a screenshot does.
+    fn render_with_images(html: &str) -> (Document, Canvas) {
+        let mut doc = parse_html(html);
+        doc.set_viewport((200.0, 100.0));
+        let client = crate::fetch::Client::new(std::sync::Arc::new(std::sync::Mutex::new(crate::cookies::CookieJar::new())));
+        let store = Arc::new(crate::images::ImageStore::new(client));
+        doc.set_images(Arc::clone(&store));
+        let mut urls: Vec<String> = doc.descendants(doc.document_id()).filter(|id| doc.is_tag(*id, "img")).filter_map(|id| doc.image_url(id)).collect();
+        urls.extend(background_urls(&doc));
+        store.wait_all(&urls);
+        let region = Region { x: 0.0, y: 0.0, width: 200.0, height: 100.0, scale: 1.0 };
+        let canvas = paint(&doc, region, &|t| t.to_string());
+        (doc, canvas)
+    }
+
+    #[test]
+    fn gradients_run_from_stop_to_stop() {
+        let (_, canvas) = render(
+            "<body style='margin:0'><div style='width:100px;height:10px;background:linear-gradient(to right, #000, #fff)'></div>\
+             <div style='width:100px;height:10px;background-image:linear-gradient(90deg, red 50%, blue 50%)'></div></body>",
+        );
+        assert!(canvas.pixel(2, 5)[0] < 10);
+        assert!(canvas.pixel(97, 5)[0] > 245);
+        assert!(canvas.pixel(50, 5)[0].abs_diff(128) < 4, "{:?}", canvas.pixel(50, 5));
+        assert_eq!(canvas.pixel(25, 15), [255, 0, 0]);
+        assert_eq!(canvas.pixel(75, 15), [0, 0, 255]);
+    }
+
+    #[test]
+    fn background_images_are_sized_placed_and_not_repeated() {
+        let html = format!(
+            "<body style='margin:0;background:#888'>\
+             <div style='width:60px;height:60px;background:url({}) no-repeat 10px 20px;background-size:20px 20px'></div></body>",
+            quadrants()
+        );
+        let (_, canvas) = render_with_images(&html);
+        // Corners of the tile: scaled up, the quadrants blend towards each
+        // other in the middle, as Chrome's smoothing does too.
+        assert_eq!(canvas.pixel(11, 21), [255, 0, 0], "top-left quadrant");
+        assert_eq!(canvas.pixel(28, 21), [0, 255, 0]);
+        assert_eq!(canvas.pixel(11, 38), [0, 0, 255]);
+        assert_eq!(canvas.pixel(28, 38), [255, 255, 255]);
+        assert_eq!(canvas.pixel(5, 5), [0x88, 0x88, 0x88], "outside the one tile");
+        assert_eq!(canvas.pixel(45, 25), [0x88, 0x88, 0x88]);
+    }
+
+    #[test]
+    fn images_have_their_own_size_and_keep_their_ratio() {
+        let url = quadrants();
+        let html = format!(
+            "<body style='margin:0'><img id=a src='{url}' style='position:absolute;left:0;top:0'>\
+             <img id=b src='{url}' width=40 style='position:absolute;left:50px;top:0'></body>"
+        );
+        let (doc, canvas) = render_with_images(&html);
+        let layout = layout::document_layout(&doc);
+        let rect = |id: &str| layout.rect(doc.find_id(doc.document_id(), id).unwrap()).unwrap();
+        assert_eq!((rect("a").width, rect("a").height), (2.0, 2.0));
+        assert_eq!((rect("b").width, rect("b").height), (40.0, 40.0));
+        assert_eq!(canvas.pixel(55, 5), [255, 0, 0]);
+        assert_eq!(canvas.pixel(85, 35), [255, 255, 255]);
     }
 
     #[test]

@@ -8,6 +8,7 @@ function setAttr(el, name, value) {
   api.setAttr(id, name, String(value));
   queueRecord('attributes', id, { attributeName: name, oldValue });
   if (name === 'src' && api.tagName(id) === 'script') prepareScript(id);
+  if ((name === 'src' || name === 'srcset') && api.tagName(id) === 'img') startImage(id);
 }
 
 function removeAttr(el, name) {
@@ -17,6 +18,7 @@ function removeAttr(el, name) {
   const oldValue = api.attr(id, name) ?? null;
   api.removeAttr(id, name);
   queueRecord('attributes', id, { attributeName: name, oldValue });
+  if ((name === 'src' || name === 'srcset') && api.tagName(id) === 'img') startImage(id);
 }
 
 class Attr {

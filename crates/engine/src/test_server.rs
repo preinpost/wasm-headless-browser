@@ -51,7 +51,7 @@ pub fn read_request(stream: &mut TcpStream) -> String {
 /// of them has been asked for. A client that fetches them one at a time asks
 /// for the first and waits; after three seconds it gets a 503 instead. That
 /// is how a test tells parallel fetching from sequential.
-pub fn serve_together(pages: Vec<(&'static str, &'static str, String)>, together: Vec<&'static str>) -> String {
+pub fn serve_together(pages: Vec<(&'static str, &'static str, Vec<u8>)>, together: Vec<&'static str>) -> String {
     use std::collections::HashSet;
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
@@ -82,14 +82,17 @@ pub fn serve_together(pages: Vec<(&'static str, &'static str, String)>, together
                 }
                 let page = pages.iter().find(|(p, _, _)| *p == path);
                 let response = match page {
-                    Some((_, kind, body)) if all_seen => format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    ),
-                    Some(_) => "HTTP/1.1 503 Alone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
-                    None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    Some((_, kind, body)) if all_seen => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        [head.into_bytes(), body.clone()].concat()
+                    }
+                    Some(_) => b"HTTP/1.1 503 Alone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                    None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
                 };
-                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&response);
             });
         }
     });

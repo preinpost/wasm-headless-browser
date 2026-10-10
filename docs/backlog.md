@@ -5,7 +5,7 @@
 
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
-이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5). 다음 후보는 §0.4.
+이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -43,7 +43,7 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 174, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 181, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 40 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
@@ -54,11 +54,11 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 ### 0.4 다음 후보
 
-- **이미지.** 스크린샷의 가장 큰 빈칸. `<img>`와 `background-image`를 가져오지도
-  디코딩하지도 않는다. 참조 사이트는 화면 전체에 배경 이미지를 깔고 그 위에 흰
-  글자를 쓰므로 왼쪽 절반이 비어 보인다. PNG는 miniz_oxide로 풀 수 있고 JPEG는
-  순수 Rust 디코더가 필요하다. 스크린샷을 찍을 때만 가져오면 로딩 시간은 그대로다.
-- **그라디언트.** `linear-gradient`도 칠하지 않는다.
+- **참조 사이트 로고.** `div.logo`의 `<img>`가 우리 엔진에서는 `src` 없이 남는다.
+  Chrome에서는 보인다. 로고 주소를 정하는 스크립트 경로를 `probe_a_url`로 찾아야 한다.
+- **id로 된 전역 이름.** `<img id=i>`를 `window.i`나 `i`로 부를 수 없다(named access).
+  오래된 페이지가 쓴다.
+- **그림자, SVG.** `box-shadow`와 SVG 이미지(`<img src=*.svg>`, 인라인 `<svg>`)는 그리지 않는다.
 - **요청 가로채기 (M3.3).** agent-browser `network route`. `Fetch.requestPaused`는
   엔진이 요청 도중 클라이언트의 답을 기다려야 해서 구조가 바뀐다(§4.4).
 - **콘솔 (`Runtime.consoleAPICalled`).** 지금은 `probe_a_url`로만 본다.
@@ -105,7 +105,8 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `css.rs`, `style.rs` | 시트 파싱, 캐스케이드, 계산 스타일 (`document_styles`) |
 | `layout.rs` | taffy 위의 배치, 칠하는 순서, 히트 테스트 (`document_layout`) |
 | `font.rs` | 내장 글꼴(`fonts/NotoSansKR-subset.otf`). 레이아웃의 글자 폭과 그리기의 글리프가 여기서 나온다 |
-| `paint.rs`, `color.rs`, `png.rs` | 스크린샷: 레이아웃을 칠하고 PNG로 |
+| `paint.rs`, `color.rs`, `png.rs` | 스크린샷: 레이아웃을 칠하고 PNG로. 배경 이미지와 그라디언트 해석도 `paint.rs` |
+| `images.rs` | 탭의 이미지 저장소: 가져오기, 크기, 디코딩(PNG·JPEG·GIF·WebP), 기다리기 |
 | `ax.rs` | 접근성 트리 |
 | `js.rs` | `ScriptHost`: QuickJS를 전용 스레드(32MB 스택)에 가두고 채널로 부른다. 가상 시계 작업 큐, CDP용 평가 |
 | `bindings.rs` | JS에 주는 원시 함수(`__dom`)와 `PRELUDE` 조립 |
@@ -141,7 +142,8 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | 호스트 페이지에서 안으로 들어오는 경로(E3)는 필요 없다. 설령 되더라도 HTTP 전용이라 CDP의 WebSocket 업그레이드는 지나가지 못한다 | [harness/README.md](../harness/README.md) |
 | 브라우저 샌드박스에서 외부 TCP·HTTPS가 된다. WISP 릴레이를 쓴다 (E4·E5) | 이 문서의 §3 |
 | QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다. 엔진에서는 `full-wasi`를 쓸 수 없다 (§6) | [docs/quickjs.md](quickjs.md) |
-| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 자격증명 무렵 4.1MB, 글꼴과 래스터라이저까지 5.1MB | [docs/wasix.md](wasix.md), 커밋 기록 |
+| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 글꼴과 래스터라이저까지 4.7MB, 이미지 디코더까지 5.2MB. 앞의 몇 개는 빌드 스크립트 표시값이라 실제보다 클 수 있다 | `ls -l`, 커밋 기록 |
+| 참조 사이트 배경은 인라인 `background-image`(`/api/login-step`, 1920×1080 JPEG 766KB)이고, 크기·위치는 `.login-background`의 `background: ... no-repeat top; background-size: 1920px 1080px`에서 온다. `cover`를 쓰는 규칙은 `min-height:1081px` 미디어 쿼리 안이라 800×600에서는 안 맞는다 | 2026-10-10 Chrome과 비교 |
 | 참조 사이트는 `Noto Sans KR, ...`으로 Noto Sans KR 웹 글꼴을 쓴다. 왼쪽 절반은 화면 전체에 깔린 배경 이미지와 그 위의 흰 글자이고, 로그인 상자는 그 위의 80% 흰색이다 | 2026-10-09 CSS와 Chrome 스크린샷 |
 | 참조 사이트 로그인 상자는 오른쪽에서 미끄러져 들어온다. Chrome에서 열자마자 재면 x가 수십 px 다르다 | 같은 날 |
 | WASIX에서 rustls + ring이 TLS 1.3으로 동작한다. 참조 사이트 인증서는 공개 루트로 검증된다 | [docs/wasix.md](wasix.md) |
@@ -286,7 +288,20 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       다른 글꼴(굵게는 번지게, 기울임은 똑바로). 비밀: 비밀번호 칸은 글자 수만큼 점이고,
       다른 글자는 그리기 전에 가린다. 레이아웃은 실제 값으로 쟀으므로 자리표시자가
       더 길면 그만큼 줄 폭을 늘려 줄을 나눈다(줄을 먼저 나누고 가리면 줄에 걸친
-      비밀이 조각으로 샌다). WASIX 모듈은 4.1MB에서 5.1MB가 됐다.
+      비밀이 조각으로 샌다). WASIX 모듈은 4.7MB가 됐다(이때 빌드 스크립트가 5.1M으로
+      표시했는데 실제 바이트 수와 다르다. 크기는 `ls -l`로 잰다).
+      이어서 이미지(`images.rs`): `image` 크레이트로 PNG·JPEG·GIF(첫 장)·WebP를
+      디코딩한다. 파서가 찾은 `<img>`는 파싱 직후, 스크립트가 넣거나 `src`를 바꾼 것은
+      그 순간 요청하고, 태스크에서 기다려 `load`/`error`를 쏜다. 그래서 window `load`가
+      이미지 뒤에 오고 `naturalWidth`·`complete`·`decode()`가 실제 값이다. 레이아웃은
+      기다리지 않고 도착한 이미지의 고유 크기를 쓴다(이미지 세대가 레이아웃 캐시 키에
+      들어간다). 배경 이미지는 로드 끝에 요청하고 스크린샷이 최대 5초 기다린다. 박스가
+      있는 요소의 배경만 받는다. 그리는 것: `<img>`와 `object-fit`, `background-image`의
+      크기(`cover`·`contain`·길이)·위치(3·4값 문법 포함)·반복, `linear-gradient`(각도·
+      `to`·정지점), `radial-gradient`(farthest-corner 타원 근사), 둥근 모서리 따라 자르기.
+      스타일시트의 `url()`은 시트 주소 기준으로 절대화해서 저장한다. 참조 사이트 로그인
+      화면이 Chrome과 거의 같게 나온다(배경 사진, 그 위 흰 글자, 반투명 로그인 상자).
+      로드 시간은 그대로(약 2.8초). WASIX 모듈 4.7MB → 5.2MB(5,188,554바이트).
 - [ ] M1.6 실제 사이트로 다시 측정한다. 참조 사이트 로그인 화면은 레이아웃까지
       Chrome과 비교했다(§2). 로그인 뒤 화면과 CDP 표면 재캡처는 아직이다.
 - [x] M1.7 `browser` 바이너리에 `--engine fake|html` 플래그를 넣었다.
@@ -495,6 +510,11 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
   headless shell을 따로 띄우므로 사용자의 Chrome 프로필을 건드리지 않는다. SPA는
   `WAIT_FOR=선택자`를 주고, 애니메이션이 끝나도록 `SETTLE_MS`(기본 2.5초)를 기다린다.
   이걸 안 기다리면 참조 사이트 로그인 상자가 들어오는 도중을 재서 46px 다르게 나온다.
+- **배경은 축약 속성과 longhand를 함께 읽는다.** 인라인 `background-image`만 있고
+  위치·반복은 시트의 `background` 축약 속성에 있는 경우가 흔하다(참조 사이트). 한쪽만
+  읽으면 위치가 가운데로, 반복이 켜진 채로 그려진다.
+- **레이아웃은 이미지를 기다리지 않는다.** 스크립트 도중의 `getBoundingClientRect`가
+  다운로드를 기다리면 로드가 느려진다. 기다리는 곳은 이미지의 `load` 태스크와 스크린샷뿐이다.
 - **글꼴을 바꾸면 레이아웃이 바뀐다.** 글자 폭이 `font.rs`에서 나오기 때문이다.
   `scripts/make-font.sh`로 다시 만든 뒤에는 `compare-layout.sh`로 확인한다.
 - **Wasmer에서는 게스트의 stdin이 늘 터미널로 보인다.** 파이프로 넣어도 그렇다.

@@ -308,6 +308,8 @@ function nodeInserted(id) {
   for (const script of scripts) prepareScript(script);
   const links = api.tagName(id) === 'link' ? [id] : api.byTag(id, 'link');
   for (const link of links) linkInserted(link);
+  const images = api.tagName(id) === 'img' ? [id] : api.byTag(id, 'img');
+  for (const image of images) startImage(image);
 }
 
 // A selector a method was given, checked as a browser checks it.

@@ -110,6 +110,9 @@ pub struct Document {
     /// Computed styles and the parsed sheets behind them. See `style.rs`.
     pub(crate) style_cache: crate::style::StyleCache,
     pub(crate) layout_cache: crate::layout::LayoutCache,
+    /// The target's images, for intrinsic sizes and painting. `None` for
+    /// documents no target shows, such as `DOMParser`'s.
+    images: Option<std::sync::Arc<crate::images::ImageStore>>,
 }
 
 impl Default for Document {
@@ -131,6 +134,31 @@ impl Document {
             viewport: (800.0, 600.0),
             style_cache: Default::default(),
             layout_cache: Default::default(),
+            images: None,
+        }
+    }
+
+    pub fn images(&self) -> Option<&std::sync::Arc<crate::images::ImageStore>> {
+        self.images.as_ref()
+    }
+
+    pub fn set_images(&mut self, images: std::sync::Arc<crate::images::ImageStore>) {
+        self.images = Some(images);
+        self.touch();
+    }
+
+    /// The URL an `<img>` shows: its `src`, else the first `srcset`
+    /// candidate, against the document's URL.
+    pub fn image_url(&self, id: NodeId) -> Option<String> {
+        let src = self.attr(id, "src").map(str::trim).filter(|s| !s.is_empty());
+        let candidate = src.map(str::to_string).or_else(|| {
+            let srcset = self.attr(id, "srcset")?;
+            srcset.split(',').next()?.split_whitespace().next().map(str::to_string)
+        })?;
+        let base = url::Url::parse(&self.url).ok();
+        match base {
+            Some(base) => base.join(&candidate).ok().map(String::from),
+            None => url::Url::parse(&candidate).ok().map(String::from),
         }
     }
 
