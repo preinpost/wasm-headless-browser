@@ -34,6 +34,11 @@ taffy = { version = "0.14", default-features = false, features = ["std", "taffy_
 # WHATWG URL parsing, for `URL`, `<script src>` and request URLs. Pure Rust.
 url = "2"
 
+# Character encodings, as the WHATWG Encoding standard defines them: page
+# decoding (EUC-KR and the rest) and TextDecoder. Pure Rust; Firefox's. See
+# encoding.rs.
+encoding_rs = "0.8"
+
 # Screenshots: glyph outlines rasterised from the embedded font (CFF included),
 # and deflate for the PNG. Both pure Rust. See paint.rs and font.rs.
 ab_glyph = "0.2"

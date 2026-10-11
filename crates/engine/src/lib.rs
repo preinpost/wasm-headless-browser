@@ -24,6 +24,7 @@ pub mod browser;
 pub mod cookies;
 pub mod css;
 pub mod dom;
+pub mod encoding;
 pub mod fetch;
 pub mod font;
 pub mod images;

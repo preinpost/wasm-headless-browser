@@ -294,27 +294,41 @@ class TextEncoder {
 }
 tagClass(TextEncoder, 'TextEncoder');
 
-// Only UTF-8. Other encodings are refused, as a browser refuses a label it
-// does not know, rather than decoded wrongly.
+// Every encoding the Encoding standard names, by any of its labels. UTF-8
+// is decoded here; the rest by the engine (encoding.rs). Each `decode` call
+// stands alone: with `{ stream: true }`, a character split across two calls
+// is not put back together.
+const decoderState = new WeakMap();
 class TextDecoder {
   constructor(label = 'utf-8', options = {}) {
-    const normal = String(label).trim().toLowerCase();
-    if (!['utf-8', 'utf8', 'unicode-1-1-utf-8'].includes(normal)) {
+    const encoding = api.decoderName(String(label));
+    if (encoding === undefined) {
       throw new RangeError(`Failed to construct 'TextDecoder': The encoding label provided ('${label}') is not supported.`);
     }
-    this.fatal = !!options.fatal;
-    this.ignoreBOM = !!options.ignoreBOM;
+    decoderState.set(this, { encoding, fatal: !!options.fatal, ignoreBOM: !!options.ignoreBOM });
   }
   get encoding() {
-    return 'utf-8';
+    return decoderState.get(this).encoding;
+  }
+  get fatal() {
+    return decoderState.get(this).fatal;
+  }
+  get ignoreBOM() {
+    return decoderState.get(this).ignoreBOM;
   }
   decode(input) {
     if (input === undefined) return '';
     const bytes = bytesOf(input);
     if (!bytes) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': parameter 1 is not of type 'ArrayBuffer'.");
-    const text = utf8Decode(bytes);
-    if (this.fatal && text.includes('\ufffd')) throw new TypeError('The encoded data was not valid.');
-    return !this.ignoreBOM && text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+    const { encoding, fatal, ignoreBOM } = decoderState.get(this);
+    if (encoding === 'utf-8') {
+      const text = utf8Decode(bytes);
+      if (fatal && text.includes('\ufffd')) throw new TypeError('The encoded data was not valid.');
+      return !ignoreBOM && text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+    }
+    const text = api.decodeText(Array.from(bytes), encoding, fatal, ignoreBOM);
+    if (text === undefined) throw new TypeError('The encoded data was not valid.');
+    return text;
   }
 }
 tagClass(TextDecoder, 'TextDecoder');

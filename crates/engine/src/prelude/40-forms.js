@@ -5,6 +5,7 @@
 const interfaces = Object.create(null);
 interfaces.HTMLElement = HTMLElement;
 interfaces.SVGElement = SVGElement;
+interfaces.SVGAnimatedString = SVGAnimatedString;
 
 // An element interface. `bodies` hold its own accessors and methods; they
 // become own properties of the prototype, which React relies on when it

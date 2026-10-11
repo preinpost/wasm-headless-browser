@@ -64,13 +64,13 @@ class Document extends Node {
     return 'CSS1Compat';
   }
   get characterSet() {
-    return 'UTF-8';
+    return api.characterSet();
   }
   get charset() {
-    return 'UTF-8';
+    return api.characterSet();
   }
   get inputEncoding() {
-    return 'UTF-8';
+    return api.characterSet();
   }
   get contentType() {
     return 'text/html';

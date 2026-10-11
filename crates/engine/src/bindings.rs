@@ -102,7 +102,7 @@ pub struct DomState {
     storage: Arc<Mutex<HashMap<String, Vec<(String, String)>>>>,
     /// Requests script started and has not collected yet, by handle. See
     /// `httpStart`.
-    requests: Arc<Mutex<HashMap<u32, (fetch::Pending, String)>>>,
+    requests: Arc<Mutex<HashMap<u32, (fetch::Pending, String, TextDecoding)>>>,
     /// The page's import maps, merged, for resolving module specifiers.
     import_map: Mutex<crate::modules::ImportMap>,
     /// The window's named properties, by id and by name, and the document
@@ -934,20 +934,44 @@ fn http_request(
     fetch::Request { method, url, headers, body: body.into_bytes(), kind }
 }
 
+/// How a response body becomes the text the prelude gets.
+#[derive(Clone, Copy)]
+struct TextDecoding {
+    /// Whether the `Content-Type` charset counts: not for `fetch`, whose
+    /// `text()` is always UTF-8.
+    use_charset: bool,
+    /// Without a charset: the document's encoding for scripts and
+    /// stylesheets, UTF-8 for the rest.
+    fallback: &'static encoding_rs::Encoding,
+}
+
+impl Default for TextDecoding {
+    fn default() -> Self {
+        TextDecoding { use_charset: true, fallback: encoding_rs::UTF_8 }
+    }
+}
+
+fn text_decoding(doc: &Arc<Mutex<Document>>, kind: ResourceType) -> TextDecoding {
+    match kind {
+        ResourceType::Script | ResourceType::Stylesheet => TextDecoding {
+            use_charset: true,
+            fallback: with_doc(doc, |d| d.encoding()).unwrap_or(encoding_rs::UTF_8),
+        },
+        ResourceType::Fetch => TextDecoding { use_charset: false, fallback: encoding_rs::UTF_8 },
+        _ => TextDecoding::default(),
+    }
+}
+
 /// A response as the prelude reads it: `[status, statusText, finalUrl,
 /// rawHeaders, body]`. A status of 0 means the request failed, and
 /// statusText says why.
-fn http_answer(result: Result<fetch::Response, fetch::FetchError>, url: String) -> Vec<String> {
+fn http_answer(result: Result<fetch::Response, fetch::FetchError>, url: String, decoding: TextDecoding) -> Vec<String> {
     match result {
         Ok(response) => {
             let raw_headers = response.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect::<String>();
-            vec![
-                response.status.to_string(),
-                response.reason,
-                response.url,
-                raw_headers,
-                String::from_utf8_lossy(&response.body).into_owned(),
-            ]
+            let content_type = response.header("content-type").filter(|_| decoding.use_charset);
+            let body = crate::encoding::decode_body(&response.body, content_type, decoding.fallback);
+            vec![response.status.to_string(), response.reason, response.url, raw_headers, body]
         }
         Err(e) => vec!["0".into(), e.to_string(), url, String::new(), String::new()],
     }
@@ -989,8 +1013,8 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         let client = state.client.clone();
         install_fn!(ctx, api, "http", move |method: String, url: String, headers: Vec<String>, body: String, kind: String| {
             let request = http_request(&doc, method, url, headers, body, kind);
-            let url = request.url.clone();
-            http_answer(client.send(request), url)
+            let (url, decoding) = (request.url.clone(), text_decoding(&doc, request.kind));
+            http_answer(client.send(request), url, decoding)
         });
     }
     {
@@ -1006,12 +1030,12 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         let next = Arc::new(Mutex::new(0u32));
         install_fn!(ctx, api, "httpStart", move |method: String, url: String, headers: Vec<String>, body: String, kind: String| {
             let request = http_request(&doc, method, url, headers, body, kind);
-            let url = request.url.clone();
+            let (url, decoding) = (request.url.clone(), text_decoding(&doc, request.kind));
             let pending = client.start(request);
             let mut next = next.lock().unwrap_or_else(|p| p.into_inner());
             *next += 1;
             if let Ok(mut requests) = requests.lock() {
-                requests.insert(*next, (pending, url));
+                requests.insert(*next, (pending, url, decoding));
             }
             *next
         });
@@ -1021,8 +1045,8 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         install_fn!(ctx, api, "httpFinish", move |handle: u32| {
             let started = requests.lock().ok().and_then(|mut r| r.remove(&handle));
             match started {
-                Some((pending, url)) => http_answer(pending.wait(), url),
-                None => http_answer(Err(fetch::FetchError::Io("no such request".into())), String::new()),
+                Some((pending, url, decoding)) => http_answer(pending.wait(), url, decoding),
+                None => http_answer(Err(fetch::FetchError::Io("no such request".into())), String::new(), TextDecoding::default()),
             }
         });
     }
@@ -1038,6 +1062,23 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
     }
 
     install_fn!(ctx, api, "resolveUrl", |base: String, relative: String| resolve_url(&base, &relative));
+
+    // Encodings (encoding.rs). TextDecoder's name for a label, or nothing
+    // when it names none it may use; and a decode, nothing when `fatal` and
+    // the bytes are malformed.
+    install_fn!(ctx, api, "decoderName", |label: String| {
+        crate::encoding::for_label(&label).filter(|e| *e != encoding_rs::REPLACEMENT).map(crate::encoding::decoder_name)
+    });
+    install_fn!(ctx, api, "decodeText", |bytes: Vec<u8>, label: String, fatal: bool, ignore_bom: bool| {
+        let encoding = crate::encoding::for_label(&label)?;
+        crate::encoding::decode_text(&bytes, encoding, fatal, ignore_bom)
+    });
+    {
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "characterSet", move || {
+            with_doc(&doc, |d| crate::encoding::document_name(d.encoding()).to_string()).unwrap_or_else(|| "UTF-8".into())
+        });
+    }
     {
         let state = Arc::clone(state);
         install_fn!(ctx, api, "namedItem", move |name: String| state.named_item(&name));

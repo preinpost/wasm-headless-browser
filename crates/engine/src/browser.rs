@@ -23,7 +23,7 @@ use crate::images::ImageStore;
 use crate::screencast::{Format, Screencast};
 use crate::js::{JsValue, ScriptHost};
 use crate::network::ResourceType;
-use crate::parse::{parse_html, parse_html_bytes};
+use crate::parse::parse_html;
 use crate::select;
 
 /// How many times a script-initiated navigation is followed before stopping.
@@ -366,12 +366,17 @@ impl HtmlEngine {
             let mut doc = self.doc();
             match fetched {
                 Ok(response) => {
+                    let content_type = response.header("content-type");
                     if response.is_html() {
-                        *doc = parse_html_bytes(&response.body);
+                        let encoding = crate::encoding::sniff_document(&response.body, content_type);
+                        let (text, _, _) = encoding.decode(&response.body);
+                        *doc = parse_html(&text);
+                        doc.set_encoding(encoding);
                     } else {
                         // Non-HTML is wrapped so the client sees something rather
                         // than an empty document with a misleading title.
-                        let escaped = escape_html(&String::from_utf8_lossy(&response.body));
+                        let text = crate::encoding::decode_body(&response.body, content_type, encoding_rs::UTF_8);
+                        let escaped = escape_html(&text);
                         let label = response.header("content-type").unwrap_or("document");
                         *doc = parse_html(&format!(
                             "<!doctype html><title>{}</title><body><pre>{escaped}</pre>",
@@ -382,10 +387,7 @@ impl HtmlEngine {
                     doc.set_viewport(self.viewport);
                     doc.set_images(Arc::clone(&self.images));
                     new_url = response.url.clone();
-                    new_error = response
-                        .charset()
-                        .filter(|c| c != "utf-8" && c != "utf8")
-                        .map(|c| format!("the page declares charset {c}; only UTF-8 is decoded"));
+                    new_error = None;
                 }
                 Err(e) => {
                     let message = e.to_string();
@@ -469,7 +471,8 @@ impl HtmlEngine {
             let request = Request::get(url.as_str()).of_kind(ResourceType::Stylesheet);
             let Ok(response) = self.client.send(request) else { continue };
             if (200..300).contains(&response.status) {
-                let text = String::from_utf8_lossy(&response.body);
+                let fallback = self.doc().encoding();
+                let text = crate::encoding::decode_body(&response.body, response.header("content-type"), fallback);
                 // Its `url()`s are relative to the sheet, not the page.
                 let text = crate::css::absolutize_urls(&text, &response.url);
                 self.doc().set_stylesheet(id, text);
@@ -2578,6 +2581,51 @@ mod tests {
         assert_eq!(check(&mut engine, "document.getElementById('later').id = 'renamed'; typeof later + ' ' + renamed.tagName"), "undefined DIV");
         // Script's own globals win, and assigning one does not touch the element.
         assert_eq!(check(&mut engine, "menu = 5; menu + ' ' + document.getElementById('menu').textContent"), "5 m");
+    }
+
+    #[test]
+    fn pages_in_euc_kr_are_decoded_and_their_scripts_and_sheets_too() {
+        let euc = |text: &str| encoding_rs::EUC_KR.encode(text).0.into_owned();
+        let base = crate::test_server::serve_together(
+            vec![
+                ("/header", "text/html; charset=euc-kr", euc("<title>한글 제목</title><script src=s.js></script><link rel=stylesheet href=c.css><p id=p>본문</p>")),
+                ("/meta", "text/html", euc("<meta charset=\"euc-kr\"><title>메타 선언</title>")),
+                ("/none", "text/html", euc("<title>선언 없음</title>")),
+                ("/s.js", "text/javascript", euc("window.fromScript = '스크립트';")),
+                ("/c.css", "text/css", euc("p::after { content: '시트' } p { font-family: '맑은 고딕' }")),
+            ],
+            vec![],
+        );
+        let mut engine = HtmlEngine::new("t");
+        for (path, title) in [("/meta", "메타 선언"), ("/none", "선언 없음"), ("/header", "한글 제목")] {
+            engine.load(&format!("{base}{path}"));
+            assert_eq!(engine.last_error, None);
+            assert_eq!(engine.info().title, title, "{path}");
+            assert_eq!(evaluate(&mut engine, "document.characterSet")["result"]["value"], "EUC-KR", "{path}");
+        }
+        assert_eq!(evaluate(&mut engine, "fromScript + ' ' + document.getElementById('p').textContent")["result"]["value"], "스크립트 본문");
+        assert_eq!(evaluate(&mut engine, "getComputedStyle(document.getElementById('p')).fontFamily")["result"]["value"], "'맑은 고딕'");
+        engine.load("data:text/html,<title>x</title>");
+        assert_eq!(evaluate(&mut engine, "document.characterSet")["result"]["value"], "UTF-8");
+    }
+
+    #[test]
+    fn text_decoders_know_every_encoding_and_svg_strings_are_animated() {
+        let mut engine = engine_with("<body><svg><a id=s class='c1'></a></svg></body>");
+        let value = |engine: &mut HtmlEngine, expression: &str| evaluate(engine, expression)["result"]["value"].clone();
+        assert_eq!(value(&mut engine, "new TextDecoder('utf-16le').decode(new Uint8Array([0xff, 0xfe, 0x68, 0, 0x69, 0]))"), "hi");
+        assert_eq!(value(&mut engine, "new TextDecoder('ks_c_5601-1987').encoding"), "euc-kr");
+        assert_eq!(value(&mut engine, "new TextDecoder('euc-kr').decode(new Uint8Array([0xc7, 0xd1, 0xb1, 0xdb]))"), "한글");
+        assert_eq!(value(&mut engine, "new TextDecoder('utf8').decode(new Uint8Array([0xed, 0x95, 0x9c]))"), "한");
+        assert_eq!(
+            value(&mut engine, "try { new TextDecoder('utf-16le', { fatal: true }).decode(new Uint8Array([0x00, 0xd8])) } catch (e) { e.name }"),
+            "TypeError"
+        );
+        assert_eq!(value(&mut engine, "try { new TextDecoder('nope') } catch (e) { e.name }"), "RangeError");
+        assert_eq!(
+            value(&mut engine, "const c = document.getElementById('s').className; [c instanceof SVGAnimatedString, c.baseVal, c.animVal].join()"),
+            "true,c1,c1"
+        );
     }
 
     #[test]

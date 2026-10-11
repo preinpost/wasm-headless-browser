@@ -6,7 +6,7 @@
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
 이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
-보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. 다음 후보는 §0.4.
+보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. EUC-KR 등 모든 인코딩(M1.9). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -44,7 +44,7 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 195, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 199, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 42 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
@@ -57,9 +57,11 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 - **참조 사이트 로고.** `div.logo`의 `<img>`가 우리 엔진에서는 `src` 없이 남는다.
   Chrome에서는 보인다. 로고 주소를 정하는 스크립트 경로를 `probe_a_url`로 찾아야 한다.
-- **콘솔이 드러낸 vite.dev의 빈칸.** `SVGAnimatedString`이 없어 프레임워크 청크에서
-  ReferenceError, `TextDecoder('utf-16le')` 미지원, 그 여파로 FloatingVue 초기화 실패.
-  화면(스냅샷 305줄)은 그대로 나온다.
+- **`innerText`가 `textContent`와 같다.** Chrome의 `innerText`는 보이는 글자만이고(스크립트·
+  스타일·`display:none` 제외) 블록마다 줄을 바꾼다. 지금은 `<script>` 안의 코드까지 나온다
+  (웃긴대학 본문 첫머리가 `var is_ddn_call = 0; ...`). 에이전트가 `eval`로 읽을 때 잡음이다.
+- **WebAssembly.** QuickJS에 없다. vite.dev의 코드 하이라이터(oniguruma)가 이것 때문에
+  실패한다. 인터프리터 안에서 wasm을 돌리는 것은 범위 밖으로 본다.
 - **그림자, SVG.** `box-shadow`와 SVG 이미지(`<img src=*.svg>`, 인라인 `<svg>`)는 그리지 않는다.
 - **요청 가로채기 (M3.3).** agent-browser `network route`. `Fetch.requestPaused`는
   엔진이 요청 도중 클라이언트의 답을 기다려야 해서 구조가 바뀐다(§4.4).
@@ -106,6 +108,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `images.rs` | 탭의 이미지 저장소: 가져오기, 크기, 디코딩(PNG·JPEG·GIF·WebP), 기다리기 |
 | `screencast.rs` | `Page.startScreencast`: 바뀐 화면을 JPEG 프레임으로, 응답을 받은 뒤에만 |
 | `scroll.rs` | 스크롤 위치(문서에 저장), 범위, `scrollIntoView` 정렬, 휠 |
+| `encoding.rs` | 문자 인코딩: 문서 인코딩 판정(BOM·헤더·meta·추정), 응답 디코딩, `TextDecoder` |
 | `modules.rs` | ES 모듈의 지정자 해석(import map 포함)과 로딩. QuickJS가 링크와 평가를 맡는다 |
 | `ax.rs` | 접근성 트리 |
 | `js.rs` | `ScriptHost`: QuickJS를 전용 스레드(32MB 스택)에 가두고 채널로 부른다. 가상 시계 작업 큐, CDP용 평가 |
@@ -249,8 +252,18 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       처리한다. 사설 CA는 `WHB_EXTRA_CA_CERTS`로 추가한다. WASIX에서
       example.com과 참조 사이트가 TLS 1.3으로 열린다. 근거는
       [docs/wasix.md](wasix.md)의 "TLS inside the guest".
-- [ ] M1.9 UTF-8이 아닌 문자셋을 디코딩한다. 지금은 헤더가 UTF-8이 아니면
-      손실 변환하고 그 사실을 `last_error`에 남긴다.
+- [x] M1.9 모든 문자 인코딩(`encoding.rs`, `encoding_rs`: Firefox가 쓰는 WHATWG 구현,
+      순수 Rust, WASIX 모듈 +182KB). 문서는 브라우저 순서로 판정한다: BOM, 헤더의 `charset`,
+      앞 1024바이트의 `<meta charset>`·`http-equiv`(meta의 UTF-16은 UTF-8로). 선언이 없으면
+      UTF-8로 풀리면 UTF-8, 아니면 EUC-KR(한국어 로캘의 Chrome 기본값; Chrome의 바이트
+      추정은 하지 않는다). `document.characterSet`이 그 이름을 낸다. 스크립트와 스타일시트는
+      헤더 `charset`, 없으면 문서 인코딩. XHR·이미지 외 응답은 헤더, 없으면 UTF-8. `fetch`의
+      `text()`와 모듈은 규격대로 늘 UTF-8. `TextDecoder`는 모든 레이블(`ks_c_5601-1987`,
+      `utf-16le` 등)을 받고 UTF-8 밖은 엔진이 푼다. `fatal`, `ignoreBOM`은 되고 `stream`은
+      호출마다 따로 푼다. 웃긴대학(meta로만 EUC-KR)이 네이티브·WASIX에서 제대로 나온다(전에는
+      제목부터 깨졌다). 같은 작업에서 `SVGAnimatedString`을 진짜 클래스로 만들어 전역에
+      냈다(vite.dev의 `instanceof SVGAnimatedString`). vite.dev에 남은 오류 중 FloatingVue는
+      Chrome에서도 나는 사이트 자체 버그이고, 남은 차이는 WebAssembly뿐이다.
 - [x] M1.10 선택자 엔진을 새로 썼다(`select.rs`). 결합자 넷, 속성 연산자 전부와
       `i` 플래그, `:nth-child(An+B of S)`를 포함한 구조 의사 클래스, `:not`·`:is`·
       `:where`·`:has`, 폼 상태 의사 클래스, `:focus`, 명시도. `:hover`처럼 포인터가

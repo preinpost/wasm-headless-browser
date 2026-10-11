@@ -53,6 +53,9 @@ top-level `await` and import maps, so Vite-built sites hydrate.
 `agent-browser console` and `errors` work: console calls and uncaught
 exceptions are sent as Chrome sends them, object previews included.
 
+Pages are decoded in whatever encoding they declare, EUC-KR included, as
+a browser decides it, and `TextDecoder` takes every encoding label.
+
 Pages scroll: script, `scrollIntoView`, the wheel and agent-browser's
 `scroll` move the viewport and scroll containers, and boxes, clicks and
 screenshots follow.

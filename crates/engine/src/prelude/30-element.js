@@ -750,6 +750,29 @@ tagClass(HTMLElement, 'HTMLElement');
 reflect(HTMLElement, 'string', { title: 'title', lang: 'lang', dir: 'dir', accessKey: 'accesskey', nonce: 'nonce', enterKeyHint: 'enterkeyhint', inputMode: 'inputmode' });
 reflect(HTMLElement, 'boolean', { hidden: 'hidden', autofocus: 'autofocus', inert: 'inert', draggable: 'draggable', spellcheck: 'spellcheck' });
 
+// What SVG reflects some attributes as: a base value, and an animated one,
+// which is the same here, as nothing animates.
+const animatedStrings = new WeakMap();
+class SVGAnimatedString {
+  get baseVal() {
+    const { el, name } = animatedStrings.get(this);
+    return el.getAttribute(name) ?? '';
+  }
+  set baseVal(value) {
+    const { el, name } = animatedStrings.get(this);
+    el.setAttribute(name, String(value));
+  }
+  get animVal() {
+    return this.baseVal;
+  }
+}
+tagClass(SVGAnimatedString, 'SVGAnimatedString');
+function animatedString(el, name) {
+  const value = Object.create(SVGAnimatedString.prototype);
+  animatedStrings.set(value, { el, name });
+  return value;
+}
+
 class SVGElement extends Element {
   get style() {
     return inlineStyle(this);
@@ -759,18 +782,7 @@ class SVGElement extends Element {
   }
   // SVG's className is an SVGAnimatedString.
   get className() {
-    const el = this;
-    return {
-      get baseVal() {
-        return el.getAttribute('class') ?? '';
-      },
-      set baseVal(v) {
-        el.setAttribute('class', String(v));
-      },
-      get animVal() {
-        return el.getAttribute('class') ?? '';
-      },
-    };
+    return animatedString(this, 'class');
   }
   get ownerSVGElement() {
     return this.parentElement?.closest('svg') ?? null;

@@ -120,6 +120,9 @@ pub struct Document {
     /// Bumped by every scroll, which changes what is seen without changing
     /// the document, so that screencast frames notice.
     scroll_generation: u64,
+    /// What the document's bytes were decoded from: `document.characterSet`,
+    /// and the default for its scripts and stylesheets.
+    encoding: &'static encoding_rs::Encoding,
 }
 
 impl Default for Document {
@@ -144,7 +147,16 @@ impl Document {
             images: None,
             scroll: HashMap::new(),
             scroll_generation: 0,
+            encoding: encoding_rs::UTF_8,
         }
+    }
+
+    pub fn encoding(&self) -> &'static encoding_rs::Encoding {
+        self.encoding
+    }
+
+    pub fn set_encoding(&mut self, encoding: &'static encoding_rs::Encoding) {
+        self.encoding = encoding;
     }
 
     /// How far `id` is scrolled, `(left, top)`. The document node's is the
