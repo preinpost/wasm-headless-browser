@@ -69,8 +69,10 @@ pub struct HtmlEngine {
     frame_id: String,
     loader_id: String,
     context_id: u64,
-    history: Vec<String>,
+    history: Vec<HistoryEntry>,
     history_index: usize,
+    /// Counts documents loaded, so history entries know which share one.
+    document_number: u64,
     viewport: (f64, f64),
     last_error: Option<String>,
 }
@@ -115,8 +117,9 @@ impl HtmlEngine {
             frame_id,
             loader_id: ids::token(&mut counter),
             context_id: 1,
-            history: vec!["about:blank".to_string()],
+            history: vec![HistoryEntry { url: "about:blank".to_string(), document: 0, state: None }],
             history_index: 0,
+            document_number: 0,
             viewport,
             last_error: None,
         }
@@ -329,23 +332,39 @@ impl HtmlEngine {
         self.sync_script_url();
     }
 
-    /// Follows a URL change script made without loading anything:
-    /// `history.pushState` or `location.hash = ...`. Returns the new URL.
-    fn sync_script_url(&mut self) -> Option<String> {
-        let replace = self.script.as_ref()?.state().take_url_change()?;
-        let url = self.doc().url().to_string();
-        if url == self.url {
-            return None;
-        }
-        self.url = url.clone();
-        if replace {
-            if let Some(entry) = self.history.get_mut(self.history_index) {
-                *entry = url.clone();
+    /// Follows the URL changes script made without loading anything,
+    /// `pushState`, `replaceState` and new fragments, into history. Returns
+    /// the URLs moved to.
+    fn sync_script_url(&mut self) -> Vec<String> {
+        let Some(script) = &self.script else { return Vec::new() };
+        let changes = script.state().take_url_changes();
+        let mut moved = Vec::new();
+        for change in changes {
+            let state = Some(change.state).filter(|s| s != "null");
+            if change.replace {
+                if let Some(entry) = self.history.get_mut(self.history_index) {
+                    entry.url = change.url.clone();
+                    entry.state = state;
+                }
+            } else {
+                self.history.truncate(self.history_index + 1);
+                self.history.push(HistoryEntry { url: change.url.clone(), document: self.document_number, state });
+                self.history_index = self.history.len() - 1;
             }
-        } else {
-            self.push_history();
+            if change.url != self.url {
+                self.url = change.url.clone();
+                moved.push(change.url);
+            }
         }
-        Some(url)
+        self.publish_history_shape();
+        moved
+    }
+
+    /// Tells script where history stands, for `history.length`.
+    fn publish_history_shape(&self) {
+        if let Some(script) = &self.script {
+            script.state().set_history_shape(self.history_index, self.history.len());
+        }
     }
 
     /// Fetches `request` and makes the result the document. A fetch failure
@@ -356,6 +375,7 @@ impl HtmlEngine {
         // fields is collected here and applied once the guard is dropped.
         let request = request.of_kind(ResourceType::Document);
         let requested = request.url.clone();
+        self.document_number += 1;
         self.client.clear_preloads();
         self.images.clear();
         let fetched = self.client.send(request);
@@ -597,7 +617,10 @@ impl HtmlEngine {
         if is_get && target.contains('#') && without_fragment(&target) == without_fragment(&self.url) {
             self.url = target.clone();
             self.doc().set_url(&target);
-            self.push_history();
+            self.history.truncate(self.history_index + 1);
+            self.history.push(HistoryEntry { url: target, document: self.document_number, state: None });
+            self.history_index = self.history.len() - 1;
+            self.publish_history_shape();
             return true;
         }
         let mut request = Request {
@@ -615,12 +638,20 @@ impl HtmlEngine {
         true
     }
 
+    /// Records the document just loaded as the next entry. Loading the
+    /// current URL again replaces its entry, as a reload does, and so does
+    /// the first navigation the tab's initial blank page, as in Chrome.
     fn push_history(&mut self) {
         self.history.truncate(self.history_index + 1);
-        if self.history.last() != Some(&self.url) {
-            self.history.push(self.url.clone());
-            self.history_index = self.history.len() - 1;
+        let entry = HistoryEntry { url: self.url.clone(), document: self.document_number, state: None };
+        match self.history.last_mut() {
+            Some(last) if last.url == self.url || last.document == 0 => *last = entry,
+            _ => {
+                self.history.push(entry);
+                self.history_index = self.history.len() - 1;
+            }
         }
+        self.publish_history_shape();
     }
 
     /// Remote-object id for a raw DOM index, matching `backendDOMNodeId`.
@@ -677,6 +708,7 @@ impl HtmlEngine {
             script.run_tasks(EVALUATE_BUDGET_MS, MAX_TASKS);
         }
         let moved = self.sync_script_url();
+        let mut moved = moved.into_iter();
         let (requested, steps) = match &self.script {
             Some(script) => (script.state().take_requested_navigation(), script.state().take_requested_history()),
             None => (None, 0),
@@ -687,38 +719,69 @@ impl HtmlEngine {
                 self.push_history();
                 self.emit_lifecycle(out);
             }
-        } else if steps != 0 && self.go(steps) {
-            self.emit_lifecycle(out);
-        } else if let Some(url) = moved {
-            out(
-                "Page.navigatedWithinDocument",
-                json!({ "frameId": self.frame_id, "url": url, "navigationType": "historyApi" }),
-            );
+        } else if steps != 0 {
+            match self.go(steps) {
+                Some(Traversal::Loaded) => self.emit_lifecycle(out),
+                Some(Traversal::SameDocument(url)) => {
+                    // What the traversal set in motion: popstate listeners'
+                    // timers and requests, a hashchange.
+                    if let Some(script) = &self.script {
+                        script.run_tasks(EVALUATE_BUDGET_MS, MAX_TASKS);
+                    }
+                    self.sync_script_url();
+                    out("Page.navigatedWithinDocument", json!({ "frameId": self.frame_id, "url": url, "navigationType": "historyApi" }));
+                }
+                None => {}
+            }
+        } else {
+            for url in moved.by_ref() {
+                out(
+                    "Page.navigatedWithinDocument",
+                    json!({ "frameId": self.frame_id, "url": url, "navigationType": "historyApi" }),
+                );
+            }
         }
     }
 
-    /// Moves `steps` entries through history, as `history.go(steps)` does.
-    /// Returns whether a page was loaded; a move past either end is ignored,
-    /// as a browser ignores it.
-    fn go(&mut self, steps: i32) -> bool {
+    /// Moves `steps` entries through history, as `history.go(steps)` does;
+    /// a move past either end is ignored, as a browser ignores it.
+    /// Between entries of one document, made by `pushState` or a fragment,
+    /// nothing loads: the URL and `history.state` change and `popstate`
+    /// fires, and `hashchange` if the fragment changed. Between documents,
+    /// the entry's URL loads again, there being no page cache, with its
+    /// state restored.
+    fn go(&mut self, steps: i32) -> Option<Traversal> {
         let target = self.history_index as i64 + steps as i64;
         if target < 0 || target >= self.history.len() as i64 {
-            return false;
+            return None;
         }
+        let from = self.history[self.history_index].document;
         self.history_index = target as usize;
-        let url = self.history[self.history_index].clone();
-        self.load_preserving_history(&url);
-        true
-    }
-
-    fn load_preserving_history(&mut self, url: &str) {
+        let entry = self.history[self.history_index].clone();
+        let state = entry.state.clone().unwrap_or_else(|| "null".into());
+        if entry.document == from && self.script.is_some() {
+            let old_url = std::mem::replace(&mut self.url, entry.url.clone());
+            self.doc().set_url(&entry.url);
+            self.publish_history_shape();
+            if let Some(script) = &self.script {
+                let _ = script.run(&format!("__traverseHistory({}, {})", js_string(&state), js_string(&old_url)));
+            }
+            return Some(Traversal::SameDocument(entry.url));
+        }
         let history = self.history.clone();
         let index = self.history_index;
-
-        self.replace_document(Request::get(url));
+        self.replace_document(Request::get(&entry.url));
+        // Before the page's scripts, which may read it.
+        if let Some(script) = &self.script {
+            let _ = script.run(&format!("__setHistoryState({})", js_string(&state)));
+        }
         self.run_document_scripts();
         self.history = history;
         self.history_index = index;
+        // The entry belongs to the document just loaded now.
+        self.history[index].document = self.document_number;
+        self.publish_history_shape();
+        Some(Traversal::Loaded)
     }
 
     /// `Network.setCookie`. Without a `url` or a `domain` there is nothing to
@@ -870,12 +933,12 @@ impl HtmlEngine {
                     .history
                     .iter()
                     .enumerate()
-                    .map(|(i, url)| {
+                    .map(|(i, entry)| {
                         json!({
                             "id": i,
-                            "url": url,
-                            "userTypedURL": url,
-                            "title": if *url == self.url { title.clone() } else { String::new() },
+                            "url": entry.url,
+                            "userTypedURL": entry.url,
+                            "title": if i == self.history_index { title.clone() } else { String::new() },
                             "transitionType": "typed",
                         })
                     })
@@ -1484,6 +1547,25 @@ fn escape_html(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// One entry of a tab's session history.
+#[derive(Debug, Clone)]
+struct HistoryEntry {
+    url: String,
+    /// The document it belongs to, by `HtmlEngine::document_number`: entries
+    /// `pushState` or a fragment made share their document's.
+    document: u64,
+    /// `history.state` as JSON, when it is not null.
+    state: Option<String>,
+}
+
+/// How [`HtmlEngine::go`] got there.
+enum Traversal {
+    /// A new document was loaded.
+    Loaded,
+    /// Within the document, to this URL.
+    SameDocument(String),
+}
+
 /// Console messages and exceptions held for a client, at most; the oldest
 /// go first.
 const MAX_PAGE_EVENTS: usize = 1000;
@@ -1745,7 +1827,8 @@ mod tests {
         // Past the end is ignored.
         dispatch(&mut engine, "Runtime.evaluate", json!({ "expression": "history.forward()" }));
         assert_eq!(engine.info().title, "second");
-        assert_eq!(engine.history.len(), 3, "{:?}", engine.history);
+        // The tab's initial blank page was replaced by the first load.
+        assert_eq!(engine.history.len(), 2, "{:?}", engine.history);
     }
 
     #[test]
@@ -2626,6 +2709,54 @@ mod tests {
             value(&mut engine, "const c = document.getElementById('s').className; [c instanceof SVGAnimatedString, c.baseVal, c.animVal].join()"),
             "true,c1,c1"
         );
+    }
+
+    #[test]
+    fn going_back_through_push_state_entries_pops_state_without_loading() {
+        let (base, requests) = crate::test_server::serve_script(vec![
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 16\r\n\r\n<title>a</title>".into(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 16\r\n\r\n<title>b</title>".into(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 16\r\n\r\n<title>a</title>".into(),
+        ]);
+        let mut engine = HtmlEngine::new("t");
+        engine.load(&format!("{base}/a"));
+        let run = |engine: &mut HtmlEngine, expression: &str| -> Vec<(String, Value)> {
+            events_of(engine, |e, out| {
+                e.dispatch("Runtime.evaluate", &json!({ "expression": expression }), out).unwrap();
+            })
+        };
+        let value = |engine: &mut HtmlEngine, expression: &str| evaluate(engine, expression)["result"]["value"].clone();
+        run(
+            &mut engine,
+            "window.log = []; addEventListener('popstate', (e) => log.push('pop ' + JSON.stringify(e.state)));\
+             addEventListener('hashchange', () => log.push('hash ' + location.hash));\
+             history.pushState({ step: 1 }, '', '/a/one'); history.pushState({ step: 2 }, '', '/a/two');\
+             location.hash = 'x';",
+        );
+        assert_eq!(value(&mut engine, "history.length"), 4);
+        let urls = |engine: &HtmlEngine| engine.history.iter().map(|e| e.url.rsplit('/').next().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(urls(&engine), ["a", "one", "two", "two#x"]);
+
+        // Back from the fragment, then back once more: no load, the state comes back.
+        let events = run(&mut engine, "history.back()");
+        assert!(events.iter().any(|(m, p)| m == "Page.navigatedWithinDocument" && p["url"].as_str().unwrap().ends_with("/a/two")));
+        assert!(!events.iter().any(|(m, _)| m == "Page.frameNavigated"), "nothing loaded");
+        run(&mut engine, "history.back()");
+        assert_eq!(value(&mut engine, "location.pathname + ' ' + history.state.step"), "/a/one 1");
+        // Setting the hash fired its own hashchange; going back from it
+        // pops, and the fragment is gone again.
+        assert_eq!(value(&mut engine, "log.join(' | ')"), "hash #x | pop {\"step\":2} | hash  | pop {\"step\":1}");
+        assert_eq!(value(&mut engine, "history.length"), 4, "going back keeps the entries");
+        run(&mut engine, "history.forward()");
+        assert_eq!(value(&mut engine, "history.state.step"), 2);
+
+        // Another document, and back: that one loads again, with its state.
+        run(&mut engine, &format!("location.href = '{base}/b'"));
+        assert_eq!(engine.info().title, "b");
+        run(&mut engine, "history.back()");
+        assert_eq!(engine.info().title, "a");
+        assert_eq!(value(&mut engine, "location.pathname + ' ' + history.state.step"), "/a/two 2");
+        let _ = (requests.recv(), requests.recv(), requests.recv());
     }
 
     #[test]

@@ -6,7 +6,7 @@
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
 이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
-보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. EUC-KR 등 모든 인코딩(M1.9). `innerText`가 보이는 글자다(M2.16). 다음 후보는 §0.4.
+보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. EUC-KR 등 모든 인코딩(M1.9). `innerText`가 보이는 글자다(M2.16). 같은 문서의 뒤로·앞으로가 `popstate`다(M2.12). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -44,7 +44,7 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 202, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 203, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 42 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
@@ -57,6 +57,10 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 - **참조 사이트 로고.** `div.logo`의 `<img>`가 우리 엔진에서는 `src` 없이 남는다.
   Chrome에서는 보인다. 로고 주소를 정하는 스크립트 경로를 `probe_a_url`로 찾아야 한다.
+- **문단에 이름이 붙는다.** Chrome의 스냅샷은 `paragraph`에 이름이 없고 글자를 자식으로
+  보이는데, 우리는 `paragraph "You are signed in."`이다. ARIA에서 paragraph·strong·emphasis·
+  code·mark 등은 내용에서 이름을 얻지 않는다(`ax.rs`의 `names_from_content`). 고칠 때
+  `verify-m1.sh`의 기대값과 함께 Chrome 스냅샷으로 맞춘다.
 - **WebAssembly.** QuickJS에 없다. vite.dev의 코드 하이라이터(oniguruma)가 이것 때문에
   실패한다. 인터프리터 안에서 wasm을 돌리는 것은 범위 밖으로 본다.
 - **그림자, SVG.** `box-shadow`와 SVG 이미지(`<img src=*.svg>`, 인라인 `<svg>`)는 그리지 않는다.
@@ -419,8 +423,18 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       (`vendor/patches/0002`): 전역 변수 조회가 이국 객체를 만나면 `has`를 먼저 묻는다.
       원본 소스의 `XXX: should pass throw_ref_error` 자리다. 이때 vendored `build.rs`가
       C 소스 변경을 감시하지 않는 것도 고쳤다(`rerun-if-changed=quickjs`).
-- [ ] M2.12 `popstate`. 지금은 `pushState`로 만든 항목으로 뒤로 가면 그 URL을
-      새로 읽는다.
+- [x] M2.12 `popstate`. 히스토리 항목이 `{url, 문서 번호, state(JSON)}`이다. 문서를 새로
+      읽을 때마다 번호가 오르고, `pushState`·`replaceState`·새 프래그먼트가 만든 항목은 그
+      문서의 번호를 갖는다. 스크립트의 URL 변경은 큐에 순서대로 쌓여(한 스크립트에서
+      `pushState`를 두 번 해도 항목 두 개) 엔진이 스크립트 뒤에 반영한다. 같은 문서의 항목
+      사이를 오가면 아무것도 읽지 않고 URL과 `history.state`를 바꿔 `popstate`를 쏘고,
+      프래그먼트가 바뀌었으면 `hashchange`를 태스크로, `Page.navigatedWithinDocument`를 낸다.
+      다른 문서의 항목으로 가면 다시 읽되(페이지 캐시 없음) 그 항목의 state를 스크립트 전에
+      복원한다. state는 JSON으로 보관해서 Date·Map은 JSON이 만드는 모양으로 돌아온다.
+      `history.length`는 엔진의 값이다. 탭의 처음 빈 페이지는 첫 이동이 대체한다. 로그인
+      픽스처에서 `/home` → `back`이 Chrome처럼 다시 읽지 않고 URL만 `/`가 된다. Chrome과
+      다른 점: Chrome을 `about:blank`로 띄우면 그 페이지가 진짜 항목이라 `history.length`가
+      하나 더 많다.
 - [x] M2.5 마우스. `Input.dispatchMouseEvent`가 히트 테스트로 대상을 찾고
       pointer/mouse over·out·enter·leave·move·down·up, 포커스 이동, `click`과 그
       기본 동작, `dblclick`, `contextmenu`, `wheel`을 브라우저 순서로 낸다. 누른

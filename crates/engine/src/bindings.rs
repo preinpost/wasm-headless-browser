@@ -93,7 +93,11 @@ pub struct DomState {
     /// Set when script changed the URL without loading anything
     /// (`pushState`, a fragment change). `true` replaces the current history
     /// entry rather than adding one.
-    url_change: Arc<Mutex<Option<bool>>>,
+    url_changes: Arc<Mutex<Vec<UrlChange>>>,
+    /// The engine's history as script sees it, `(index, length)`: set by the
+    /// engine, and moved on at once by `pushState`, so `history.length` is
+    /// right before the engine has caught up.
+    history_shape: Arc<Mutex<(usize, usize)>>,
     viewport: Arc<Mutex<(f64, f64)>>,
     user_agent: Arc<Mutex<String>>,
     /// `localStorage` and `sessionStorage`, keyed by kind and origin. In
@@ -131,7 +135,8 @@ impl DomState {
             focus: Arc::new(Mutex::new(None)),
             requested_navigation: Arc::new(Mutex::new(None)),
             requested_history: Arc::new(Mutex::new(0)),
-            url_change: Arc::new(Mutex::new(None)),
+            url_changes: Arc::new(Mutex::new(Vec::new())),
+            history_shape: Arc::new(Mutex::new((0, 1))),
             viewport: Arc::new(Mutex::new(viewport)),
             user_agent: Arc::new(Mutex::new(user_agent.to_string())),
             storage: Arc::new(Mutex::new(HashMap::new())),
@@ -162,7 +167,7 @@ impl DomState {
         }
         let _ = self.take_requested_navigation();
         let _ = self.take_requested_history();
-        let _ = self.take_url_change();
+        let _ = self.take_url_changes();
         if let Ok(mut map) = self.import_map.lock() {
             *map = Default::default();
         }
@@ -216,10 +221,17 @@ impl DomState {
         self.import_map.lock().map_err(|_| "the import map is unavailable".to_string())?.merge(json, &base)
     }
 
-    /// Whether script changed the URL in place since the last call, and if so
-    /// whether it replaced the history entry.
-    pub fn take_url_change(&self) -> Option<bool> {
-        self.url_change.lock().ok().and_then(|mut slot| slot.take())
+    /// The same-document URL changes script made since the last call, in
+    /// order: `pushState`, `replaceState`, a new fragment.
+    pub fn take_url_changes(&self) -> Vec<UrlChange> {
+        self.url_changes.lock().map(|mut changes| std::mem::take(&mut *changes)).unwrap_or_default()
+    }
+
+    /// Tells script where the engine's history stands.
+    pub fn set_history_shape(&self, index: usize, length: usize) {
+        if let Ok(mut shape) = self.history_shape.lock() {
+            *shape = (index, length);
+        }
     }
 
     pub fn take_requested_history(&self) -> i32 {
@@ -256,6 +268,16 @@ fn with_doc<R>(doc: &Arc<Mutex<Document>>, f: impl FnOnce(&Document) -> R) -> Op
 
 fn with_doc_mut<R>(doc: &Arc<Mutex<Document>>, f: impl FnOnce(&mut Document) -> R) -> Option<R> {
     doc.lock().ok().map(|mut d| f(&mut d))
+}
+
+/// A same-document URL change script made.
+#[derive(Debug, Clone)]
+pub struct UrlChange {
+    pub url: String,
+    /// Whether it replaces the current history entry rather than adding one.
+    pub replace: bool,
+    /// The entry's `history.state`, as JSON.
+    pub state: String,
 }
 
 /// Installs `globalThis.__dom`, then evaluates the prelude.
@@ -858,16 +880,27 @@ fn put_navigation<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>)
         });
     }
     {
-        // A same-document URL change. Repeated changes before the engine
-        // looks keep "replace" only if every one of them replaced.
+        // A same-document URL change, with the history state that goes with
+        // it as JSON. The engine applies the changes in order once the
+        // script is done.
         let doc = Arc::clone(&state.doc);
-        let change = Arc::clone(&state.url_change);
-        install_fn!(ctx, api, "setUrl", move |url: String, replace: bool| {
+        let changes = Arc::clone(&state.url_changes);
+        let shape = Arc::clone(&state.history_shape);
+        install_fn!(ctx, api, "setUrl", move |url: String, replace: bool, state: String| {
             let _ = with_doc_mut(&doc, |d| d.set_url(&url));
-            if let Ok(mut slot) = change.lock() {
-                *slot = Some(slot.unwrap_or(true) && replace);
+            if !replace {
+                if let Ok(mut shape) = shape.lock() {
+                    *shape = (shape.0 + 1, shape.0 + 2);
+                }
+            }
+            if let Ok(mut changes) = changes.lock() {
+                changes.push(UrlChange { url, replace, state });
             }
         });
+    }
+    {
+        let shape = Arc::clone(&state.history_shape);
+        install_fn!(ctx, api, "historyLength", move || shape.lock().map(|s| s.1).unwrap_or(1));
     }
     {
         let ready = Arc::clone(&state.ready_state);
@@ -1710,7 +1743,11 @@ mod tests {
         js.evaluate("history.pushState({ step: 2 }, '', '/next?x=1')").unwrap();
         assert_eq!(text(&js, "location.pathname + location.search"), "/next?x=1");
         assert_eq!(text(&js, "history.state.step"), "2");
-        assert_eq!(state.take_url_change(), Some(false));
+        let changes = state.take_url_changes();
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].replace);
+        assert_eq!(changes[0].state, r#"{"step":2}"#);
+        assert_eq!(text(&js, "history.length"), "2");
         assert_eq!(state.take_requested_navigation(), None);
     }
 

@@ -393,6 +393,8 @@ for (const [name, fn] of Object.entries({
   __fireLoad: fireLoad,
   __beginTurn: beginTurn,
   __runNextTask: runNextTask,
+  __traverseHistory: traverseHistory,
+  __setHistoryState: setHistoryState,
 })) {
   Object.defineProperty(globalThis, name, { value: fn, writable: false, configurable: false, enumerable: false });
 }

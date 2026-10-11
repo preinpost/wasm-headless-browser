@@ -29,8 +29,9 @@ function navigateTo(url) {
   const current = api.url();
   if (target.includes('#') && withoutFragment(target) === withoutFragment(current)) {
     if (target === current) return;
-    api.setUrl(target, false);
-    schedule(() => dispatch(globalThis, new HashChangeEvent('hashchange', { oldURL: current, newURL: target })), 0);
+    historyState = null;
+    api.setUrl(target, false, 'null');
+    queueHashChange(current, target);
     return;
   }
   api.navigate(target);
@@ -82,18 +83,18 @@ for (const part of ['origin', 'protocol', 'host', 'hostname', 'port', 'pathname'
 }
 const location = Object.create(Location.prototype);
 
-// `pushState` and `replaceState` change the URL without loading anything. The
-// engine records the new URL in its history. Going back through those
-// entries reloads the page at that URL rather than firing `popstate`, which
-// is a known difference from a browser.
+// `pushState` and `replaceState` change the URL without loading anything,
+// and the engine records the entry with its state, kept as JSON: values JSON
+// cannot hold (a Date, a Map) come back as JSON makes them. Going back and
+// forward between such entries fires `popstate` (`__traverseHistory`); to an
+// entry of another document, that document loads again with its state.
 let historyState = null;
-let historyLength = 1;
 class History {
   constructor() {
     illegalConstructor();
   }
   get length() {
-    return historyLength;
+    return api.historyLength();
   }
   get state() {
     return historyState;
@@ -114,7 +115,6 @@ class History {
   }
   pushState(state, title, url) {
     changeHistory(state, url, false);
-    historyLength++;
   }
   replaceState(state, title, url) {
     changeHistory(state, url, true);
@@ -124,15 +124,46 @@ tagClass(History, 'History');
 const history = Object.create(History.prototype);
 
 function changeHistory(state, url, replace) {
+  let target = api.url();
   if (url !== undefined && url !== null) {
-    const target = resolveUrl(url);
+    target = resolveUrl(url);
     if (!target) throw domError('SyntaxError', `Failed to execute 'pushState' on 'History': '${url}' is not a valid URL.`);
     if (URL.parse(target)?.origin !== URL.parse(api.url())?.origin) {
       throw domError('SecurityError', `Failed to execute 'pushState' on 'History': A history state object with URL '${target}' cannot be created in a document with origin '${location.origin}'.`);
     }
-    api.setUrl(target, replace);
   }
-  historyState = structuredClone(state);
+  // structuredClone first, for its DataCloneError on what cannot be kept.
+  const clone = structuredClone(state);
+  let json;
+  try {
+    json = JSON.stringify(clone === undefined ? null : clone) ?? 'null';
+  } catch (e) {
+    json = 'null';
+  }
+  historyState = clone === undefined ? null : clone;
+  api.setUrl(target, replace, json);
+}
+
+function queueHashChange(oldURL, newURL) {
+  schedule(() => dispatch(globalThis, new HashChangeEvent('hashchange', { oldURL, newURL })), 0);
+}
+
+// The engine moved through history within this document: the URL is
+// already the entry's. `popstate` fires now, `hashchange` in a task.
+function traverseHistory(stateJson, oldURL) {
+  setHistoryState(stateJson);
+  dispatch(globalThis, new PopStateEvent('popstate', { state: historyState }));
+  const newURL = api.url();
+  const fragment = (u) => (String(u).includes('#') ? String(u).slice(String(u).indexOf('#')) : '');
+  if (fragment(oldURL) !== fragment(newURL)) queueHashChange(oldURL, newURL);
+}
+
+function setHistoryState(stateJson) {
+  try {
+    historyState = JSON.parse(stateJson);
+  } catch (e) {
+    historyState = null;
+  }
 }
 
 // ---- navigator and screen ---------------------------------------------------
