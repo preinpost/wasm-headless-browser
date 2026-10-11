@@ -12,14 +12,15 @@ markup5ever = "0.40"
 serde_json.workspace = true
 base64.workspace = true
 
-# Only `std` (the default) and `bindgen`. `full-wasi` was used at first, but it
+# `std` (the default), `bindgen`, and `loader` for ES modules (modules.rs),
+# which adds only the pure-Rust `relative-path`. `full-wasi` was used at first, but it
 # pulls in `rquickjs-macro`, and the WASIX toolchain's rustc refuses to load
 # that proc-macro (E0463, "can't find crate") even though cargo built it. The
 # engine uses none of the macros, loaders or conversions that feature adds.
 # `bindgen` is not optional, because rquickjs ships no pre-generated bindings
 # for wasm32-wasmer-wasi and its fallback looks them up by exact target triple.
 # See docs/quickjs.md.
-rquickjs = { version = "0.14", features = ["bindgen"] }
+rquickjs = { version = "0.14", features = ["bindgen", "loader"] }
 
 # TLS inside the guest. ring, not rustls's default aws-lc-rs, because ring is
 # the backend the WASIX registry carries a fork of. See experiments/tls.

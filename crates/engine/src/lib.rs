@@ -32,6 +32,7 @@ pub mod layout;
 pub mod paint;
 pub mod parse;
 pub mod png;
+pub mod modules;
 pub mod network;
 pub mod screencast;
 pub mod secrets;

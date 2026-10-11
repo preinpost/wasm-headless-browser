@@ -374,7 +374,9 @@ impl HtmlEngine {
                 .filter_map(|id| {
                     let (href, kind) = if doc.is_tag(id, "link") && has_token(doc.attr(id, "rel"), "stylesheet") {
                         (doc.attr(id, "href"), ResourceType::Stylesheet)
-                    } else if doc.is_tag(id, "script") && is_classic_script_type(doc.attr(id, "type")) {
+                    } else if doc.is_tag(id, "link") && has_token(doc.attr(id, "rel"), "modulepreload") {
+                        (doc.attr(id, "href"), ResourceType::Script)
+                    } else if doc.is_tag(id, "script") && runs_script_type(doc.attr(id, "type"), doc.has_attr(id, "nomodule")) {
                         (doc.attr(id, "src"), ResourceType::Script)
                     } else if doc.is_tag(id, "img") {
                         return doc.image_url(id).map(|url| (url, ResourceType::Image));
@@ -438,7 +440,7 @@ impl HtmlEngine {
         struct Found {
             id: NodeId,
             label: String,
-            external: bool,
+            module: bool,
             deferred: bool,
             asynchronous: bool,
         }
@@ -448,13 +450,15 @@ impl HtmlEngine {
                 .filter(|id| doc.is_tag(*id, "script"))
                 .map(|id| {
                     let src = doc.attr(id, "src");
+                    let module = doc.attr(id, "type").is_some_and(|t| t.trim().eq_ignore_ascii_case("module"));
                     Found {
                         id,
                         label: src.map(str::to_string).unwrap_or_else(|| format!("inline-{id}")),
-                        external: src.is_some(),
-                        // Modules are deferred by default.
-                        deferred: doc.has_attr(id, "defer") || doc.attr(id, "type") == Some("module"),
-                        asynchronous: doc.has_attr(id, "async"),
+                        module,
+                        // Modules, inline ones too, are deferred unless async;
+                        // `defer` means nothing to an inline classic script.
+                        deferred: module || (src.is_some() && doc.has_attr(id, "defer")),
+                        asynchronous: (module || src.is_some()) && doc.has_attr(id, "async"),
                     }
                 })
                 .collect()
@@ -472,16 +476,16 @@ impl HtmlEngine {
             }
         };
 
-        let blocking = |f: &&Found| !f.external || (!f.deferred && !f.asynchronous);
+        let blocking = |f: &&Found| !f.module && !f.deferred && !f.asynchronous;
         for f in found.iter().filter(blocking) {
             run(f);
         }
         let _ = script.run("__documentParsed()");
-        for f in found.iter().filter(|f| f.external && f.deferred && !f.asynchronous) {
+        for f in found.iter().filter(|f| f.deferred && !f.asynchronous) {
             run(f);
         }
         let _ = script.run("__fireDOMContentLoaded()");
-        for f in found.iter().filter(|f| f.external && f.asynchronous) {
+        for f in found.iter().filter(|f| f.asynchronous) {
             run(f);
         }
         script.run_tasks(LOAD_BUDGET_MS, MAX_TASKS);
@@ -1405,12 +1409,16 @@ fn has_token(value: Option<&str>, token: &str) -> bool {
     value.is_some_and(|v| v.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case(token)))
 }
 
-/// Whether a `<script type>` is one the engine runs as a classic script.
-/// The prelude's `scriptKind` decides for real; this only has to agree well
-/// enough not to preload what will not run.
-fn is_classic_script_type(kind: Option<&str>) -> bool {
-    let Some(kind) = kind.map(|k| k.trim().to_ascii_lowercase()) else { return true };
-    kind.is_empty() || kind.contains("javascript") || kind.contains("ecmascript") || kind.contains("jscript")
+/// Whether a `<script>` is one the engine runs: a classic script not marked
+/// `nomodule`, or a module. The prelude's `scriptKind` decides for real;
+/// this only has to agree well enough not to preload what will not run.
+fn runs_script_type(kind: Option<&str>, nomodule: bool) -> bool {
+    let Some(kind) = kind.map(|k| k.trim().to_ascii_lowercase()) else { return !nomodule };
+    if kind == "module" {
+        return true;
+    }
+    let classic = kind.is_empty() || kind.contains("javascript") || kind.contains("ecmascript") || kind.contains("jscript");
+    classic && !nomodule
 }
 
 /// The page shown when a navigation fails. A browser shows something; so does
@@ -2290,6 +2298,68 @@ mod tests {
         let shot = dispatch(&mut engine, "Page.captureScreenshot", json!({}))["data"].as_str().unwrap().to_string();
         assert!(shot == data, "the payload went out untouched");
         assert!(base64::engine::general_purpose::STANDARD.decode(shot).is_ok());
+    }
+
+    #[test]
+    fn module_scripts_import_resolve_and_run_in_order() {
+        let base = crate::test_server::serve_together(
+            vec![
+                (
+                    "/",
+                    "text/html",
+                    "<script type=importmap>{\"imports\": {\"lib\": \"/lib/index.js\"}}</script>\
+                     <script>window.log = []; log.push('classic');\
+                       import('./dyn.js').then((m) => log.push('classic import ' + m.value));\
+                       document.addEventListener('DOMContentLoaded', () => log.push('dcl'));</script>\
+                     <script type=module>import { name } from './a.js'; import lib from 'lib';\
+                       log.push('inline ' + name + ' ' + lib + ' ' + (import.meta.url === location.href));</script>\
+                     <script type=module src=main.js></script>\
+                     <script nomodule>log.push('nomodule ran')</script>\
+                     <script defer src=deferred.js></script>"
+                        .into(),
+                ),
+                ("/a.js", "text/javascript", "export const name = 'a'; log.push('a evaluated');".into()),
+                ("/lib/index.js", "text/javascript", "import { helper } from './helper.js'; export default helper();".into()),
+                ("/lib/helper.js", "text/javascript", "export const helper = () => 'lib';".into()),
+                (
+                    "/main.js",
+                    "text/javascript",
+                    "import { name } from './a.js'; const later = await Promise.resolve('tla');\
+                     log.push('main ' + name + ' ' + later + ' ' + import.meta.url.split('/').pop());\
+                     const dynamic = await import('./dyn.js'); log.push('main import ' + dynamic.value);"
+                        .into(),
+                ),
+                ("/dyn.js", "text/javascript", "export const value = 42;".into()),
+                ("/deferred.js", "text/javascript", "log.push('deferred');".into()),
+            ],
+            vec![],
+        );
+        let mut engine = HtmlEngine::new("t");
+        engine.load(&format!("{base}/"));
+        assert_eq!(engine.last_error, None);
+        let log = evaluate(&mut engine, "JSON.stringify(log)")["result"]["value"].as_str().unwrap().to_string();
+        let log: Vec<String> = serde_json::from_str(&log).unwrap();
+        let at = |entry: &str| log.iter().position(|l| l == entry).unwrap_or_else(|| panic!("{entry} missing from {log:?}"));
+        assert_eq!(log[0], "classic");
+        assert_eq!(log.iter().filter(|l| *l == "a evaluated").count(), 1, "one module instance: {log:?}");
+        assert!(at("a evaluated") < at("inline a lib true"));
+        assert!(at("inline a lib true") < at("main a tla main.js"), "{log:?}");
+        assert!(at("main a tla main.js") < at("main import 42"));
+        assert!(at("deferred") < at("dcl"), "{log:?}");
+        at("classic import 42");
+        assert!(!log.iter().any(|l| l == "nomodule ran"), "{log:?}");
+    }
+
+    #[test]
+    fn a_bare_specifier_without_an_import_map_fails_like_chrome() {
+        let mut engine = engine_with("<body></body>");
+        engine.load(
+            "data:text/html,<script>window.log = []</script>\
+             <script type=module onerror=\"log.push('error event')\">import x from 'vue'</script>",
+        );
+        let error = engine.last_error.clone().unwrap_or_default();
+        assert!(error.contains("Failed to resolve module specifier \"vue\""), "{error}");
+        assert_eq!(evaluate(&mut engine, "log.join()")["result"]["value"], "error event");
     }
 
     #[test]

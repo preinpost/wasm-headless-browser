@@ -6,7 +6,7 @@
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
 이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
-보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). 다음 후보는 §0.4.
+보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -44,7 +44,7 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 184, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 187, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 40 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
@@ -65,7 +65,6 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 - **콘솔 (`Runtime.consoleAPICalled`).** 지금은 `probe_a_url`로만 본다.
 - **스크롤.** `scrollIntoView`가 아무것도 안 한다. 뷰포트 밖 요소의 클릭은 되지만
   `elementFromPoint`는 뷰포트 안만 본다.
-- **ES 모듈 (M2.11).**
 - **접근성 이름에 숨은 글자가 섞인다.** 참조 사이트 스냅샷의 최상위 `generic`(e1)의
   이름에 `display:none`인 추가 인증 화면의 글자가 들어간다. 내용에서 이름을 만들 때
   숨은 하위 요소를 빼야 한다(ax.rs). M2.13 전후로 같으므로 원래 있던 문제다.
@@ -111,6 +110,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `paint.rs`, `color.rs`, `png.rs` | 스크린샷: 레이아웃을 칠하고 PNG로. 배경 이미지와 그라디언트 해석도 `paint.rs` |
 | `images.rs` | 탭의 이미지 저장소: 가져오기, 크기, 디코딩(PNG·JPEG·GIF·WebP), 기다리기 |
 | `screencast.rs` | `Page.startScreencast`: 바뀐 화면을 JPEG 프레임으로, 응답을 받은 뒤에만 |
+| `modules.rs` | ES 모듈의 지정자 해석(import map 포함)과 로딩. QuickJS가 링크와 평가를 맡는다 |
 | `ax.rs` | 접근성 트리 |
 | `js.rs` | `ScriptHost`: QuickJS를 전용 스레드(32MB 스택)에 가두고 채널로 부른다. 가상 시계 작업 큐, CDP용 평가 |
 | `bindings.rs` | JS에 주는 원시 함수(`__dom`)와 `PRELUDE` 조립 |
@@ -364,7 +364,21 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       거의 그대로이고(이득은 받는 동안 파싱이 겹치는 데서 온다), 남은 것은 번들
       파싱(약 1.7초)과 동기 XHR인 `the language pack`(6MB, 0.5~0.8초)이다.
       gzip은 오히려 손해다(§2).
-- [ ] M2.11 ES 모듈(`type=module`)과 `import()`.
+- [x] M2.11 ES 모듈(`modules.rs`). rquickjs의 `loader` feature(순수 Rust `relative-path`
+      하나 추가)로 QuickJS에 경로 해석기와 로더를 단다. 모듈 이름은 절대 URL이라 모듈
+      자신이 import의 기준이 된다. 상대·절대 지정자는 URL로, bare 지정자는
+      `<script type=importmap>`의 `imports`로(정확히 맞는 것, 아니면 가장 긴 `/` 접두어)
+      풀고, 없으면 Chrome과 같은 "Failed to resolve module specifier" 오류다. 기준이 URL이
+      아니면(클래식 스크립트의 `import()`, `Runtime.evaluate`) 문서 URL을 쓴다. 로딩은
+      엔진의 `Client`라 쿠키·`Network.*`·미리 받기가 그대로 적용되고, 파서가 찾은 모듈
+      `src`와 `<link rel=modulepreload>`는 파싱 직후 미리 받는다. `import.meta.url`을
+      준다. 인라인 모듈은 `문서URL#inline-module-N`이라는 고유한 이름으로 선언한다.
+      실행 순서: 모듈은 인라인도 `defer`처럼 문서 순서대로, `async`면 async 순서로,
+      스크립트가 넣은 모듈은 태스크에서. top-level await와 모듈 안팎의 `import()`가 된다.
+      평가가 끝나면 외부 모듈은 `load`, 실패하면 `error`. `nomodule` 스크립트는 이제
+      돌지 않는다(모듈을 지원하는 브라우저처럼). 없는 것: import map의 `scopes`·
+      `integrity`, JSON·CSS 모듈, MIME 검사. vite.dev(VitePress)가 네이티브와 WASIX에서
+      오류 없이 하이드레이션된다. 모듈 실행으로 0.3~1초가 더 걸린다.
 - [ ] M2.12 `popstate`. 지금은 `pushState`로 만든 항목으로 뒤로 가면 그 URL을
       새로 읽는다.
 - [x] M2.5 마우스. `Input.dispatchMouseEvent`가 히트 테스트로 대상을 찾고

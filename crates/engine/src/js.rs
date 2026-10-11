@@ -638,6 +638,11 @@ impl ScriptHost {
                 };
                 // Only here, where the thread's stack is known to be larger.
                 js.runtime().set_max_stack_size(SCRIPT_STACK_LIMIT);
+                // Modules resolve and load through the page; see modules.rs.
+                js.runtime().set_loader(
+                    crate::modules::PageResolver(Arc::clone(&thread_state)),
+                    crate::modules::PageLoader(Arc::clone(&thread_state)),
+                );
                 if let Err(e) = js.with(|ctx| crate::bindings::install(&ctx, &thread_state)) {
                     let _ = ready_tx.send(Err(e));
                     return;

@@ -103,6 +103,8 @@ pub struct DomState {
     /// Requests script started and has not collected yet, by handle. See
     /// `httpStart`.
     requests: Arc<Mutex<HashMap<u32, (fetch::Pending, String)>>>,
+    /// The page's import maps, merged, for resolving module specifiers.
+    import_map: Mutex<crate::modules::ImportMap>,
 }
 
 impl DomState {
@@ -124,6 +126,7 @@ impl DomState {
             user_agent: Arc::new(Mutex::new(user_agent.to_string())),
             storage: Arc::new(Mutex::new(HashMap::new())),
             requests: Arc::new(Mutex::new(HashMap::new())),
+            import_map: Mutex::new(Default::default()),
         }
     }
 
@@ -149,6 +152,27 @@ impl DomState {
         let _ = self.take_requested_navigation();
         let _ = self.take_requested_history();
         let _ = self.take_url_change();
+        if let Ok(mut map) = self.import_map.lock() {
+            *map = Default::default();
+        }
+    }
+
+    pub fn client(&self) -> &fetch::Client {
+        &self.client
+    }
+
+    pub fn document_url(&self) -> String {
+        with_doc(&self.doc, |d| d.url().to_string()).unwrap_or_default()
+    }
+
+    pub fn import_map(&self) -> crate::modules::ImportMap {
+        self.import_map.lock().map(|m| m.clone()).unwrap_or_default()
+    }
+
+    /// Adds a `<script type=importmap>`'s JSON to the page's map.
+    pub fn add_import_map(&self, json: &str) -> Result<(), String> {
+        let base = self.document_url();
+        self.import_map.lock().map_err(|_| "the import map is unavailable".to_string())?.merge(json, &base)
     }
 
     /// Whether script changed the URL in place since the last call, and if so
@@ -917,6 +941,32 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
     }
 
     install_fn!(ctx, api, "resolveUrl", |base: String, relative: String| resolve_url(&base, &relative));
+
+    // A module script. Inline, its source is declared under `name`, unique
+    // per script, with `url`, the document's, as `import.meta.url`; external,
+    // `url` is loaded through the page's loader (modules.rs), with whatever
+    // it imports. Either way the result is the promise of its evaluation,
+    // which top-level `await` can keep pending. Syntax and loading errors
+    // are thrown.
+    install_fn!(
+        ctx,
+        api,
+        "runModule",
+        |ctx: Ctx<'js>, source: Option<String>, name: String, url: String| -> rquickjs::Result<rquickjs::Promise<'js>> {
+            match source {
+                Some(source) => {
+                    let (_, promise) = crate::modules::declare(&ctx, &name, &url, source)?.eval()?;
+                    Ok(promise)
+                }
+                None => rquickjs::Module::import(&ctx, url),
+            }
+        }
+    );
+    {
+        // A `<script type=importmap>`'s JSON. Returns the error, or nothing.
+        let state = Arc::clone(state);
+        install_fn!(ctx, api, "addImportMap", move |json: String| state.add_import_map(&json).err());
+    }
 
     // Images, through the target's store. The store is taken out of the
     // document before waiting: the lock must not be held while a download

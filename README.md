@@ -47,8 +47,11 @@ Images are fetched as a browser fetches them: `<img>` loads fire before the
 window's `load`, layout uses intrinsic sizes, and screenshots paint images
 (PNG, JPEG, GIF, WebP), CSS backgrounds and gradients.
 
-Not there yet: shadows and SVG in screenshots, scrolling, ES modules, and
-request interception (`network route`). The WASIX module is 5.2 MB, the font
+ES modules run: `<script type=module>`, static and dynamic `import`,
+top-level `await` and import maps, so Vite-built sites hydrate.
+
+Not there yet: shadows and SVG in screenshots, scrolling, and request
+interception (`network route`). The WASIX module is 5.2 MB, the font
 1.15 MB of it.
 
 ## Why the shape is what it is
@@ -173,7 +176,7 @@ has acknowledged the previous one. The focused field shows a caret.
 |---|---|
 | M0 | Protocol plumbing and the engine seam. **Done** |
 | M1 | Real engine: parsing, DOM, fetching over HTTP(S), CSS cascade, layout, screenshots with images. **Done** |
-| M2 | JavaScript: QuickJS (patched, see [`vendor/README.md`](vendor/README.md)), a DOM binding, an event loop, `fetch` and XHR, input. **Done**, except ES modules |
+| M2 | JavaScript: QuickJS (patched, see [`vendor/README.md`](vendor/README.md)), a DOM binding, an event loop, `fetch` and XHR, input, ES modules. **Done** |
 | M3 | Network: cookies and `Network.*` events are **done**; request interception is not |
 | M4 | Credentials held in memory only, typed by placeholder, scrubbed from CDP. **Done** |
 

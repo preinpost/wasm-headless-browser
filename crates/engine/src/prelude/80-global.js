@@ -55,16 +55,61 @@ const CLASSIC_TYPES = new Set([
   'text/jscript', 'text/livescript', 'text/javascript1.0', 'text/javascript1.5',
 ]);
 
-// 'classic', 'module', or null for a data block such as JSON or a template.
+// 'classic', 'module', 'importmap', or null for a data block such as JSON
+// or a template. A classic script marked `nomodule` is the fallback for
+// browsers without modules, so it does not run here.
 function scriptKind(id) {
   const type = api.attr(id, 'type');
+  let kind;
   if (type === undefined) {
     const language = api.attr(id, 'language');
-    return language === undefined || language === '' || CLASSIC_TYPES.has('text/' + language.toLowerCase()) ? 'classic' : null;
+    kind = language === undefined || language === '' || CLASSIC_TYPES.has('text/' + language.toLowerCase()) ? 'classic' : null;
+  } else {
+    const t = type.trim().toLowerCase();
+    kind = t === 'module' ? 'module' : t === 'importmap' ? 'importmap' : CLASSIC_TYPES.has(t) ? 'classic' : null;
   }
-  const t = type.trim().toLowerCase();
-  if (t === 'module') return 'module';
-  return CLASSIC_TYPES.has(t) ? 'classic' : null;
+  if (kind === 'classic' && api.hasAttr(id, 'nomodule')) return null;
+  return kind;
+}
+
+// A module script. Its imports are fetched as it is linked, then it runs,
+// and `load` or `error` fires when its evaluation settles, which top-level
+// `await` can put off. A module has no `document.currentScript`. Returns an
+// error message for a failure known at once, or ''.
+function runModuleElement(id, el) {
+  const src = api.attr(id, 'src');
+  let promise;
+  try {
+    if (src !== undefined) {
+      const url = resolveUrl(src);
+      if (!url) {
+        schedule(() => fire(el, 'error'), 0);
+        return `invalid module URL ${src}`;
+      }
+      promise = api.runModule(undefined, url, url);
+    } else {
+      const source = api.textContent(id);
+      if (!source.trim()) return '';
+      // Unique per script, so two inline modules are two modules; it still
+      // resolves imports against the document, the fragment aside.
+      const page = api.url();
+      promise = api.runModule(source, `${page.split('#')[0]}#inline-module-${id}`, page);
+    }
+  } catch (e) {
+    reportError(e);
+    schedule(() => fire(el, 'error'), 0);
+    return String(e && e.message !== undefined ? e.message : e);
+  }
+  promise.then(
+    () => {
+      if (src !== undefined) fire(el, 'load');
+    },
+    (e) => {
+      reportError(e);
+      fire(el, 'error');
+    },
+  );
+  return '';
 }
 
 // Fetches and runs one script element. Returns an error message, or ''.
@@ -73,11 +118,15 @@ function runScriptElement(id, finish) {
   const kind = scriptKind(id);
   if (kind === null) return '';
   const el = wrap(id);
-  if (kind === 'module') {
-    // Modules need a module loader, which does not exist yet. `nomodule`
-    // fallbacks do run, so pages that ship both still work.
-    schedule(() => fire(el, 'error'), 0);
-    return 'module scripts are not supported yet';
+  if (kind === 'module') return runModuleElement(id, el);
+  if (kind === 'importmap') {
+    if (api.hasAttr(id, 'src')) {
+      schedule(() => fire(el, 'error'), 0);
+      return 'an import map cannot have a src';
+    }
+    const error = api.addImportMap(api.textContent(id));
+    if (error) console.error(error);
+    return error ?? '';
   }
   const src = api.attr(id, 'src');
   let source;
@@ -115,6 +164,11 @@ function prepareScript(id) {
   // An empty inline script waits for content or a src, as in a browser.
   if (!hasSrc && !api.textContent(id).trim()) return;
   startedScripts.add(id);
+  if (scriptKind(id) === 'module') {
+    // Inserted modules run when they are ready, inline ones included.
+    schedule(() => runScriptElement(id), 0);
+    return;
+  }
   if (hasSrc) {
     const url = scriptKind(id) === 'classic' ? resolveUrl(api.attr(id, 'src')) : null;
     const finish = url ? startRequest('GET', url, ['Accept', '*/*'], '', 'Script') : undefined;
