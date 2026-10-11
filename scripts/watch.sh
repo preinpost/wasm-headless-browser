@@ -17,7 +17,13 @@
 #
 #   agent-browser --session watch --cdp http://127.0.0.1:9222 snapshot -i
 #
-# Ctrl-C stops the engine and the dashboard.
+# The viewport is set to agent-browser's own default, 1280x720 (VIEWPORT to
+# change it). The dashboard turns a click into page coordinates with the
+# viewport agent-browser believes in, so the engine has to be told it: left
+# at the engine's 800x600, every click lands 1.6 times too far right and down.
+#
+# Ctrl-C stops the engine, and the dashboard if this script started it; one
+# that was already running is used and left running.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,6 +33,7 @@ MODE="${MODE:-native}"
 CDP_PORT="${CDP_PORT:-9222}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-4848}"
 BASE="http://127.0.0.1:${CDP_PORT}"
+read -r VIEW_WIDTH VIEW_HEIGHT <<<"${VIEWPORT:-1280 720}"
 export AGENT_BROWSER_SESSION="${AGENT_BROWSER_SESSION:-watch}"
 
 case "$MODE" in
@@ -44,9 +51,12 @@ case "$MODE" in
     ;;
 esac
 
+STARTED_DASHBOARD=""
 cleanup() {
   agent-browser --cdp "$BASE" close >/dev/null 2>&1 || true
-  agent-browser dashboard stop >/dev/null 2>&1 || true
+  # Only a dashboard this script started: one already running may be
+  # showing someone else's sessions.
+  [[ -n "$STARTED_DASHBOARD" ]] && { agent-browser dashboard stop >/dev/null 2>&1 || true; }
   [[ -n "${ENGINE_PID:-}" ]] && { kill "$ENGINE_PID" 2>/dev/null || true; wait "$ENGINE_PID" 2>/dev/null || true; }
 }
 trap cleanup EXIT INT TERM
@@ -61,8 +71,18 @@ for _ in $(seq 1 300); do
   sleep 0.1
 done
 
+agent-browser --cdp "$BASE" set viewport "$VIEW_WIDTH" "$VIEW_HEIGHT" >/dev/null
 agent-browser --cdp "$BASE" open "$URL"
-agent-browser dashboard start --port "$DASHBOARD_PORT" >/dev/null
+# One dashboard serves every session: use the one running, wherever it is.
+if curl -s -m 2 -o /dev/null "http://localhost:${DASHBOARD_PORT}/"; then
+  :
+elif started="$(agent-browser dashboard start --port "$DASHBOARD_PORT" 2>&1)"; then
+  STARTED_DASHBOARD=1
+else
+  running="$(grep -o 'port [0-9]*' <<<"$started" | grep -o '[0-9]*' | head -1)"
+  [[ -n "$running" ]] || { echo "$started" >&2; exit 1; }
+  DASHBOARD_PORT="$running"
+fi
 echo
 echo "watch and drive it at  http://localhost:${DASHBOARD_PORT}   (session: ${AGENT_BROWSER_SESSION})"
 echo "Ctrl-C to stop"
