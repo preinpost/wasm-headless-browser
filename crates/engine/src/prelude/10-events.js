@@ -165,6 +165,15 @@ const PromiseRejectionEvent = eventInterface('PromiseRejectionEvent', Event, { p
 // ---- EventTarget ------------------------------------------------------------
 
 const listenerMaps = new WeakMap();
+
+// Listeners that make an element something to click, for the
+// accessibility tree, which keeps such elements as Chrome does.
+const CLICK_TYPES = new Set(['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup']);
+function noteClickable(target, type) {
+  if (!CLICK_TYPES.has(type)) return;
+  const id = nodeIds.get(target);
+  if (id !== undefined && isElementId(id)) api.markClickable(id);
+}
 const handlerMaps = new WeakMap();
 const compiledHandlers = new WeakMap();
 
@@ -186,6 +195,7 @@ class EventTarget {
     if (!list) byType.set(type, (list = []));
     if (list.some((l) => l.callback === callback && l.capture === capture)) return;
     list.push({ callback, capture, once: !!opts.once, passive: !!opts.passive, removed: false });
+    noteClickable(target, type);
     if (opts.signal) {
       opts.signal.addEventListener('abort', () => target.removeEventListener(type, callback, { capture }));
     }
@@ -340,6 +350,7 @@ for (const type of HANDLER_EVENTS) {
       let map = handlerMaps.get(target);
       if (!map) handlerMaps.set(target, (map = new Map()));
       map.set(type, typeof value === 'function' ? value : null);
+      if (typeof value === 'function') noteClickable(target, type);
     },
     configurable: true,
     enumerable: true,

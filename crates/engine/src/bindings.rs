@@ -732,6 +732,14 @@ fn put_geometry<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         });
     }
 
+    // An element got a click listener; see `Document::mark_clickable`.
+    {
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "markClickable", move |id: usize| {
+            let _ = with_doc_mut(&doc, |d| d.mark_clickable(id));
+        });
+    }
+
     // `innerText`: the text as rendered (text.rs).
     {
         let doc = Arc::clone(&state.doc);

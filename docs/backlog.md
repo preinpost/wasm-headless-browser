@@ -44,9 +44,9 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 203, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 204, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
-| `./scripts/verify-m1.sh` | 42 |
+| `./scripts/verify-m1.sh` | 43 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
 | `WAIT_FOR='#first-field' ./scripts/compare-layout.sh https://login.example.com/` | Chrome과 비교. 13개 중 8개가 2px 안, 평균 1.4px |
 | `WHB_PROBE_URL=https://login.example.com/ cargo test --release -p engine probe_a_url -- --ignored --nocapture` | 오류 없이 `#/login`까지 |
@@ -57,10 +57,9 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 - **참조 사이트 로고.** `div.logo`의 `<img>`가 우리 엔진에서는 `src` 없이 남는다.
   Chrome에서는 보인다. 로고 주소를 정하는 스크립트 경로를 `probe_a_url`로 찾아야 한다.
-- **문단에 이름이 붙는다.** Chrome의 스냅샷은 `paragraph`에 이름이 없고 글자를 자식으로
-  보이는데, 우리는 `paragraph "You are signed in."`이다. ARIA에서 paragraph·strong·emphasis·
-  code·mark 등은 내용에서 이름을 얻지 않는다(`ax.rs`의 `names_from_content`). 고칠 때
-  `verify-m1.sh`의 기대값과 함께 Chrome 스냅샷으로 맞춘다.
+- **접근성 트리의 남은 차이(겉모습).** Chrome은 줄 안 요소를 건너 글자를 한
+  `StaticText`로 합치고(`" bold span"`) 글자 끝 공백을 남기며, 목록 기호(`ListMarker`)와
+  `MenuListPopup`을 내고, `<tbody>`의 rowgroup은 무시한다. 우리는 하지 않는다.
 - **WebAssembly.** QuickJS에 없다. vite.dev의 코드 하이라이터(oniguruma)가 이것 때문에
   실패한다. 인터프리터 안에서 wasm을 돌리는 것은 범위 밖으로 본다.
 - **그림자, SVG.** `box-shadow`와 SVG 이미지(`<img src=*.svg>`, 인라인 `<svg>`)는 그리지 않는다.
@@ -271,6 +270,20 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       `:where`·`:has`, 폼 상태 의사 클래스, `:focus`, 명시도. `:hover`처럼 포인터가
       있어야 참인 것은 거짓이고, 의사 요소로 끝나는 선택자는 요소와 맞지 않는다.
       잘못된 선택자는 스크립트에서 SyntaxError다. 캐스케이드가 같은 파서를 쓴다.
+- [x] M1.2b 접근성 트리를 Chrome 스냅샷과 맞췄다. 여러 역할이 든 페이지를 Chrome과 나란히
+      떠서 비교했다. 이름: 내용에서 이름을 얻는 것은 button·link·heading·option·menuitem·
+      tab·treeitem·cell·헤더·term·tooltip·checkbox 등뿐이고, paragraph·strong·emphasis·code·
+      mark·blockquote·listitem·definition·caption·legend·label·alert·status는 이름 없이 글자가
+      자식이다. 표는 `<caption>`, fieldset은 `<legend>`로 이름을 얻는다. 역할: `<b>`·`<i>`는
+      generic, `<th>`는 scope·thead·옆 칸에 따라 columnheader/rowheader, `<dl>`은
+      DescriptionList, `<img>`는 image, legend·figcaption·abbr은 Chrome의 내부 역할 이름,
+      명시적 ARIA 역할 표를 넓혔다(note, group, grid 등). 속성: `<select>`는 고른 옵션이 값이고
+      `expanded=false`, 고른 옵션은 `selected`, 목록 항목은 중첩 깊이를 `level`로. 이름 없는
+      generic은 Chrome처럼 `ignored`로 보내서 클라이언트가 건너뛰고 자식을 올린다(스냅샷
+      맨 위의 쓸모없는 `generic`이 사라졌다). 단 클릭 리스너(click·mousedown·mouseup·
+      pointerdown·pointerup, `addEventListener`나 `on*` 속성)가 있거나 `onclick`·`tabindex`·
+      `contenteditable`이 있으면 남긴다(`Document::mark_clickable`). 그래서 참조 사이트의
+      `snapshot -i`가 Chrome과 줄까지 같다.
 - [x] M1.4a 인라인 `style`의 `display: none`·`visibility: hidden`을 접근성 트리가
       반영한다(`style.rs`). `visibility`의 상속은 아직 하위 트리 전체로 근사한다.
 - [x] M1.4b CSS 캐스케이드. `css.rs`가 시트를 읽고 `style.rs`가 계산한다. 출처·

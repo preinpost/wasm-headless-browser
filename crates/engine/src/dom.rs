@@ -123,6 +123,9 @@ pub struct Document {
     /// What the document's bytes were decoded from: `document.characterSet`,
     /// and the default for its scripts and stylesheets.
     encoding: &'static encoding_rs::Encoding,
+    /// Elements script gave a click, mouse or pointer press listener, which
+    /// Chrome's accessibility tree keeps even when they are plain boxes.
+    clickable: std::collections::HashSet<NodeId>,
 }
 
 impl Default for Document {
@@ -148,7 +151,16 @@ impl Document {
             scroll: HashMap::new(),
             scroll_generation: 0,
             encoding: encoding_rs::UTF_8,
+            clickable: Default::default(),
         }
+    }
+
+    pub fn mark_clickable(&mut self, id: NodeId) {
+        self.clickable.insert(id);
+    }
+
+    pub fn is_clickable(&self, id: NodeId) -> bool {
+        self.clickable.contains(&id)
     }
 
     pub fn encoding(&self) -> &'static encoding_rs::Encoding {

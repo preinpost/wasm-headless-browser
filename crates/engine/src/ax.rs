@@ -31,6 +31,14 @@ pub struct AxNode {
     pub value: Option<String>,
     /// Disabled, as a control or by `aria-disabled`.
     pub disabled: bool,
+    /// A collapsed or expanded control: `false` for a `<select>` that is
+    /// closed, as it always is here; `aria-expanded` otherwise.
+    pub expanded: Option<bool>,
+    /// An option chosen in its list.
+    pub selected: bool,
+    /// Something to act on even without a role that says so: a click
+    /// listener, `onclick`, `tabindex`, `contenteditable`.
+    pub actionable: bool,
 }
 
 /// Builds the tree in document order.
@@ -144,6 +152,9 @@ fn collect(
             level: None,
             value: None,
             disabled: false,
+            expanded: None,
+            selected: false,
+            actionable: false,
         });
         siblings.push(node_id);
         return;
@@ -169,9 +180,12 @@ fn collect(
             backend_dom_node_id: id + 1,
             parent,
             children: Vec::new(),
-            level: if is_root { None } else { heading_level(doc, id) },
+            level: if is_root { None } else { level_of(doc, id, role) },
             value: if is_root { None } else { control_value(doc, id) },
             disabled: !is_root && is_disabled(doc, id),
+            expanded: if is_root { None } else { expanded_of(doc, id, role) },
+            selected: role == "option" && is_chosen(doc, id),
+            actionable: doc.is_clickable(id) || ["onclick", "tabindex", "contenteditable"].iter().any(|a| doc.has_attr(id, a)),
         });
 
         let mut children = Vec::new();
@@ -201,6 +215,36 @@ fn explicit_role(doc: &Document, id: NodeId) -> Option<&'static str> {
     let first = raw.split_whitespace().next()?.to_ascii_lowercase();
     Some(match first.as_str() {
         "alert" => "alert",
+        "alertdialog" => "alertdialog",
+        "application" => "application",
+        "blockquote" => "blockquote",
+        "caption" => "caption",
+        "code" => "code",
+        "definition" => "definition",
+        "deletion" => "deletion",
+        "document" => "document",
+        "emphasis" => "emphasis",
+        "feed" => "feed",
+        "generic" => "generic",
+        "grid" => "grid",
+        "gridcell" => "gridcell",
+        "group" => "group",
+        "insertion" => "insertion",
+        "log" => "log",
+        "marquee" => "marquee",
+        "math" => "math",
+        "meter" => "meter",
+        "note" => "note",
+        "paragraph" => "paragraph",
+        "radiogroup" => "radiogroup",
+        "rowgroup" => "rowgroup",
+        "scrollbar" => "scrollbar",
+        "strong" => "strong",
+        "subscript" => "subscript",
+        "superscript" => "superscript",
+        "time" => "time",
+        "timer" => "timer",
+        "treegrid" => "treegrid",
         "article" => "article",
         "banner" => "banner",
         "button" => "button",
@@ -214,7 +258,7 @@ fn explicit_role(doc: &Document, id: NodeId) -> Option<&'static str> {
         "figure" => "figure",
         "form" => "form",
         "heading" => "heading",
-        "img" => "img",
+        "img" | "image" => "image",
         "link" => "link",
         "list" => "list",
         "listbox" => "listbox",
@@ -274,7 +318,7 @@ pub fn role_of(doc: &Document, id: NodeId) -> &'static str {
         "address" => "group",
         "article" => "article",
         "aside" => "complementary",
-        "b" | "strong" => "strong",
+        "strong" => "strong",
         "blockquote" => "blockquote",
         "body" | "div" | "span" => "generic",
         "button" => "button",
@@ -285,24 +329,23 @@ pub fn role_of(doc: &Document, id: NodeId) -> &'static str {
         "details" => "group",
         "dfn" => "term",
         "dialog" => "dialog",
-        "dl" => "list",
+        "dl" => "DescriptionList",
         "dt" => "term",
         "em" => "emphasis",
         "fieldset" => "group",
-        "figcaption" => "caption",
+        "figcaption" => "Figcaption",
         "figure" => "figure",
         "footer" => "contentinfo",
         "form" => "form",
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading",
         "header" => "banner",
         "hr" => "separator",
-        "i" => "emphasis",
         "img" => {
             // An image with no accessible name and no alt is presentational.
             if doc.attr(id, "alt") == Some("") && doc.attr(id, "role").is_none() {
                 "generic"
             } else {
-                "img"
+                "image"
             }
         }
         "input" => match doc.attr(id, "type").unwrap_or("text") {
@@ -319,7 +362,8 @@ pub fn role_of(doc: &Document, id: NodeId) -> &'static str {
         },
         "ins" => "insertion",
         "label" => "LabelText",
-        "legend" => "legend",
+        "legend" => "Legend",
+        "abbr" => "Abbr",
         "li" => "listitem",
         "main" => "main",
         "mark" => "mark",
@@ -355,16 +399,58 @@ pub fn role_of(doc: &Document, id: NodeId) -> &'static str {
         "tbody" | "thead" | "tfoot" => "rowgroup",
         "td" => "cell",
         "textarea" => "textbox",
-        "th" => match doc.attr(id, "scope") {
-            Some("row") => "rowheader",
-            Some("col") | Some("colgroup") => "columnheader",
-            _ => "cell",
-        },
+        "th" => th_role(doc, id),
         "time" => "time",
         "tr" => "row",
         "video" | "audio" => "generic",
         _ => "generic",
     }
+}
+
+/// A `<th>`: by its `scope`, else a column header in a `<thead>` or a row of
+/// headers only, and a row header beside data cells.
+fn th_role(doc: &Document, id: NodeId) -> &'static str {
+    match doc.attr(id, "scope").map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("row" | "rowgroup") => return "rowheader",
+        Some("col" | "colgroup") => return "columnheader",
+        _ => {}
+    }
+    let row = doc.parent(id);
+    if row.and_then(|r| doc.parent(r)).is_some_and(|g| doc.is_tag(g, "thead")) {
+        return "columnheader";
+    }
+    let beside_data = row.is_some_and(|r| doc.children(r).iter().any(|c| doc.is_tag(*c, "td")));
+    if beside_data {
+        "rowheader"
+    } else {
+        "columnheader"
+    }
+}
+
+/// The `level` property: a heading's, a list item's nesting depth, a tree
+/// item's `aria-level`.
+fn level_of(doc: &Document, id: NodeId, role: &str) -> Option<u8> {
+    match role {
+        "heading" => heading_level(doc, id),
+        "listitem" => {
+            let lists = std::iter::successors(doc.parent(id), |p| doc.parent(*p))
+                .filter(|p| matches!(doc.tag(*p), Some("ul" | "ol" | "menu")))
+                .count();
+            Some(lists.clamp(1, 255) as u8)
+        }
+        "treeitem" => Some(doc.attr(id, "aria-level").and_then(|v| v.parse().ok()).unwrap_or(1)),
+        _ => None,
+    }
+}
+
+/// The option a `<select>` shows: the selected one, else the first.
+fn chosen_option(doc: &Document, select: NodeId) -> Option<NodeId> {
+    let options: Vec<NodeId> = doc.descendants(select).filter(|o| doc.is_tag(*o, "option")).collect();
+    options
+        .iter()
+        .copied()
+        .find(|o| doc.control(*o).selected.unwrap_or_else(|| doc.has_attr(*o, "selected")))
+        .or(options.first().copied())
 }
 
 fn heading_level(doc: &Document, id: NodeId) -> Option<u8> {
@@ -382,6 +468,29 @@ fn heading_level(doc: &Document, id: NodeId) -> Option<u8> {
         return Some(2);
     }
     None
+}
+
+fn expanded_of(doc: &Document, id: NodeId, role: &str) -> Option<bool> {
+    match doc.attr(id, "aria-expanded") {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ if role == "combobox" && doc.is_tag(id, "select") => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether an option is the one chosen: in a `<select>`, as it shows it;
+/// elsewhere by `aria-selected`.
+fn is_chosen(doc: &Document, id: NodeId) -> bool {
+    if doc.attr(id, "aria-selected") == Some("true") {
+        return true;
+    }
+    let select = std::iter::successors(doc.parent(id), |p| doc.parent(*p)).find(|p| doc.is_tag(*p, "select"));
+    match select {
+        Some(select) if doc.has_attr(select, "multiple") => doc.control(id).selected.unwrap_or_else(|| doc.has_attr(id, "selected")),
+        Some(select) => chosen_option(doc, select) == Some(id),
+        None => false,
+    }
 }
 
 /// Whether `id` is disabled, as HTML defines it for form controls: its own
@@ -420,6 +529,9 @@ fn is_disabled(doc: &Document, id: NodeId) -> bool {
 
 fn control_value(doc: &Document, id: NodeId) -> Option<String> {
     match role_of(doc, id) {
+        "combobox" if doc.is_tag(id, "select") => {
+            chosen_option(doc, id).map(|o| collapse(&doc.text_content(o)))
+        }
         "textbox" | "searchbox" | "combobox" | "slider" | "spinbutton" | "listbox" => {
             // A password field's value must never surface here.
             if doc.attr(id, "type") == Some("password") {
@@ -481,6 +593,19 @@ pub fn accessible_name(doc: &Document, id: NodeId, role: &str) -> String {
     // Weaker tag-specific fallbacks, such as a placeholder.
     if let Some(name) = weak_tag_name(doc, id) {
         return name;
+    }
+
+    // A table is named by its caption, a fieldset by its legend.
+    let named_by = match doc.tag(id) {
+        Some("table") => Some("caption"),
+        Some("fieldset") => Some("legend"),
+        _ => None,
+    };
+    if let Some(tag) = named_by {
+        let first = doc.children(id).iter().copied().find(|c| doc.is_tag(*c, tag));
+        if let Some(text) = first.map(|c| collapse(&doc.text_content(c))).filter(|t| !t.is_empty()) {
+            return text;
+        }
     }
 
     // Content-derived names.
@@ -583,14 +708,15 @@ fn label_for(doc: &Document, id: NodeId) -> Option<String> {
     None
 }
 
+/// Roles ARIA names from their content, as Chrome computes them. Others,
+/// paragraphs, emphasis, list items, alerts and the like, have no name of
+/// their own; their text is in their children.
 fn names_from_content(role: &str) -> bool {
     matches!(
         role,
         "button"
             | "link"
             | "heading"
-            | "paragraph"
-            | "listitem"
             | "option"
             | "menuitem"
             | "menuitemcheckbox"
@@ -601,19 +727,10 @@ fn names_from_content(role: &str) -> bool {
             | "rowheader"
             | "columnheader"
             | "term"
-            | "definition"
-            | "caption"
-            | "legend"
-            | "LabelText"
             | "tooltip"
-            | "status"
-            | "alert"
-            | "emphasis"
-            | "strong"
-            | "code"
-            | "blockquote"
-            | "mark"
-            | "label"
+            | "checkbox"
+            | "radio"
+            | "switch"
     )
 }
 
@@ -653,6 +770,17 @@ pub fn to_cdp(nodes: &[AxNode]) -> Value {
         if node.disabled {
             properties.push(json!({ "name": "disabled", "value": { "type": "boolean", "value": true } }));
         }
+        if let Some(expanded) = node.expanded {
+            properties.push(json!({ "name": "expanded", "value": { "type": "boolean", "value": expanded } }));
+        }
+        if node.selected {
+            properties.push(json!({ "name": "selected", "value": { "type": "boolean", "value": true } }));
+        }
+        // A generic box with nothing to say is ignored, as Chrome ignores
+        // it: clients skip it and keep its children.
+        if node.role == "generic" && node.name.is_empty() && properties.is_empty() && node.value.is_none() && !node.actionable {
+            entry["ignored"] = json!(true);
+        }
         if !properties.is_empty() {
             entry["properties"] = json!(properties);
         }
@@ -664,6 +792,7 @@ pub fn to_cdp(nodes: &[AxNode]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{build, to_cdp, AxNode};
+    use serde_json::json;
     use crate::parse::parse_html;
 
     /// The same page `engine-fake` served. The point of this test is that the
@@ -705,11 +834,9 @@ mod tests {
         assert_eq!(root.name, "Sandbox Login");
 
         assert_eq!(names_of(&nodes, "heading"), vec!["Sandbox Login"]);
-        assert!(
-            names_of(&nodes, "paragraph").iter().any(|n| n.starts_with("Sign in to continue")),
-            "paragraph name missing: {:?}",
-            names_of(&nodes, "paragraph")
-        );
+        // A paragraph has no name of its own; its text is its child's.
+        assert_eq!(names_of(&nodes, "paragraph"), vec![""]);
+        assert!(names_of(&nodes, "StaticText").iter().any(|n| n.starts_with("Sign in to continue")));
         assert!(find(&nodes, "form", "").is_some(), "form node missing");
 
         // Labels are their own role and name the controls through `for`.
@@ -784,7 +911,7 @@ mod tests {
         // aria-labelledby beats aria-label beats content.
         assert!(find(&nodes, "button", "From reference").is_some());
         assert!(find(&nodes, "button", "From label").is_some());
-        assert!(find(&nodes, "img", "From alt").is_some());
+        assert!(find(&nodes, "image", "From alt").is_some());
         assert!(find(&nodes, "button", "Send").is_some());
         assert!(find(&nodes, "textbox", "From placeholder").is_some());
         assert!(find(&nodes, "checkbox", "Wrapped label").is_some());
@@ -812,7 +939,46 @@ mod tests {
         // An image inside a label is still named by its alt text.
         let doc = parse_html("<body><label><img src='x' alt='From alt'> caption</label></body>");
         let nodes = build(&doc);
-        assert!(find(&nodes, "img", "From alt").is_some());
+        assert!(find(&nodes, "image", "From alt").is_some());
+    }
+
+    #[test]
+    fn roles_and_names_follow_chrome() {
+        let mut doc = parse_html(
+            "<body><p>para <b>bold</b></p><table><caption>Cap</caption><thead><tr><th>H</th></tr></thead>\
+             <tbody><tr><th>R</th><td>C</td></tr></tbody></table><dl><dt>T</dt><dd>D</dd></dl>\
+             <fieldset><legend>L</legend></fieldset><img alt=pic src=x><abbr title=t>a</abbr>\
+             <select aria-label=s><option>one</option><option selected>two</option></select>\
+             <div id=plain>plain</div><div id=click>click</div><div tabindex=0>tab</div><div role=note>n</div></body>",
+        );
+        let click = doc.find_id(doc.document_id(), "click").unwrap();
+        doc.mark_clickable(click);
+        let nodes = build(&doc);
+        let named = |role: &str| names_of(&nodes, role);
+        assert_eq!(named("paragraph"), vec![""], "no name from content");
+        assert!(named("strong").is_empty(), "<b> is generic");
+        assert_eq!(named("table"), vec!["Cap"]);
+        assert_eq!(named("columnheader"), vec!["H"]);
+        assert_eq!(named("rowheader"), vec!["R"]);
+        assert_eq!(named("DescriptionList"), vec![""]);
+        assert_eq!(named("group"), vec!["L"]);
+        assert_eq!(named("image"), vec!["pic"]);
+        assert_eq!(named("Abbr"), vec!["t"]);
+        assert_eq!(named("note"), vec![""]);
+        let combobox = nodes.iter().find(|n| n.role == "combobox").unwrap();
+        assert_eq!((combobox.value.as_deref(), combobox.expanded), (Some("two"), Some(false)));
+        let selected: Vec<&str> = nodes.iter().filter(|n| n.selected).map(|n| n.name.as_str()).collect();
+        assert_eq!(selected, ["two"]);
+
+        // Plain boxes are ignored; one with a click listener or a tabindex is not.
+        let cdp = to_cdp(&nodes);
+        let ignored = |dom: &str| {
+            let id = doc.find_id(doc.document_id(), dom);
+            let backend = id.map(|i| i + 1).unwrap_or(0);
+            cdp["nodes"].as_array().unwrap().iter().find(|n| n["backendDOMNodeId"] == backend).map(|n| n["ignored"].clone())
+        };
+        assert_eq!(ignored("plain"), Some(json!(true)));
+        assert_eq!(ignored("click"), Some(json!(false)));
     }
 
     #[test]
@@ -825,8 +991,9 @@ mod tests {
         );
         let nodes = build(&doc);
         let disabled: Vec<String> = nodes.iter().filter(|n| n.disabled).map(|n| format!("{} {}", n.role, n.name)).collect();
-        // The fieldset and the optgroup are disabled themselves, as in Chrome.
-        assert_eq!(disabled, ["textbox off", "group ", "button in fieldset", "button aria", "group ", "option grouped"]);
+        // The fieldset, named by its legend, and the optgroup are disabled
+        // themselves, as in Chrome.
+        assert_eq!(disabled, ["textbox off", "group in legend", "button in fieldset", "button aria", "group ", "option grouped"]);
         let cdp = to_cdp(&nodes).to_string();
         assert!(cdp.contains(r#"{"name":"disabled","value":{"type":"boolean","value":true}}"#), "{cdp}");
     }
@@ -852,7 +1019,7 @@ mod tests {
         let doc = parse_html("<body><p>hello world</p></body>");
         let nodes = build(&doc);
         let paragraph = nodes.iter().find(|n| n.role == "paragraph").expect("paragraph");
-        assert_eq!(paragraph.name, "hello world");
+        assert_eq!(paragraph.name, "", "the text is the child's, not the paragraph's");
         let children: Vec<&AxNode> =
             paragraph.children.iter().map(|id| nodes.iter().find(|n| &n.id == id).unwrap()).collect();
         assert_eq!(children.len(), 1);
@@ -925,12 +1092,12 @@ mod tests {
         // Parents precede their children, and siblings follow source order.
         let doc = parse_html("<body><div id='outer'><p id='first'>a</p><p id='second'>b</p></div><span>c</span></body>");
         let nodes = build(&doc);
-        let paragraphs: Vec<&str> = nodes
+        let texts: Vec<&str> = nodes
             .iter()
-            .filter(|n| n.role == "paragraph")
+            .filter(|n| n.role == "StaticText")
             .map(|n| n.name.as_str())
             .collect();
-        assert_eq!(paragraphs, vec!["a", "b"]);
+        assert_eq!(texts, vec!["a", "b", "c"]);
 
         for node in &nodes {
             for child in &node.children {
