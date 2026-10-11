@@ -7,7 +7,7 @@
 #
 # The site is fixtures/login: a page its own script renders, a fetch() login,
 # an HttpOnly session cookie, and a signed-in page that reads it back. That is
-# the shape of the reference site without its credentials.
+# the shape of a real React login site without its credentials.
 #
 # The credentials go to the engine the way they would for real: piped into its
 # stdin, bound to the site's origin with --secret. The client types

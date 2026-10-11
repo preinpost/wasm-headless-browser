@@ -19,7 +19,7 @@ HTML을 파싱하고, 페이지 JS를 QuickJS로 돌리고, 스타일시트를 �
 세션은 메모리 전용 쿠키 저장소에 남는다. 자격증명은 자리표시자로 입력하고
 클라이언트에게 돌아가지 않는다(`docs/credentials.md`).
 
-참조 사이트(`https://login.example.com`, React SPA)의 로그인 화면이 네이티브 약
+참조 사이트(실제 React SPA의 로그인 화면. 주소는 문서에 남기지 않는다)가 네이티브 약
 3.5초, WASIX 약 4.2초에 열리고, 800×600에서 Chrome과 1px 안팎으로 같은 자리에 배치되며, `fill`·`click`·
 `press Enter`가 된다. 가짜 계정으로 실패 응답까지 확인했다. 실제 계정 로그인은
 사용자가 `--secret`으로 직접 한다(README의 "Running it").
@@ -49,14 +49,14 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 43 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
-| `WAIT_FOR='#first-field' ./scripts/compare-layout.sh https://login.example.com/` | Chrome과 비교. 13개 중 8개가 2px 안, 평균 1.4px |
-| `WHB_PROBE_URL=https://login.example.com/ cargo test --release -p engine probe_a_url -- --ignored --nocapture` | 오류 없이 `#/login`까지 |
+| `WAIT_FOR='<첫 입력란 선택자>' ./scripts/compare-layout.sh <참조 사이트 URL>` | Chrome과 비교. 13개 중 8개가 2px 안, 평균 1.4px |
+| `WHB_PROBE_URL=<참조 사이트 URL> cargo test --release -p engine probe_a_url -- --ignored --nocapture` | 오류 없이 로그인 화면까지 |
 
 WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다린다(§6).
 
 ### 0.4 다음 후보
 
-- **참조 사이트 로고.** `div.logo`의 `<img>`가 우리 엔진에서는 `src` 없이 남는다.
+- **참조 사이트 로고.** 로고 `<img>`가 우리 엔진에서는 `src` 없이 남는다.
   Chrome에서는 보인다. 로고 주소를 정하는 스크립트 경로를 `probe_a_url`로 찾아야 한다.
 - **접근성 트리의 남은 차이(겉모습).** Chrome은 줄 안 요소를 건너 글자를 한
   `StaticText`로 합치고(`" bold span"`) 글자 끝 공백을 남기며, 목록 기호(`ListMarker`)와
@@ -152,21 +152,21 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | 브라우저 샌드박스에서 외부 TCP·HTTPS가 된다. WISP 릴레이를 쓴다 (E4·E5) | 이 문서의 §3 |
 | QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다. 엔진에서는 `full-wasi`를 쓸 수 없다 (§6) | [docs/quickjs.md](quickjs.md) |
 | WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 글꼴과 래스터라이저까지 4.7MB, 이미지 디코더까지 5.2MB, 인코딩 5.4MB, resvg까지 6.2MB. 앞의 몇 개는 빌드 스크립트 표시값이라 실제보다 클 수 있다 | `ls -l`, 커밋 기록 |
-| 참조 사이트 배경은 인라인 `background-image`(`/api/login-step`, 1920×1080 JPEG 766KB)이고, 크기·위치는 `.login-background`의 `background: ... no-repeat top; background-size: 1920px 1080px`에서 온다. `cover`를 쓰는 규칙은 `min-height:1081px` 미디어 쿼리 안이라 800×600에서는 안 맞는다 | 2026-10-10 Chrome과 비교 |
-| 참조 사이트는 `Noto Sans KR, ...`으로 Noto Sans KR 웹 글꼴을 쓴다. 왼쪽 절반은 화면 전체에 깔린 배경 이미지와 그 위의 흰 글자이고, 로그인 상자는 그 위의 80% 흰색이다 | 2026-10-09 CSS와 Chrome 스크린샷 |
+| 참조 사이트 배경은 인라인 `background-image`(1920×1080 JPEG)이고, 크기·위치는 스타일시트 규칙의 `background: ... no-repeat top; background-size: 1920px 1080px`에서 온다. `cover`를 쓰는 규칙은 `min-height:1081px` 미디어 쿼리 안이라 800×600에서는 안 맞는다 | 2026-10-10 Chrome과 비교 |
+| 참조 사이트는 Noto Sans KR 웹 글꼴을 쓴다. 왼쪽 절반은 화면 전체에 깔린 배경 이미지와 그 위의 흰 글자이고, 로그인 상자는 그 위의 80% 흰색이다 | 2026-10-09 CSS와 Chrome 스크린샷 |
 | 참조 사이트 로그인 상자는 오른쪽에서 미끄러져 들어온다. Chrome에서 열자마자 재면 x가 수십 px 다르다 | 같은 날 |
 | WASIX에서 rustls + ring이 TLS 1.3으로 동작한다. 참조 사이트 인증서는 공개 루트로 검증된다 | [docs/wasix.md](wasix.md) |
 | example.com은 이제 본문이 문단 하나와 `<script src=/s.js>`뿐이다. 외부 스크립트 없이는 제목과 링크가 없다 | 2026-10-09 측정 |
-| 참조 사이트 로그인 화면을 800×600에서 Chrome(Playwright headless shell)과 비교하면 입력란·`.login-form`·`#wrap`·저작권 문구의 위치와 크기가 같거나 1px 차이다. 체크박스만 x가 8px 다르다. 아이디 입력란 클릭은 포커스를, "체크박스" 글자 클릭은 체크를 두 엔진에서 똑같이 바꾸고, 숨은 체크박스를 ref로 누르면 두 엔진 모두 빗나간다(`div.login-background`가 맞는다) | 2026-10-09 |
-| 캐스케이드를 넣은 뒤 참조 사이트 "다음" 버튼의 계산 스타일은 `display: block`, `cursor: pointer`, `width: 100%`, `height: 54px`, 배경 `#00aaff`(`a CSS variable`에서), 13.33px이다. 전체 스냅샷은 23줄이다 | 2026-10-09 |
-| 참조 사이트의 숨은 화면(추가 인증 선택, OTP, 실패 대화상자)은 CSS 클래스가 아니라 인라인 `style="display: none"`으로 숨는다. 인라인 스타일만 반영해도 로그인 화면의 인터랙티브 스냅샷이 25개 넘던 것에서 4개(첫 입력란, 아이디, 다음, 체크박스)로 준다 | 2026-10-09 측정 (M1.6) |
-| 참조 사이트에 가짜 계정으로 로그인하면 실패가 화면에 나온다. Enter 한 번에 아이디 단계(`POST /api/login-step`, a result code), 버튼이 "로그인"으로 바뀐 뒤 Enter 한 번 더에 인증(a result code "실패 문구")이고, 그 문구가 폼 아래 문단과 확인 대화상자로 스냅샷에 나온다. 클릭 없이 Enter만으로 된다 | 2026-10-09, 사용자 승인 아래 가짜 계정 `nonexistent-test-account`로 |
+| 참조 사이트 로그인 화면을 800×600에서 Chrome(Playwright headless shell)과 비교하면 입력란·로그인 폼·저작권 문구의 위치와 크기가 같거나 1px 차이다. 체크박스만 x가 8px 다르다. 아이디 입력란 클릭은 포커스를, 체크박스 라벨 글자 클릭은 체크를 두 엔진에서 똑같이 바꾸고, 숨은 체크박스를 ref로 누르면 두 엔진 모두 빗나간다(배경 상자가 맞는다) | 2026-10-09 |
+| 캐스케이드를 넣은 뒤 참조 사이트 "다음" 버튼의 계산 스타일은 `display: block`, `cursor: pointer`, `width: 100%`, `height: 54px`, 배경색은 CSS 변수에서, 13.33px이다. 전체 스냅샷은 23줄이다 | 2026-10-09 |
+| 참조 사이트의 숨은 화면(추가 인증 단계, 실패 대화상자)은 CSS 클래스가 아니라 인라인 `style="display: none"`으로 숨는다. 인라인 스타일만 반영해도 로그인 화면의 인터랙티브 스냅샷이 25개 넘던 것에서 4개(입력란 둘, 다음 버튼, 체크박스)로 준다 | 2026-10-09 측정 (M1.6) |
+| 참조 사이트에 가짜 계정으로 로그인하면 실패가 화면에 나온다. Enter 한 번에 아이디 단계, 버튼이 "로그인"으로 바뀐 뒤 Enter 한 번 더에 인증이고, 실패 문구가 폼 아래 문단과 확인 대화상자로 스냅샷에 나온다. 클릭 없이 Enter만으로 된다 | 2026-10-09, 사용자 승인 아래 존재하지 않는 계정으로 |
 | 참조 사이트의 React 입력란에 agent-browser `fill`이 동작한다. 아이디는 스냅샷에 나오고 비밀번호는 나오지 않는다 | 2026-10-09 agent-browser |
-| 참조 사이트의 로그인 화면이 WASIX에서 그려진다. 숨은 화면을 빼면 첫 단계 스냅샷은 첫 입력란·아이디·"다음"·체크박스뿐이고, 비밀번호 칸은 "다음" 뒤에 나온다 | 2026-10-09 agent-browser |
+| 참조 사이트의 로그인 화면이 WASIX에서 그려진다. 숨은 화면을 빼면 첫 단계 스냅샷은 입력란 둘·"다음"·체크박스뿐이고, 비밀번호 칸은 "다음" 뒤에 나온다 | 2026-10-09 agent-browser |
 | QuickJS 호출은 V8보다 네이티브 스택을 훨씬 많이 쓴다. 기본 한도 1MB로는 React 렌더링이 넘친다. 스크립트 스레드는 32MB 스택에 한도 24MB로 돈다 | 같은 측정 |
-| 참조 사이트는 gzip을 요청마다 즉석에서 압축해서 오히려 느리다. The largest bundle는 원본 4.6MB가 0.37~0.49초, gzip 1.2MB가 0.84~0.90초(curl, 세 번씩). 그래서 엔진은 `Accept-Encoding: identity`를 유지한다. 느린 회선에서는 반대일 수 있다 | 2026-10-09 |
+| 참조 사이트는 gzip을 요청마다 즉석에서 압축해서 오히려 느리다. 가장 큰 번들은 원본 4.6MB가 0.37~0.49초, gzip 1.2MB가 0.84~0.90초(curl, 세 번씩). 그래서 엔진은 `Accept-Encoding: identity`를 유지한다. 느린 회선에서는 반대일 수 있다 | 2026-10-09 |
 | 엔진 클라이언트의 다운로드 속도는 curl과 같다(큰 파일 4개 11MB를 순차 0.9~1.2초, 병렬 0.7~0.9초). 이 회선에서 병렬은 처리량보다 파싱과 겹치는 데 쓸모가 있다 | 같은 날 |
-| 참조 사이트는 React 번들 3개와 the grid library·jQuery·lottie를 싣는다. jQuery는 초기화 때 `createHTMLDocument`를, lottie는 캔버스 2D 컨텍스트를 요구하고, the grid library는 `Function.caller`를 요구한다 | 2026-10-09 `probe_a_url` |
+| 참조 사이트는 React 번들 3개와 오래된 그리드 라이브러리·jQuery·애니메이션 라이브러리를 싣는다. jQuery는 초기화 때 `createHTMLDocument`를, 애니메이션 라이브러리는 캔버스 2D 컨텍스트를, 그리드 라이브러리는 `Function.caller`를 요구한다 | 2026-10-09 `probe_a_url` |
 | agent-browser의 `back`·`forward`는 CDP 메서드가 아니라 `Runtime.evaluate("history.back()")`이다 | [docs/capture/required-expressions.txt](capture/required-expressions.txt) |
 | `Context::full`이 죽는 원인은 sysroot 불일치 하나다. `CLOCK_MONOTONIC`이 포인터 인코딩(1058440)으로 컴파일되고 WASIX는 정수 1을 기대한다 | 같은 문서 |
 | 참조 사이트 사이트는 SPA 셸만 돌려준다. HTML만 받아서는 아무것도 얻을 수 없다 | 이 문서의 §3 |
@@ -180,17 +180,15 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 - **E5** 는 샌드박스 안의 `curl/curl` 패키지로 실제 HTTPS 요청을 보냅니다.
   TLS가 게스트 안에서 처리되므로 인증서까지 게스트 책임입니다.
 
-참조 사이트 주소로 돌린 결과입니다.
+참조 사이트 주소로 돌린 결과입니다(주소는 `login.example.com`으로 바꿔 적음).
 
 ```
 E4 PASS: TCP connected (login.example.com:443)
-E5 PASS: HTTP/1.1 200 OK / 3593 bytes
-  Content-Length: 3208, Content-Type: text/html, Etag: "6ac5f37d-c88"
+E5 PASS: HTTP/1.1 200 OK
 ```
 
-응답 본문에는 `<title>`이 없고 `<div id="first-loading">`만 있습니다.
-로드밸런서의 로딩 오버레이이며, 실제 화면은 `the main stylesheet`와
-the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온다"와 "페이지를
+응답 본문에는 `<title>`이 없고 로드밸런서의 로딩 오버레이 하나뿐입니다. 실제
+화면은 스타일시트와 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온다"와 "페이지를
 읽는다"가 다른 일이라는 것을 이 페이지 하나가 증명합니다.**
 
 호스트에서 같은 주소로 curl한 결과와 헤더가 일치합니다. WISP 릴레이가 사용자
@@ -401,7 +399,7 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 - [x] M2.8 폼 컨트롤 상태. 입력값·체크·선택을 속성과 따로 `dom::Control`에 둔다.
       페이지 스크립트는 비밀번호 값을 읽는다. 로그인 폼을 제출하려면 읽어야 한다.
       접근성 트리와 CDP 설명에는 나오지 않는다.
-- [x] M2.10 `Function.prototype.caller`. 참조 사이트의 the grid library가
+- [x] M2.10 `Function.prototype.caller`. 참조 사이트의 그리드 라이브러리가
       `this._super.caller`로 부모 메서드를 찾는데 QuickJS는 늘 `undefined`를 줬다.
       rquickjs-sys를 `vendor/`에 들여와 QuickJS를 패치했다
       ([vendor/README.md](../vendor/README.md)).
@@ -416,7 +414,7 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       번갈아 잰 중앙값: 네이티브 4.66초 → 3.56초, WASIX 약 5.6초 → 4.2초.
       더 줄이기 어려운 이유: 회선이 대역폭 한계(약 12MB/s)라 병렬로 받아도 총량은
       거의 그대로이고(이득은 받는 동안 파싱이 겹치는 데서 온다), 남은 것은 번들
-      파싱(약 1.7초)과 동기 XHR인 `the language pack`(6MB, 0.5~0.8초)이다.
+      파싱(약 1.7초)과 동기 XHR로 받는 언어 팩 JSON(6MB, 0.5~0.8초)이다.
       gzip은 오히려 손해다(§2).
 - [x] M2.11 ES 모듈(`modules.rs`). rquickjs의 `loader` feature(순수 Rust `relative-path`
       하나 추가)로 QuickJS에 경로 해석기와 로더를 단다. 모듈 이름은 절대 URL이라 모듈
@@ -661,7 +659,7 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
   첫 줄에 숨은 화면의 글자가 섞이는 것은 Chrome에서도 글자까지 같다. 엔진 문제가
   아니다(한때 백로그에 버그로 적었다가 정정).
 - **접근성 트리는 `disabled`를 속성으로 낸다.** Chrome처럼 `{name: disabled, value:
-  {type: boolean, value: true}}`. 참조 사이트 첫 입력란 칸이 `[disabled]`로 나와야 Chrome과
+  {type: boolean, value: true}}`. 참조 사이트의 첫 입력란이 `[disabled]`로 나와야 Chrome과
   같다. 규칙은 프렐류드의 `isDisabled`와 같다(fieldset, 첫 legend 예외, optgroup, aria).
 - **vendored C를 고치면 다시 컴파일되는지 확인한다.** 0002 이전에는 `build.rs`가 C
   소스를 감시하지 않아 고쳐도 옛 객체 파일이 쓰였다.

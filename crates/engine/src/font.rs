@@ -4,9 +4,8 @@
 //! A sandbox has no system fonts, so whatever a page asks for, text is
 //! measured and painted with this. Layout and painting use the same advances,
 //! so the boxes a client is told about hold exactly the glyphs a screenshot
-//! shows. Noto Sans KR is also what Korean sites, the reference site among
-//! them, most often load as a web font, which keeps measurements close to
-//! Chrome's there.
+//! shows. Noto Sans KR is also what Korean sites most often load as a web
+//! font, which keeps measurements close to Chrome's there.
 //!
 //! What it does not do: other faces (bold is drawn by smearing the regular
 //! one, italic is upright), monospace (glyphs are centred in 0.6em cells),

@@ -16581,7 +16581,7 @@ static JSValue js_throw_type_error(JSContext *ctx, JSValueConst this_val,
 
 /* wasm-headless-browser: Function.prototype.caller for sloppy functions.
    Upstream answers undefined. V8 and SpiderMonkey answer the function that
-   called this one, and old class libraries (the grid library's `this._super.caller`)
+   called this one, and old class libraries (`this._super.caller`)
    use it to find the overridden method. Walks the stack to the newest frame
    running `this_val`, then returns the nearest bytecode function below it.
    Native frames such as Function.prototype.apply are skipped, as V8 skips

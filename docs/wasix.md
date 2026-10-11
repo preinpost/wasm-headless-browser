@@ -141,12 +141,11 @@ a plaintext request, so a completed connect is the signal.
 request. TLS terminates **inside the guest**, so certificates are the guest's
 problem, not the relay's.
 
-Against a reference site:
+Against a real login site (its name left out here):
 
 ```
 E4 PASS: TCP connected (login.example.com:443)
-E5 PASS: HTTP/1.1 200 OK / 3593 bytes
-     Content-Length: 3208, Content-Type: text/html, Etag: "6ac5f37d-c88"
+E5 PASS: HTTP/1.1 200 OK
 ```
 
 The headers match what `curl` on the host returns for the same URL, which is
@@ -154,9 +153,9 @@ expected: the WISP relay runs on this machine, so the sandbox egresses from the
 same address.
 
 The response body is worth reading, because it answers a question the engine
-work depends on. It contains no `<title>` and a single `<div id="first-loading">`,
-the load balancer's loading overlay. The actual screen is built later by
-JavaScript from `the main stylesheet` and a set of the grid library bundles. **Fetching the
+work depends on. It contains no `<title>` and a single loading overlay from the
+site's load balancer. The actual screen is built later by JavaScript from a
+set of bundles. **Fetching the
 HTML gets you nothing.** A headless engine that cannot run page script cannot
 read this page at all, which is the whole argument for M2.
 
@@ -224,8 +223,8 @@ a much larger C build. Under Wasmer 7.5.0 with `--net`:
 [tls] 582933 bytes in 181.717ms
 ```
 
-`example.com`, `www.google.com`, `github.com` and `login.example.com` all
-handshake TLS 1.3 and return 200, so the reference site's certificate chains to a
+`example.com`, `www.google.com`, `github.com` and the reference login site
+all handshake TLS 1.3 and return 200, so that site's certificate chains to a
 public root. A site signed by a private CA needs its root in a PEM file named by
 `WHB_EXTRA_CA_CERTS` (a path list, like `NODE_EXTRA_CA_CERTS`).
 

@@ -1,4 +1,4 @@
-"""A login site for verify-login.sh, standing in for the reference site.
+"""A login site for verify-login.sh, standing in for a real login site.
 
 The page is an empty shell that app.js renders, the login is a fetch() POST,
 the session is an HttpOnly cookie, and the signed-in page reads it back from
