@@ -39,6 +39,8 @@
       heading.textContent = 'Added by page script';
       document.getElementById('scripted').appendChild(heading);
       fixtureScriptRan = true;
+      console.log('fixture script ran', { checks: 1 });
+      setTimeout(() => { throw new Error('fixture uncaught'); }, 0);
     </script>
   </main>
 </body>

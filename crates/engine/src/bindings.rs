@@ -918,14 +918,25 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
     // Classic script text, evaluated as a global script. Not `eval` from
     // JavaScript: indirect eval would scope top-level `let` and `const` to the
     // one script, where a browser shares them between every script of the
-    // page. Returns the error message, or nothing.
-    install_fn!(ctx, api, "runScript", move |ctx: Ctx<'js>, source: String, name: String| {
+    // page. Returns nothing, or `[message, thrown]`: the error as the engine
+    // reports it, and the value thrown, for the console and
+    // `Runtime.exceptionThrown`.
+    install_fn!(ctx, api, "runScript", move |ctx: Ctx<'js>, source: String, name: String| -> Option<Vec<Value<'js>>> {
         let mut options = EvalOptions::default();
         options.strict = false;
         options.filename = Some(name);
         match ctx.eval_with_options::<Value, _>(source, options).catch(&ctx) {
             Ok(_) => None,
-            Err(caught) => Some(describe_caught(&ctx, caught)),
+            Err(caught) => {
+                let thrown = match &caught {
+                    rquickjs::CaughtError::Exception(e) => Some(e.as_value().clone()),
+                    rquickjs::CaughtError::Value(v) => Some(v.clone()),
+                    rquickjs::CaughtError::Error(_) => None,
+                };
+                let message = rquickjs::String::from_str(ctx.clone(), &describe_caught(&ctx, caught)).ok()?.into_value();
+                let thrown = thrown.unwrap_or_else(|| message.clone());
+                Some(vec![message, thrown])
+            }
         }
     });
 

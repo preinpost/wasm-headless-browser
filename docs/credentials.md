@@ -96,7 +96,7 @@ The M4.3 list, and where each stands.
 | Accessibility tree and snapshots | Scrubbed, and a password field never shows its value | `verify-login.sh` keeps every snapshot and checks the transcript |
 | Engine stderr, including `WHB_TRACE_CDP` | Never written | `verify-login.sh` runs traced and checks stderr |
 | Disk | Never written | The engine has no file writes |
-| Console output from the page | Kept in memory, not sent | Will be scrubbed with everything else once `Runtime.consoleAPICalled` is emitted |
+| Console output and uncaught exceptions | Scrubbed: `Runtime.consoleAPICalled` and `Runtime.exceptionThrown` go out through the same exit | An engine test logs the password and gets the placeholder |
 | Screencast frames | Painted like screenshots | An engine test runs a screencast; frames come from the same painter |
 | Binary payloads | Scrubbed before encoding, then left alone | A screenshot's `data`, a frame's `data` and a base64 response body skip the string scrub, which could match a short secret inside base64 by chance and corrupt the payload. An engine test uses a secret taken from a screenshot's own base64 |
 | Screenshots | A password field paints a bullet per character; other text is scrubbed before it is painted, so a username shows as its placeholder | An engine test paints the secret and a same-length other value and compares the images, and paints a page showing the username against one showing the placeholder |

@@ -11,8 +11,7 @@ function runJavascriptUrl(url) {
   } catch (e) {
     // Leave it as written.
   }
-  const error = api.runScript(source, 'javascript-url');
-  if (error) console.error(`Uncaught ${error}`);
+  runClassic(source, 'javascript-url');
 }
 
 const withoutFragment = (url) => String(url).split('#')[0];

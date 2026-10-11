@@ -50,6 +50,9 @@ window's `load`, layout uses intrinsic sizes, and screenshots paint images
 ES modules run: `<script type=module>`, static and dynamic `import`,
 top-level `await` and import maps, so Vite-built sites hydrate.
 
+`agent-browser console` and `errors` work: console calls and uncaught
+exceptions are sent as Chrome sends them, object previews included.
+
 Pages scroll: script, `scrollIntoView`, the wheel and agent-browser's
 `scroll` move the viewport and scroll containers, and boxes, clicks and
 screenshots follow.

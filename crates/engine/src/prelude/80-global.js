@@ -8,8 +8,7 @@ function timerCallback(handler, args) {
   // A string handler is compiled as a global script, as browsers still do.
   const source = String(handler);
   return () => {
-    const error = api.runScript(source, 'timer');
-    if (error) console.error(`Uncaught ${error}`);
+    runClassic(source, 'timer');
   };
 }
 
@@ -147,11 +146,10 @@ function runScriptElement(id, finish) {
   }
   const previous = currentScript;
   currentScript = el;
-  const error = api.runScript(source, name);
+  const error = runClassic(source, name);
   currentScript = previous;
-  if (error) console.error(`Uncaught ${error}`);
   if (src !== undefined) fire(el, 'load');
-  return error ?? '';
+  return error;
 }
 
 // A script that became connected, or got its content or `src`, after the

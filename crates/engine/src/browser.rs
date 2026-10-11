@@ -56,6 +56,12 @@ pub struct HtmlEngine {
     images: Arc<ImageStore>,
     /// Set between `Page.startScreencast` and `Page.stopScreencast`.
     screencast: Option<Screencast>,
+    /// Set by `Runtime.enable`: console messages and exceptions are sent.
+    runtime_enabled: bool,
+    /// `Runtime.*` events collected from the page and not sent yet.
+    page_events: Vec<(String, Value)>,
+    /// The last `exceptionId` given.
+    exceptions: u64,
     /// Credentials, typed only through placeholders and scrubbed from
     /// everything the engine says. Shared by every target.
     secrets: Arc<Secrets>,
@@ -101,6 +107,9 @@ impl HtmlEngine {
             client,
             images,
             screencast: None,
+            runtime_enabled: false,
+            page_events: Vec::new(),
+            exceptions: 0,
             secrets,
             url: "about:blank".to_string(),
             frame_id,
@@ -259,6 +268,43 @@ impl HtmlEngine {
         }
     }
 
+    /// Takes the console messages and exceptions the page queued, stamped
+    /// with when and in which context, if a client asked for them; they are
+    /// dropped otherwise, as Chrome does not keep them for a later
+    /// `Runtime.enable` either beyond what DevTools shows.
+    fn collect_page_events(&mut self) {
+        let Some(script) = &self.script else { return };
+        let events = script.take_page_events();
+        if !self.runtime_enabled {
+            return;
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        for (method, mut params) in events {
+            params["timestamp"] = json!(timestamp);
+            if method == "Runtime.exceptionThrown" {
+                self.exceptions += 1;
+                params["exceptionDetails"]["exceptionId"] = json!(self.exceptions);
+                params["exceptionDetails"]["executionContextId"] = json!(self.context_id);
+            } else {
+                params["executionContextId"] = json!(self.context_id);
+            }
+            self.page_events.push((method, params));
+        }
+        let excess = self.page_events.len().saturating_sub(MAX_PAGE_EVENTS);
+        self.page_events.drain(..excess);
+    }
+
+    /// Sends what [`collect_page_events`](Self::collect_page_events) has.
+    fn emit_page_events(&mut self, out: &mut EngineEmit) {
+        self.collect_page_events();
+        for (method, params) in std::mem::take(&mut self.page_events) {
+            out(&method, params);
+        }
+    }
+
     /// Sends the `Network.*` events recorded since the last call. Requests
     /// run on other threads and inside script, where no emitter is at hand,
     /// so they are recorded and sent from here: before the lifecycle events
@@ -358,6 +404,8 @@ impl HtmlEngine {
         self.preload_subresources();
         self.load_stylesheets();
 
+        // What the old document logged goes before its context does.
+        self.collect_page_events();
         // A new document gets a new global environment, as in a browser. The
         // document lock is released above, which this needs.
         if let Some(script) = &self.script {
@@ -881,10 +929,20 @@ impl HtmlEngine {
 
             // ---- Runtime -------------------------------------------------
             "Runtime.enable" => {
+                self.runtime_enabled = true;
                 self.emit_context(out);
                 Ok(json!({}))
             }
-            "Runtime.disable" | "Runtime.runIfWaitingForDebugger" => Ok(json!({})),
+            "Runtime.disable" => {
+                self.runtime_enabled = false;
+                self.page_events.clear();
+                Ok(json!({}))
+            }
+            "Runtime.discardConsoleEntries" => {
+                self.page_events.clear();
+                Ok(json!({}))
+            }
+            "Runtime.runIfWaitingForDebugger" => Ok(json!({})),
             "Runtime.releaseObject" => {
                 if let Some(id) = params.get("objectId").and_then(|v| v.as_str()) {
                     self.cdp(&format!("(__cdpRelease({}), '{{}}')", js_string(id)))?;
@@ -1191,6 +1249,7 @@ impl Engine for HtmlEngine {
             out(method, params)
         };
         let result = self.navigate_raw(url, &mut scrubbed).map_err(|e| scrub_error(&self.secrets, e));
+        self.emit_page_events(&mut scrubbed);
         self.emit_frame(&mut scrubbed);
         result
     }
@@ -1212,6 +1271,7 @@ impl Engine for HtmlEngine {
         };
         let result = self.dispatch_raw(method, params, &mut scrubbed);
         self.emit_network(&mut scrubbed);
+        self.emit_page_events(&mut scrubbed);
         self.emit_frame(&mut scrubbed);
         match result {
             Ok(mut value) => {
@@ -1420,6 +1480,10 @@ fn escape_html(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
+
+/// Console messages and exceptions held for a client, at most; the oldest
+/// go first.
+const MAX_PAGE_EVENTS: usize = 1000;
 
 /// The largest screenshot painted: 64 megapixels, a full-page shot of a long
 /// page at twice the scale. Beyond that the request is refused, not cropped.
@@ -2424,6 +2488,78 @@ mod tests {
         evaluate(&mut engine, "scrollTo(0, 0)");
         dispatch(&mut engine, "Input.dispatchMouseEvent", json!({ "type": "mouseWheel", "x": 50, "y": 50, "deltaX": 0, "deltaY": 120 }));
         assert_eq!(evaluate(&mut engine, "[document.getElementById('list').scrollTop, scrollY].join()")["result"]["value"], "120,0");
+    }
+
+    fn runtime_events(events: &[(String, Value)]) -> Vec<&Value> {
+        events
+            .iter()
+            .filter(|(m, _)| m == "Runtime.consoleAPICalled" || m == "Runtime.exceptionThrown")
+            .map(|(_, p)| p)
+            .collect()
+    }
+
+    #[test]
+    fn console_calls_and_uncaught_exceptions_reach_the_client_as_chrome_sends_them() {
+        let mut engine = engine_with_secrets("<body></body>");
+        let quiet = events_of(&mut engine, |e, out| {
+            e.dispatch("Runtime.evaluate", &json!({ "expression": "console.log('before enable')" }), out).unwrap();
+        });
+        assert!(runtime_events(&quiet).is_empty(), "nothing before Runtime.enable");
+
+        dispatch(&mut engine, "Runtime.enable", json!({}));
+        let page = "console.log('hello', 42, { a: 1, b: 'x' }, [1, 2]);\
+                    console.warn('careful'); console.error(new Error('boom'));\
+                    console.count(); console.count(); console.assert(1 === 2, 'math');\
+                    console.log('pw', 'hunter2-s3cret');\
+                    setTimeout(() => { throw new TypeError('late') }, 0);\
+                    Promise.reject(new Error('rejected'));\
+                    addEventListener('unhandledrejection', (e) => { if (e.reason === 'quiet') e.preventDefault() });\
+                    Promise.reject('quiet');\
+                    Promise.reject(new Error('handled later')).catch(() => {});";
+        let events = events_of(&mut engine, |e, out| {
+            e.dispatch("Runtime.evaluate", &json!({ "expression": page }), out).unwrap();
+        });
+        let events = runtime_events(&events);
+        let consoles: Vec<&&Value> = events.iter().filter(|p| p.get("type").is_some()).collect();
+        let types: Vec<&str> = consoles.iter().map(|p| p["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["log", "warning", "error", "count", "count", "assert", "log"]);
+        let hello = &consoles[0]["args"];
+        assert_eq!(hello[0], json!({ "type": "string", "value": "hello" }));
+        assert_eq!(hello[1]["value"], 42);
+        assert_eq!(hello[2]["preview"]["properties"], json!([{ "name": "a", "type": "number", "value": "1" }, { "name": "b", "type": "string", "value": "x" }]));
+        assert_eq!(hello[3]["subtype"], "array");
+        assert_eq!(hello[3]["description"], "Array(2)");
+        assert_eq!(consoles[0]["executionContextId"], 1);
+        assert!(consoles[0]["timestamp"].as_f64().unwrap() > 1.7e12, "epoch milliseconds");
+        assert_eq!(consoles[2]["args"][0]["subtype"], "error");
+        assert_eq!(consoles[4]["args"][0]["value"], "default: 2");
+        assert_eq!(consoles[5]["args"][0]["value"], "Assertion failed: math");
+        // Console arguments go out through the same scrub as everything else.
+        assert_eq!(consoles[6]["args"][1]["value"], "{{secret:pw}}");
+
+        let exceptions: Vec<&Value> = events.iter().filter_map(|p| p.get("exceptionDetails")).collect();
+        let texts: Vec<(String, String)> = exceptions
+            .iter()
+            .map(|d| (d["text"].as_str().unwrap().to_string(), d["exception"]["description"].as_str().unwrap().lines().next().unwrap().to_string()))
+            .collect();
+        assert!(texts.contains(&("Uncaught".into(), "TypeError: late".into())), "{texts:?}");
+        assert!(texts.contains(&("Uncaught (in promise)".into(), "Error: rejected".into())), "{texts:?}");
+        assert_eq!(texts.len(), 2, "the prevented and the handled ones are not reported: {texts:?}");
+        assert_ne!(exceptions[0]["exceptionId"], exceptions[1]["exceptionId"]);
+    }
+
+    #[test]
+    fn a_failing_script_is_reported_with_where_it_threw() {
+        let mut engine = HtmlEngine::new("t");
+        dispatch(&mut engine, "Runtime.enable", json!({}));
+        let events = events_of(&mut engine, |e, out| {
+            e.navigate("data:text/html,<script>\nwindow.onerror = () => { window.seen = true };\nnope();\n</script>", out).unwrap();
+        });
+        let details = runtime_events(&events).into_iter().find_map(|p| p.get("exceptionDetails")).expect("reported");
+        assert_eq!(details["text"], "Uncaught");
+        assert_eq!(details["lineNumber"], 2, "{details}");
+        assert!(details["exception"]["description"].as_str().unwrap().starts_with("ReferenceError"));
+        assert_eq!(evaluate(&mut engine, "window.seen")["result"]["value"], true, "and fires error at the window");
     }
 
     #[test]

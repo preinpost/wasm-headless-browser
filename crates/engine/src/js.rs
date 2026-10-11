@@ -638,6 +638,15 @@ impl ScriptHost {
                 };
                 // Only here, where the thread's stack is known to be larger.
                 js.runtime().set_max_stack_size(SCRIPT_STACK_LIMIT);
+                // A promise rejected with no handler is the page's to report,
+                // once the current task is done with it (prelude/90-cdp.js).
+                js.runtime().set_host_promise_rejection_tracker(Some(Box::new(|ctx, promise, reason, handled| {
+                    if let Ok(track) = ctx.globals().get::<_, rquickjs::Function>("__promiseRejection") {
+                        if track.call::<_, ()>((promise, reason, handled)).is_err() {
+                            let _ = ctx.catch();
+                        }
+                    }
+                })));
                 // Modules resolve and load through the page; see modules.rs.
                 js.runtime().set_loader(
                     crate::modules::PageResolver(Arc::clone(&thread_state)),
@@ -720,6 +729,13 @@ impl ScriptHost {
         let (reply, answer) = channel();
         let request = Request::CdpEvaluate { source: source.to_string(), by_value, await_promise, reply };
         self.cdp_round_trip(request, answer)
+    }
+
+    /// The console messages and exceptions the page queued since the last
+    /// call, as `(method, params)` for `Runtime.*` events.
+    pub fn take_page_events(&self) -> Vec<(String, serde_json::Value)> {
+        let taken = self.cdp_expression("__cdpTakeEvents()");
+        serde_json::from_value::<Vec<(String, serde_json::Value)>>(taken).unwrap_or_default()
     }
 
     /// See [`JsRuntime::cdp_expression`].

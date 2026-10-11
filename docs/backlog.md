@@ -6,7 +6,7 @@
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
 이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
-보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 다음 후보는 §0.4.
+보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -44,9 +44,9 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 191, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 193, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
-| `./scripts/verify-m1.sh` | 40 |
+| `./scripts/verify-m1.sh` | 42 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
 | `WAIT_FOR='#first-field' ./scripts/compare-layout.sh https://login.example.com/` | Chrome과 비교. 13개 중 8개가 2px 안, 평균 1.4px |
 | `WHB_PROBE_URL=https://login.example.com/ cargo test --release -p engine probe_a_url -- --ignored --nocapture` | 오류 없이 `#/login`까지 |
@@ -62,7 +62,6 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 - **그림자, SVG.** `box-shadow`와 SVG 이미지(`<img src=*.svg>`, 인라인 `<svg>`)는 그리지 않는다.
 - **요청 가로채기 (M3.3).** agent-browser `network route`. `Fetch.requestPaused`는
   엔진이 요청 도중 클라이언트의 답을 기다려야 해서 구조가 바뀐다(§4.4).
-- **콘솔 (`Runtime.consoleAPICalled`).** 지금은 `probe_a_url`로만 본다.
 - **접근성 이름에 숨은 글자가 섞인다.** 참조 사이트 스냅샷의 최상위 `generic`(e1)의
   이름에 `display:none`인 추가 인증 화면의 글자가 들어간다. 내용에서 이름을 만들 때
   숨은 하위 요소를 빼야 한다(ax.rs). M2.13 전후로 같으므로 원래 있던 문제다.
@@ -428,6 +427,23 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       `Secure`·`HttpOnly`를 지킨다. `fetch::Client`가 리다이렉트 응답의 쿠키까지
       저장하고, POST 뒤 302·303은 GET으로 바꾼다. CDP의 쿠키 메서드와
       `document.cookie`가 같은 저장소를 쓴다. 공개 접미사 목록은 없다.
+- [x] M3.7 콘솔과 잡히지 않은 예외. Chrome과 agent-browser 사이를 캡처해서 맞췄다:
+      `console`은 `Runtime.consoleAPICalled`의 `type`과 `args`(원격 객체, 객체는 `preview`로
+      `{a: 1}`처럼 보인다)로, `errors`는 `Runtime.exceptionThrown`(`Uncaught`,
+      `Uncaught (in promise)`)으로 만든다. 프렐류드가 `console`을 감싸 log·info·debug·
+      warn(`warning`)·error·trace·dir·dirxml·table·assert·count·time·group·clear를 큐에
+      넣고(최대 1000개), 호스트 로그에도 한 줄 남긴다(`probe_a_url`용). `runScript`가 오류
+      문자열과 함께 던진 값을 돌려줘서, 스크립트·리스너·타이머의 잡히지 않은 예외가 모두
+      `reportError` 한 곳에서 `exceptionThrown`이 된다(QuickJS 스택의 첫 프레임에서 줄·열,
+      0부터). 스크립트 오류가 이제 window `error` 이벤트도 쏜다(전에는 안 쐈다). 처리되지
+      않은 Promise 거부는 rquickjs의 `set_host_promise_rejection_tracker`로 모았다가 태스크
+      사이에 `unhandledrejection`을 쏘고, 막지 않았으면 보고한다. 나중에 처리기가 붙으면
+      빠진다. 엔진은 명령·이동이 끝날 때와 문서를 바꾸기 직전에 큐를 비우고
+      `Runtime.enable` 상태일 때만 시각과 컨텍스트를 붙여 내보낸다(가리기 출구를 지난다).
+      오류 설명과 미리보기의 스택에서 프렐류드 프레임(`eval_script`)은 뺀다.
+      `Runtime.discardConsoleEntries`도 받는다. 참조 사이트 로그인 화면은 콘솔 29줄,
+      잡히지 않은 오류 0개다. 없는 것: `stackTrace` 필드, `Log.entryAdded`(네트워크 오류
+      같은 브라우저 자체 메시지), `exceptionRevoked`.
 - [x] M3.6 실시간 보기(`screencast.rs`, `scripts/watch.sh`). agent-browser의 대시보드
       (`agent-browser dashboard`, `http://localhost:4848`)와 `stream`은 CDP
       `Page.startScreencast {format: jpeg, quality: 80, maxWidth, maxHeight}`로 프레임을 받고

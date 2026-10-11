@@ -59,14 +59,25 @@ function classNameOf(value) {
   return value.constructor && typeof value.constructor.name === 'string' && value.constructor.name ? value.constructor.name : 'Object';
 }
 
+// A stack as the page should see it in DevTools: without the frames of the
+// prelude (`eval_script`), which are the engine's, not the page's.
+function pageStack(stack) {
+  return String(stack)
+    .split('\n')
+    .filter((line) => !line.includes('(eval_script:'))
+    .join('\n');
+}
+
 function descriptionOf(value, subtype, className) {
   switch (subtype) {
     case 'node':
       return nodeDescription(value);
     case 'array':
       return `Array(${value.length})`;
-    case 'error':
-      return value.stack ? `${value.name}: ${value.message}\n${value.stack}` : `${value.name}: ${value.message}`;
+    case 'error': {
+      const stack = value.stack ? pageStack(value.stack).replace(/\n+$/, '') : '';
+      return stack ? `${value.name}: ${value.message}\n${stack}` : `${value.name}: ${value.message}`;
+    }
     case 'regexp':
       return String(value);
     case 'date':
@@ -78,6 +89,68 @@ function descriptionOf(value, subtype, className) {
       return `${className}(${value.length})`;
   }
   return className;
+}
+
+// A property in an object's preview: primitives as text, objects by their
+// description.
+function previewProperty(name, value) {
+  const type = typeof value;
+  if (value === null) return { name, type: 'object', subtype: 'null', value: 'null' };
+  if (type === 'function') return { name, type, value: '' };
+  if (type === 'object') {
+    const subtype = subtypeOf(value);
+    const out = { name, type, value: descriptionOf(value, subtype, classNameOf(value)) };
+    if (subtype) out.subtype = subtype;
+    return out;
+  }
+  const text = type === 'symbol' ? value.toString() : String(value);
+  return { name, type, value: text.length > 100 ? text.slice(0, 99) + '\u2026' : text };
+}
+
+// Chrome's ObjectPreview: the first few own properties, so a client can show
+// `{a: 1}` without asking for more. Accessors are not run, as in Chrome.
+function previewOf(value, subtype) {
+  if (value === null || typeof value !== 'object' || subtype === 'node') return undefined;
+  let names;
+  try {
+    names = Object.keys(value);
+  } catch (e) {
+    return undefined;
+  }
+  if (subtype === 'error') names = ['stack', 'message', ...names.filter((n) => n !== 'stack' && n !== 'message')];
+  const limit = subtype === 'array' || subtype === 'typedarray' ? 100 : 5;
+  const properties = [];
+  let overflow = false;
+  for (const name of names) {
+    if (properties.length >= limit) {
+      overflow = true;
+      break;
+    }
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, name) ?? (subtype === 'error' ? { value: value[name] } : undefined);
+    } catch (e) {
+      continue;
+    }
+    if (!descriptor) continue;
+    if (descriptor.get || descriptor.set) properties.push({ name, type: 'accessor' });
+    else if (subtype === 'error' && name === 'stack') properties.push(previewProperty(name, descriptionOf(value, subtype)));
+    else properties.push(previewProperty(name, descriptor.value));
+  }
+  const preview = { type: 'object', description: descriptionOf(value, subtype, classNameOf(value)), overflow, properties };
+  if (subtype) preview.subtype = subtype;
+  return preview;
+}
+
+// A remote object with a preview, as console arguments and exceptions are
+// sent.
+function remoteWithPreview(value) {
+  const object = remoteObject(value, false);
+  if (object.type === 'object' && object.objectId) {
+    const preview = previewOf(value, object.subtype);
+    if (preview) object.preview = preview;
+  }
+  return object;
 }
 
 // A value as a CDP RemoteObject. With `byValue`, objects travel as JSON, as
@@ -470,7 +543,134 @@ function dispatchMouse(json) {
   }
 }
 
+// ---- console and uncaught exceptions ----------------------------------------
+// Queued as `Runtime.consoleAPICalled` and `Runtime.exceptionThrown`, which
+// the engine collects after every command and sends once `Runtime.enable`
+// asked for them; it adds the timestamp and the context.
+
+const pageEvents = [];
+const MAX_PAGE_EVENTS = 1000;
+function queuePageEvent(method, params) {
+  if (pageEvents.length >= MAX_PAGE_EVENTS) pageEvents.shift();
+  pageEvents.push([method, params]);
+}
+
+function takePageEvents() {
+  flushRejections();
+  return JSON.stringify(pageEvents.splice(0));
+}
+
+// Where an exception was thrown, from the first frame of QuickJS's stack,
+// `    at f (url:line:column)`, which counts from 1; CDP counts from 0.
+function throwSite(error) {
+  const stack = error !== null && typeof error === 'object' ? String(error.stack ?? '') : '';
+  const frame = /\(?([^\s()]+):(\d+):(\d+)\)?/.exec(stack);
+  if (!frame) return { lineNumber: 0, columnNumber: 0 };
+  return { url: frame[1], lineNumber: Number(frame[2]) - 1, columnNumber: Number(frame[3]) - 1 };
+}
+
+function queueException(error, text) {
+  try {
+    queuePageEvent('Runtime.exceptionThrown', {
+      exceptionDetails: { text, ...throwSite(error), exception: remoteWithPreview(error) },
+    });
+  } catch (e) {
+    // Reporting must not throw, even half-way through the prelude.
+  }
+}
+
+// Rejected promises without a handler, by promise. QuickJS reports both the
+// rejection and a handler attached later (`__promiseRejection`, from js.rs);
+// those still unhandled when the task ends fire `unhandledrejection` and,
+// unless a listener prevents that, are reported.
+const pendingRejections = new Map();
+function promiseRejection(promise, reason, handled) {
+  if (handled) pendingRejections.delete(promise);
+  else pendingRejections.set(promise, reason);
+}
+
+function flushRejections() {
+  if (pendingRejections.size === 0) return;
+  const rejected = [...pendingRejections];
+  pendingRejections.clear();
+  for (const [promise, reason] of rejected) {
+    const event = new PromiseRejectionEvent('unhandledrejection', { cancelable: true, promise, reason });
+    try {
+      dispatch(globalThis, event);
+    } catch (e) {
+      // As for reportError: a broken listener does not stop the report.
+    }
+    if (!event.defaultPrevented) reportError(reason, true);
+  }
+}
+
+const consoleCounts = new Map();
+const consoleTimers = new Map();
+
+// One console call: a line on the engine's console, unless `host` is null,
+// and the event.
+function consoleCall(type, args, host) {
+  if (host) {
+    try {
+      hostConsole[host](...args);
+    } catch (e) {
+      // The line is a diagnostic; the event is what matters.
+    }
+  }
+  try {
+    queuePageEvent('Runtime.consoleAPICalled', { type, args: args.map(remoteWithPreview) });
+  } catch (e) {
+    // As above.
+  }
+}
+
+const label = (value) => (value === undefined ? 'default' : String(value));
+const elapsed = (start) => `${Math.round((performance.now() - start) * 1000) / 1000} ms`;
+
+const pageConsole = {
+  log: (...args) => consoleCall('log', args, 'log'),
+  info: (...args) => consoleCall('info', args, 'info'),
+  debug: (...args) => consoleCall('debug', args, 'debug'),
+  warn: (...args) => consoleCall('warning', args, 'warn'),
+  error: (...args) => consoleCall('error', args, 'error'),
+  trace: (...args) => consoleCall('trace', args.length ? args : ['console.trace'], 'log'),
+  dir: (value) => consoleCall('dir', [value], 'log'),
+  dirxml: (...args) => consoleCall('dirxml', args, 'log'),
+  table: (data) => consoleCall('table', [data], 'log'),
+  assert(condition, ...args) {
+    if (condition) return;
+    const message = typeof args[0] === 'string' ? [`Assertion failed: ${args[0]}`, ...args.slice(1)] : ['Assertion failed:', ...args];
+    consoleCall('assert', args.length ? message : ['Assertion failed'], 'error');
+  },
+  count(name) {
+    const key = label(name);
+    const n = (consoleCounts.get(key) ?? 0) + 1;
+    consoleCounts.set(key, n);
+    consoleCall('count', [`${key}: ${n}`], 'log');
+  },
+  countReset: (name) => consoleCounts.delete(label(name)),
+  time: (name) => consoleTimers.set(label(name), performance.now()),
+  timeLog(name, ...args) {
+    const start = consoleTimers.get(label(name));
+    if (start !== undefined) consoleCall('log', [`${label(name)}: ${elapsed(start)}`, ...args], 'log');
+  },
+  timeEnd(name) {
+    const start = consoleTimers.get(label(name));
+    if (start === undefined) return;
+    consoleTimers.delete(label(name));
+    consoleCall('timeEnd', [`${label(name)}: ${elapsed(start)}`], 'log');
+  },
+  group: (...args) => consoleCall('startGroup', args.length ? args : ['console.group'], 'log'),
+  groupCollapsed: (...args) => consoleCall('startGroupCollapsed', args.length ? args : ['console.groupCollapsed'], 'log'),
+  groupEnd: () => consoleCall('endGroup', ['console.groupEnd'], null),
+  clear: () => consoleCall('clear', ['console.clear'], null),
+};
+Object.defineProperty(pageConsole, Symbol.toStringTag, { value: 'console' });
+Object.defineProperty(globalThis, 'console', { value: pageConsole, writable: true, configurable: true, enumerable: false });
+
 for (const [name, fn] of Object.entries({
+  __cdpTakeEvents: takePageEvents,
+  __promiseRejection: promiseRejection,
   __dispatchMouse: dispatchMouse,
   __cdpResult: cdpResult,
   __cdpSettled: cdpSettled,

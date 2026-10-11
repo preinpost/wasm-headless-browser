@@ -124,13 +124,25 @@ function domError(name, message) {
   return new DOMException(message, name);
 }
 
-// An exception nobody caught: a listener, a timer, a promise job. A browser
-// reports it on the console and as an `error` event, then carries on.
+// The engine's own console, a line of text per call, kept for diagnostics
+// (`probe_a_url`). The page's `console` (prelude/90-cdp.js) writes here too.
+const hostConsole = globalThis.console;
+
+// An exception nobody caught: a script, a listener, a timer, a promise
+// nobody handled (`inPromise`). A browser reports it to DevTools as
+// `Runtime.exceptionThrown` and, unless it came from a promise, as an `error`
+// event, then carries on.
 let reportingError = false;
-function reportError(error) {
-  const text = error && error.stack ? `${error}\n${error.stack}` : String(error);
-  console.error(`Uncaught ${text}`);
-  if (reportingError) return;
+function reportError(error, inPromise = false) {
+  let text;
+  try {
+    text = error && error.stack ? `${error}\n${error.stack}` : String(error);
+  } catch (e) {
+    text = Object.prototype.toString.call(error);
+  }
+  hostConsole.error(`Uncaught ${inPromise ? '(in promise) ' : ''}${text}`);
+  queueException(error, inPromise ? 'Uncaught (in promise)' : 'Uncaught');
+  if (inPromise || reportingError) return;
   reportingError = true;
   try {
     dispatch(
@@ -203,6 +215,8 @@ function beginTurn(budget) {
 // Runs the earliest due task, in (due time, queue order). Returns false when
 // nothing is due within the turn.
 function runNextTask() {
+  // Rejections the last task left unhandled are reported between tasks.
+  flushRejections();
   let handle = 0;
   let next = null;
   for (const [h, task] of tasks) {
@@ -229,6 +243,15 @@ function runNextTask() {
 }
 
 // ---- small shared helpers ---------------------------------------------------
+
+// Classic script text, run as a global script. A throw is reported like any
+// uncaught exception. Returns the error as the engine reports it, or ''.
+function runClassic(source, name) {
+  const failed = api.runScript(source, name);
+  if (!failed) return '';
+  reportError(failed[1]);
+  return failed[0];
+}
 
 // `relative` against the document's URL, or null when it is not a URL.
 function resolveUrl(relative) {

@@ -114,6 +114,10 @@ check "eval sees the script's global" 'true' \
 check "eval reads the document" 'Added by page script' \
   "$(agent-browser --cdp "$BASE" eval "document.querySelector('#scripted h2').textContent" 2>&1 || true)"
 
+echo "console and errors"
+check "the page's console.log reaches the client" '\[log\] fixture script ran {checks: 1}' "$(agent-browser --cdp "$BASE" console 2>&1 || true)"
+check "an uncaught exception is reported" "fixture uncaught" "$(agent-browser --cdp "$BASE" --json errors 2>&1 || true)"
+
 echo "history"
 agent-browser --cdp "$BASE" open "http://127.0.0.1:${SITE_PORT}/?page=2" >/dev/null 2>&1 || true
 check "back returns to the first page" "http://127.0.0.1:${SITE_PORT}/\$" \
