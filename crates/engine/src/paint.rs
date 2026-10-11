@@ -335,7 +335,7 @@ struct Painter<'a> {
 }
 
 /// Border widths, top, right, bottom, left, in CSS pixels.
-fn border_widths(style: &ComputedStyle) -> [f64; 4] {
+pub(crate) fn border_widths(style: &ComputedStyle) -> [f64; 4] {
     ["top", "right", "bottom", "left"].map(|side| {
         if matches!(style.get(&format!("border-{side}-style")), "none" | "hidden" | "") {
             return 0.0;
@@ -378,6 +378,16 @@ fn native_look(style: &ComputedStyle) -> bool {
 }
 
 impl Painter<'_> {
+    /// Where a box is seen, in page space at the current scroll: moved by
+    /// the containers it is scrolled in, and kept in the viewport if fixed.
+    /// The region painted is in the same space, so the viewport at the
+    /// current scroll is `(scrollX, scrollY, width, height)`.
+    fn placed(&self, id: NodeId) -> Option<Rect> {
+        let rect = self.layout.client_rect(self.doc, id)?;
+        let (sx, sy) = self.doc.scroll_offset(self.doc.document_id());
+        Some(Rect { x: rect.x + sx, y: rect.y + sy, ..rect })
+    }
+
     /// A page rectangle in canvas pixels.
     fn area(&self, rect: &Rect) -> Area {
         let r = &self.region;
@@ -405,7 +415,7 @@ impl Painter<'_> {
     }
 
     fn element(&mut self, id: NodeId, background_propagated: bool) {
-        let (Some(style), Some(rect)) = (self.styles.get(id), self.layout.rect(id)) else { return };
+        let (Some(style), Some(rect)) = (self.styles.get(id), self.placed(id)) else { return };
         if matches!(style.get("visibility"), "hidden" | "collapse") {
             return;
         }
@@ -415,7 +425,7 @@ impl Painter<'_> {
         }
         let mut clip = self.canvas.whole();
         for ancestor in self.layout.clips_of(id) {
-            if let Some(r) = self.layout.rect(*ancestor) {
+            if let Some(r) = self.placed(*ancestor) {
                 clip = clip.intersect(self.area(&r));
             }
         }
@@ -460,7 +470,7 @@ impl Painter<'_> {
             let children: Vec<NodeId> = self.doc.children(id).to_vec();
             for child in children {
                 if matches!(self.doc.node(child).data, NodeData::Text) {
-                    if let Some(text_rect) = self.layout.rect(child) {
+                    if let Some(text_rect) = self.placed(child) {
                         let text = self.doc.node(child).text.clone();
                         self.text(&text, style, &text_rect, opacity, clip);
                     }
@@ -632,7 +642,7 @@ impl Painter<'_> {
                 // Its content is laid out like any element's.
                 for child in self.doc.children(id).to_vec() {
                     if matches!(self.doc.node(child).data, NodeData::Text) {
-                        if let Some(text_rect) = self.layout.rect(child) {
+                        if let Some(text_rect) = self.placed(child) {
                             let text = self.doc.node(child).text.clone();
                             self.text(&text, style, &text_rect, opacity, clip);
                         }

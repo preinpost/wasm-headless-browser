@@ -5,7 +5,8 @@
 //! Chrome sends a frame when its compositor produces one. There is no
 //! compositor here, so the engine asks after every command whether what a
 //! frame would show has changed: the document's version, the images that
-//! have arrived, the viewport, the URL and the focus, which moves the caret. Only then is the page painted,
+//! have arrived, the viewport, the URL, the focus, which moves the caret,
+//! and scrolling. Only then is the page painted,
 //! so commands that only read cost nothing. As in Chrome, a frame is not
 //! sent until the client has acknowledged the previous one, which keeps a
 //! slow viewer from queueing stale frames.
@@ -51,6 +52,7 @@ struct Shown {
     viewport: (u64, u64),
     url: String,
     focus: Option<usize>,
+    scroll: u64,
 }
 
 pub struct Screencast {
@@ -95,13 +97,15 @@ impl Screencast {
             viewport: (viewport.0.to_bits(), viewport.1.to_bits()),
             url: url.to_string(),
             focus,
+            scroll: doc.scroll_generation(),
         };
         if self.shown.as_ref() == Some(&shown) {
             return None;
         }
         // Scaled down to the client's limits, never up.
         let scale = (self.max.0 / viewport.0).min(self.max.1 / viewport.1).min(1.0);
-        let region = Region { x: 0.0, y: 0.0, width: viewport.0, height: viewport.1, scale };
+        let (scroll_x, scroll_y) = doc.scroll_offset(doc.document_id());
+        let region = Region { x: scroll_x, y: scroll_y, width: viewport.0, height: viewport.1, scale };
         let canvas = paint::paint(doc, region, focus, scrub);
         use base64::Engine as _;
         let data = base64::engine::general_purpose::STANDARD.encode(self.format.encode(&canvas));
@@ -119,8 +123,8 @@ impl Screencast {
                 "pageScaleFactor": 1,
                 "deviceWidth": viewport.0,
                 "deviceHeight": viewport.1,
-                "scrollOffsetX": 0,
-                "scrollOffsetY": 0,
+                "scrollOffsetX": scroll_x,
+                "scrollOffsetY": scroll_y,
                 "timestamp": timestamp,
             },
             "sessionId": self.session,

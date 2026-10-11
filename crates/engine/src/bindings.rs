@@ -651,7 +651,7 @@ fn put_geometry<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         install_fn!(ctx, api, "rect", move |id: usize| {
             with_doc(&doc, |d| {
                 crate::layout::document_layout(d)
-                    .rect(id)
+                    .client_rect(d, id)
                     .map(|r| vec![r.x, r.y, r.width, r.height])
                     .unwrap_or_else(|| vec![0.0; 4])
             })
@@ -663,9 +663,54 @@ fn put_geometry<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         install_fn!(ctx, api, "hitTest", move |x: f64, y: f64| {
             with_doc(&doc, |d| {
                 let styles = crate::style::document_styles(d);
-                crate::layout::document_layout(d).hits(&styles, x, y)
+                crate::layout::document_layout(d).hits(d, &styles, x, y)
             })
             .unwrap_or_default()
+        });
+    }
+
+    // Scrolling (scroll.rs). The document node's id stands for the viewport.
+    {
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "scrollOffset", move |id: usize| {
+            with_doc(&doc, |d| d.scroll_offset(id)).map(|(x, y)| vec![x, y]).unwrap_or_else(|| vec![0.0, 0.0])
+        });
+    }
+    {
+        // Returns whether it moved.
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "scrollTo", move |id: usize, x: f64, y: f64| {
+            with_doc_mut(&doc, |d| crate::scroll::scroll_to(d, id, (x, y))).unwrap_or(false)
+        });
+    }
+    {
+        // [scrollWidth, scrollHeight, clientWidth, clientHeight].
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "scrollSizes", move |id: usize| {
+            with_doc(&doc, |d| {
+                let layout = crate::layout::document_layout(d);
+                let styles = crate::style::document_styles(d);
+                crate::scroll::sizes(d, &layout, &styles, id)
+                    .map(|s| vec![s.scroll_width, s.scroll_height, s.client_width, s.client_height])
+            })
+            .flatten()
+            .unwrap_or_else(|| vec![0.0; 4])
+        });
+    }
+    {
+        // Returns the containers that moved.
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "scrollIntoView", move |id: usize, block: String, inline: String| {
+            use crate::scroll::Align;
+            let (block, inline) = (Align::parse(&block, Align::Start), Align::parse(&inline, Align::Nearest));
+            with_doc_mut(&doc, |d| crate::scroll::into_view(d, id, block, inline)).unwrap_or_default()
+        });
+    }
+    {
+        // The wheel at a viewport point; returns what moved.
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "wheel", move |x: f64, y: f64, dx: f64, dy: f64| {
+            with_doc_mut(&doc, |d| crate::scroll::wheel(d, x, y, dx, dy)).flatten()
         });
     }
 

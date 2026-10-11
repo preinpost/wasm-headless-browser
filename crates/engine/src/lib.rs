@@ -35,6 +35,7 @@ pub mod png;
 pub mod modules;
 pub mod network;
 pub mod screencast;
+pub mod scroll;
 pub mod secrets;
 pub mod select;
 pub mod style;

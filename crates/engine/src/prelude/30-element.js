@@ -280,7 +280,59 @@ const boxOf = (el) => {
   const [x, y, width, height] = api.rect(own(el));
   return new DOMRect(x || 0, y || 0, width || 0, height || 0);
 };
-const scrollPositions = new WeakMap();
+
+// ---- scrolling ----------------------------------------------------------------
+// Offsets live in the engine (scroll.rs), so boxes, hit testing and painting
+// see them. The root element's are the viewport's.
+
+const scrollId = (el) => (el === document.documentElement ? documentId : own(el));
+
+// `scroll` fires once per task for each container that moved: at the
+// document, bubbling to the window, for the viewport, at the element, not
+// bubbling, for the rest.
+const scrolledIds = new Set();
+function noteScrolled(ids) {
+  const first = scrolledIds.size === 0;
+  for (const id of ids) scrolledIds.add(id);
+  if (!first || scrolledIds.size === 0) return;
+  schedule(() => {
+    const ids = [...scrolledIds];
+    scrolledIds.clear();
+    for (const id of ids) {
+      if (id === documentId) fire(document, 'scroll', { bubbles: true });
+      else fire(wrap(id), 'scroll');
+    }
+  }, 0);
+}
+
+// `scrollTo(x, y)`, `scrollTo({ left, top })`, and `scrollBy` likewise.
+function scrollNode(id, args, relative) {
+  let [x, y] = api.scrollOffset(id);
+  const number = (v, base) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? (relative ? base + n : n) : base;
+  };
+  if (args.length === 1 && args[0] !== null && typeof args[0] === 'object') {
+    if (args[0].left !== undefined) x = number(args[0].left, x);
+    if (args[0].top !== undefined) y = number(args[0].top, y);
+  } else if (args.length >= 2) {
+    x = number(args[0], x);
+    y = number(args[1], y);
+  }
+  if (api.scrollTo(id, x, y)) noteScrolled([id]);
+}
+
+// `scrollIntoView(alignToTop)` or `scrollIntoView({ block, inline })`.
+function scrollIntoViewOf(el, arg) {
+  let block = 'start';
+  let inline = 'nearest';
+  if (arg === false) block = 'end';
+  else if (arg !== null && typeof arg === 'object') {
+    block = arg.block ?? 'start';
+    inline = arg.inline ?? 'nearest';
+  }
+  noteScrolled(api.scrollIntoView(own(el), String(block), String(inline)));
+}
 
 // ---- Element ----------------------------------------------------------------
 
@@ -412,10 +464,10 @@ class Element extends Node {
     return box.width || box.height ? [box] : [];
   }
   get clientWidth() {
-    return boxOf(this).width;
+    return api.scrollSizes(scrollId(this))[2];
   }
   get clientHeight() {
-    return boxOf(this).height;
+    return api.scrollSizes(scrollId(this))[3];
   }
   get clientTop() {
     return 0;
@@ -424,28 +476,39 @@ class Element extends Node {
     return 0;
   }
   get scrollWidth() {
-    return boxOf(this).width;
+    return api.scrollSizes(scrollId(this))[0];
   }
   get scrollHeight() {
-    return boxOf(this).height;
+    return api.scrollSizes(scrollId(this))[1];
   }
   get scrollTop() {
-    return scrollPositions.get(this)?.top ?? 0;
+    return api.scrollOffset(scrollId(this))[1];
   }
   set scrollTop(value) {
-    scrollPositions.set(this, { left: this.scrollLeft, top: Number(value) || 0 });
+    scrollNode(scrollId(this), [{ top: value }], false);
   }
   get scrollLeft() {
-    return scrollPositions.get(this)?.left ?? 0;
+    return api.scrollOffset(scrollId(this))[0];
   }
   set scrollLeft(value) {
-    scrollPositions.set(this, { left: Number(value) || 0, top: this.scrollTop });
+    scrollNode(scrollId(this), [{ left: value }], false);
   }
-  scroll() {}
-  scrollTo() {}
-  scrollBy() {}
-  scrollIntoView() {}
-  scrollIntoViewIfNeeded() {}
+  scroll(...args) {
+    scrollNode(scrollId(this), args, false);
+  }
+  scrollTo(...args) {
+    scrollNode(scrollId(this), args, false);
+  }
+  scrollBy(...args) {
+    scrollNode(scrollId(this), args, true);
+  }
+  scrollIntoView(arg) {
+    scrollIntoViewOf(this, arg);
+  }
+  scrollIntoViewIfNeeded(center = true) {
+    const how = center ? 'if-needed' : 'nearest';
+    noteScrolled(api.scrollIntoView(own(this), how, how));
+  }
   attachShadow() {
     // Shadow trees are not rendered or projected; script gets a working
     // fragment it can build into, which is enough for most components.

@@ -50,8 +50,12 @@ window's `load`, layout uses intrinsic sizes, and screenshots paint images
 ES modules run: `<script type=module>`, static and dynamic `import`,
 top-level `await` and import maps, so Vite-built sites hydrate.
 
-Not there yet: shadows and SVG in screenshots, scrolling, and request
-interception (`network route`). The WASIX module is 5.2 MB, the font
+Pages scroll: script, `scrollIntoView`, the wheel and agent-browser's
+`scroll` move the viewport and scroll containers, and boxes, clicks and
+screenshots follow.
+
+Not there yet: shadows and SVG in screenshots, sticky positioning, and
+request interception (`network route`). The WASIX module is 5.2 MB, the font
 1.15 MB of it.
 
 ## Why the shape is what it is

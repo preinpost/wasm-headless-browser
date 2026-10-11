@@ -20,7 +20,7 @@
 //! where a click lands on it, and what overlaps what is decided in paint
 //! order.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use taffy::prelude::*;
@@ -565,8 +565,15 @@ pub struct Layout {
     boxes: HashMap<NodeId, Rect>,
     /// Elements with a box, back to front.
     paint: Vec<NodeId>,
-    /// The ancestors whose overflow clips an element, by element.
+    /// The ancestors whose overflow clips an element, by element. These are
+    /// its scroll containers too: their offsets move it.
     clips: HashMap<NodeId, Vec<NodeId>>,
+    /// Elements in a `position: fixed` subtree, which stay put when the page
+    /// scrolls.
+    fixed: HashSet<NodeId>,
+    /// How far each clipping element's descendants reach, right and down, in
+    /// page space: what it can scroll to.
+    extents: HashMap<NodeId, (f64, f64)>,
 }
 
 impl Layout {
@@ -586,31 +593,56 @@ impl Layout {
         self.boxes.values().fold(viewport, |(w, h), r| (w.max(r.x + r.width), h.max(r.y + r.height)))
     }
 
-    /// The element's border box, or a text node's box.
+    /// The element's border box, or a text node's box, in page space as
+    /// laid out, before any scrolling.
     pub fn rect(&self, id: NodeId) -> Option<Rect> {
         self.boxes.get(&id).copied()
     }
 
-    /// The topmost element at a point that takes pointer input.
-    pub fn hit_test(&self, styles: &Styles, x: f64, y: f64) -> Option<NodeId> {
-        self.hits(styles, x, y).into_iter().next()
+    /// The box where it is seen: relative to the viewport, less the offsets
+    /// of every scroll container around it and, unless it is fixed, the
+    /// page's own. What `getBoundingClientRect` and `DOM.getBoxModel` report.
+    pub fn client_rect(&self, doc: &Document, id: NodeId) -> Option<Rect> {
+        let rect = self.rect(id)?;
+        let (mut dx, mut dy) = if self.fixed.contains(&id) { (0.0, 0.0) } else { doc.scroll_offset(doc.document_id()) };
+        for container in self.clips_of(id) {
+            let (sx, sy) = doc.scroll_offset(*container);
+            dx += sx;
+            dy += sy;
+        }
+        Some(Rect { x: rect.x - dx, y: rect.y - dy, ..rect })
     }
 
-    /// Every element at a point that takes pointer input, front to back.
-    pub fn hits(&self, styles: &Styles, x: f64, y: f64) -> Vec<NodeId> {
+    pub fn is_fixed(&self, id: NodeId) -> bool {
+        self.fixed.contains(&id)
+    }
+
+    /// How far a clipping element's content reaches, right and down, in page
+    /// space as laid out.
+    pub fn extent(&self, id: NodeId) -> Option<(f64, f64)> {
+        self.extents.get(&id).copied()
+    }
+
+    /// The topmost element at a viewport point that takes pointer input.
+    pub fn hit_test(&self, doc: &Document, styles: &Styles, x: f64, y: f64) -> Option<NodeId> {
+        self.hits(doc, styles, x, y).into_iter().next()
+    }
+
+    /// Every element at a viewport point that takes pointer input, front to
+    /// back.
+    pub fn hits(&self, doc: &Document, styles: &Styles, x: f64, y: f64) -> Vec<NodeId> {
+        let at = |id: NodeId| self.client_rect(doc, id).is_some_and(|r| r.contains(x, y));
         self.paint
             .iter()
             .rev()
             .copied()
-            .filter(|id| self.boxes.get(id).is_some_and(|r| r.contains(x, y)))
+            .filter(|id| at(*id))
             .filter(|id| {
                 styles.get(*id).is_some_and(|s| {
                     s.get("pointer-events") != "none" && !matches!(s.get("visibility"), "hidden" | "collapse")
                 })
             })
-            .filter(|id| {
-                self.clips.get(id).is_none_or(|clips| clips.iter().all(|c| self.boxes.get(c).is_some_and(|r| r.contains(x, y))))
-            })
+            .filter(|id| self.clips_of(*id).iter().all(|c| at(*c)))
             .collect()
     }
 }
@@ -775,6 +807,10 @@ impl Builder<'_> {
                     let leaf_style = Style { flex_shrink: 1.0, ..Style::default() };
                     let leaf = self.tree.new_leaf_with_context(leaf_style, content).expect("taffy text");
                     self.dom_of.insert(leaf, child);
+                    // Text scrolls with its containers like the elements do.
+                    if !clips.is_empty() {
+                        self.clips.insert(child, clips.to_vec());
+                    }
                     let _ = as_items;
                     items.push(Item::Flow(leaf, true));
                 }
@@ -889,8 +925,9 @@ pub fn compute(doc: &Document, styles: &Styles, viewport: (f64, f64)) -> Layout 
     // Locations are relative to the parent box; sum them into page space.
     // A translation moves the element and everything inside it.
     let mut boxes = HashMap::new();
-    let mut stack = vec![(root, 0.0f64, 0.0f64)];
-    while let Some((node, px, py)) = stack.pop() {
+    let mut fixed = HashSet::new();
+    let mut stack = vec![(root, 0.0f64, 0.0f64, false)];
+    while let Some((node, px, py, in_fixed)) = stack.pop() {
         let Ok(layout) = builder.tree.layout(node) else { continue };
         let mut x = px + layout.location.x as f64;
         let mut y = py + layout.location.y as f64;
@@ -901,18 +938,32 @@ pub fn compute(doc: &Document, styles: &Styles, viewport: (f64, f64)) -> Layout 
             x += dx;
             y += dy;
         }
+        let in_fixed = in_fixed
+            || builder.dom_of.get(&node).and_then(|dom| styles.get(*dom)).is_some_and(|s| s.get("position") == "fixed");
         if let Some(dom) = builder.dom_of.get(&node) {
             boxes.insert(*dom, Rect { x, y, width: layout.size.width as f64, height: layout.size.height as f64 });
+            if in_fixed {
+                fixed.insert(*dom);
+            }
         }
         for child in builder.tree.children(node).unwrap_or_default() {
-            stack.push((child, x, y));
+            stack.push((child, x, y, in_fixed));
+        }
+    }
+
+    let mut extents: HashMap<NodeId, (f64, f64)> = HashMap::new();
+    for (id, rect) in &boxes {
+        for container in builder.clips.get(id).into_iter().flatten() {
+            let extent = extents.entry(*container).or_insert((0.0, 0.0));
+            extent.0 = extent.0.max(rect.x + rect.width);
+            extent.1 = extent.1.max(rect.y + rect.height);
         }
     }
 
     // Back to front: stacking level, then layer, then document order.
     let mut order = builder.order;
     order.sort_by_key(|(level, layer, at, _)| (*level, *layer, *at));
-    Layout { boxes, paint: order.into_iter().map(|(_, _, _, id)| id).collect(), clips: builder.clips }
+    Layout { boxes, paint: order.into_iter().map(|(_, _, _, id)| id).collect(), clips: builder.clips, fixed, extents }
 }
 
 /// The translation part of a `transform`: `translate()`, `translateX()`,
@@ -1009,7 +1060,7 @@ mod tests {
 
     fn id_at(doc: &Document, styles: &Styles, layout: &Layout, x: f64, y: f64) -> String {
         layout
-            .hit_test(styles, x, y)
+            .hit_test(doc, styles, x, y)
             .map(|n| doc.attr(n, "id").unwrap_or(doc.tag(n).unwrap_or("?")).to_string())
             .unwrap_or_default()
     }

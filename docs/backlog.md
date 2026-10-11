@@ -6,7 +6,7 @@
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
 이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
-보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 다음 후보는 §0.4.
+보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -44,7 +44,7 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 187, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 191, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 40 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
@@ -63,8 +63,6 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 - **요청 가로채기 (M3.3).** agent-browser `network route`. `Fetch.requestPaused`는
   엔진이 요청 도중 클라이언트의 답을 기다려야 해서 구조가 바뀐다(§4.4).
 - **콘솔 (`Runtime.consoleAPICalled`).** 지금은 `probe_a_url`로만 본다.
-- **스크롤.** `scrollIntoView`가 아무것도 안 한다. 뷰포트 밖 요소의 클릭은 되지만
-  `elementFromPoint`는 뷰포트 안만 본다.
 - **접근성 이름에 숨은 글자가 섞인다.** 참조 사이트 스냅샷의 최상위 `generic`(e1)의
   이름에 `display:none`인 추가 인증 화면의 글자가 들어간다. 내용에서 이름을 만들 때
   숨은 하위 요소를 빼야 한다(ax.rs). M2.13 전후로 같으므로 원래 있던 문제다.
@@ -110,6 +108,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `paint.rs`, `color.rs`, `png.rs` | 스크린샷: 레이아웃을 칠하고 PNG로. 배경 이미지와 그라디언트 해석도 `paint.rs` |
 | `images.rs` | 탭의 이미지 저장소: 가져오기, 크기, 디코딩(PNG·JPEG·GIF·WebP), 기다리기 |
 | `screencast.rs` | `Page.startScreencast`: 바뀐 화면을 JPEG 프레임으로, 응답을 받은 뒤에만 |
+| `scroll.rs` | 스크롤 위치(문서에 저장), 범위, `scrollIntoView` 정렬, 휠 |
 | `modules.rs` | ES 모듈의 지정자 해석(import map 포함)과 로딩. QuickJS가 링크와 평가를 맡는다 |
 | `ax.rs` | 접근성 트리 |
 | `js.rs` | `ScriptHost`: QuickJS를 전용 스레드(32MB 스택)에 가두고 채널로 부른다. 가상 시계 작업 큐, CDP용 평가 |
@@ -275,8 +274,22 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       지정 조상에, `fixed`는 뷰포트에, `transform`은 이동만, `calc()`는 퍼센트만.
       칠하는 순서는 쌓임 단계·레이어·문서 순서다. 박스와 히트 테스트가 같은
       레이아웃을 써서, 요소가 보고하는 자리를 누르면 그 요소가 눌린다.
-      남은 근사: 기준선 정렬 없음, 스크롤 없음(`scrollIntoView`는 아무것도 안 함),
-      회전·확대 무시, 쌓임 맥락은 한 단계로 평평하게.
+      남은 근사: 기준선 정렬 없음, 회전·확대 무시, 쌓임 맥락은 한 단계로 평평하게.
+- [x] M1.12 스크롤(`scroll.rs`). 위치는 `Document`에 뷰포트(문서 노드 id)와 스크롤
+      컨테이너(`overflow`가 `visible`이 아닌 요소)별로 둔다. 레이아웃은 스크롤을 모르고,
+      `Layout::client_rect`가 감싼 컨테이너들과(고정 하위 트리가 아니면) 뷰포트의 위치를
+      뺀다. 그래서 스크롤에 레이아웃 비용이 없고, `getBoundingClientRect`·히트 테스트·
+      `DOM.getBoxModel`/`getContentQuads`·그리기가 같은 좌표를 본다. JS: `scrollX/Y`,
+      창과 요소의 `scroll`/`scrollTo`/`scrollBy`, `scrollTop/Left`, `scrollWidth/Height`,
+      `clientWidth/Height`, `scrollIntoView`(`block`·`inline`), `scrollIntoViewIfNeeded`,
+      태스크마다 한 번 `scroll` 이벤트(뷰포트는 문서에서 창까지 버블). 휠은 페이지가
+      `preventDefault`하지 않으면 포인터 아래에서 그 방향으로 움직일 수 있는 가장 안쪽
+      `auto`/`scroll` 컨테이너를, 없으면 뷰포트를 움직인다(루트·body가 `overflow: hidden`이면
+      안 움직임). CDP: `DOM.scrollIntoViewIfNeeded`, `Page.getLayoutMetrics`의 `pageX/Y`,
+      스크린샷(clip 없으면 현재 뷰포트)과 스크린캐스트 프레임(`scrollOffsetX/Y`, 스크롤하면
+      새 프레임). agent-browser의 `scroll down`, 화면 밖 요소 클릭, `screenshot --full`이 된다.
+      없는 것: `scroll-behavior: smooth`(늘 즉시), `position: sticky`, 스크롤 스냅, 스크롤바
+      (자리를 차지하지 않는다).
 - [x] M1.5 스크린샷(`paint.rs`). 레이아웃의 칠하는 순서대로 캔버스 배경(루트,
       없으면 body), 배경색, 둥근 모서리와 변마다 색이 다른 테두리, 글자, 폼 컨트롤
       (꾸미지 않았으면 Chrome 모양, 값·자리표시자·비밀번호 점·체크), 목록 기호,
@@ -554,6 +567,9 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
   터미널에서 Ctrl-C는 포그라운드 그룹에 가므로 그대로 된다.
 - **새로 만든 파일이 읽기 도구에서 안 보일 때가 있다.** 2026-10-10에 `/tmp`의 새 PNG가
   bash에서는 있는데 읽기 도구는 ENOENT를 냈다. 그때는 PIL로 숫자를 뽑아 확인했다.
+- **테스트의 `evaluate` 도우미는 태스크를 돌리지 않는다.** 엔진의 원시 평가라서
+  `scroll` 이벤트처럼 태스크로 미룬 일은 일어나지 않는다. 클라이언트가 하는 대로 하려면
+  `dispatch("Runtime.evaluate")`를 쓴다.
 - **배경은 축약 속성과 longhand를 함께 읽는다.** 인라인 `background-image`만 있고
   위치·반복은 시트의 `background` 축약 속성에 있는 경우가 흔하다(참조 사이트). 한쪽만
   읽으면 위치가 가운데로, 반복이 켜진 채로 그려진다.

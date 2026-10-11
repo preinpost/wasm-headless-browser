@@ -208,9 +208,15 @@ impl HtmlEngine {
         let number = |name: &str, default: f64| {
             clip.and_then(|c| c.get(name)).and_then(|v| v.as_f64()).unwrap_or(default)
         };
+        // Without a clip, the viewport where it is scrolled to; a clip is in
+        // page space, as Chrome takes it.
+        let (scroll_x, scroll_y) = {
+            let doc = self.doc();
+            doc.scroll_offset(doc.document_id())
+        };
         let region = crate::paint::Region {
-            x: number("x", 0.0),
-            y: number("y", 0.0),
+            x: number("x", scroll_x),
+            y: number("y", scroll_y),
             width: number("width", w),
             height: number("height", h),
             scale: number("scale", 1.0),
@@ -693,7 +699,7 @@ impl HtmlEngine {
     /// content, padding and margin boxes from the computed widths around it.
     fn box_model(&self, node: NodeId) -> Option<Value> {
         let doc = self.doc();
-        let rect = crate::layout::document_layout(&doc).rect(node)?;
+        let rect = crate::layout::document_layout(&doc).client_rect(&doc, node)?;
         let styles = crate::style::document_styles(&doc);
         let style = styles.get(node);
         let px = |name: &str| -> f64 {
@@ -826,14 +832,19 @@ impl HtmlEngine {
                 Ok(json!({ "currentIndex": self.history_index, "entries": entries }))
             }
 
-            // The page does not scroll, so the viewport is always at the top
-            // left; the content size is how far the layout reaches.
+            // The viewport is where the page is scrolled to; the content size
+            // is how far the layout reaches.
             "Page.getLayoutMetrics" => {
                 let (w, h) = self.viewport;
-                let (cw, ch) = crate::layout::document_layout(&self.doc()).content_size(self.viewport);
-                let layout_viewport = json!({ "pageX": 0, "pageY": 0, "clientWidth": w, "clientHeight": h });
+                let (cw, ch, sx, sy) = {
+                    let doc = self.doc();
+                    let (cw, ch) = crate::layout::document_layout(&doc).content_size(self.viewport);
+                    let (sx, sy) = doc.scroll_offset(doc.document_id());
+                    (cw, ch, sx, sy)
+                };
+                let layout_viewport = json!({ "pageX": sx, "pageY": sy, "clientWidth": w, "clientHeight": h });
                 let visual_viewport = json!({
-                    "offsetX": 0, "offsetY": 0, "pageX": 0, "pageY": 0,
+                    "offsetX": 0, "offsetY": 0, "pageX": sx, "pageY": sy,
                     "clientWidth": w, "clientHeight": h, "scale": 1, "zoom": 1,
                 });
                 let content = json!({ "x": 0, "y": 0, "width": cw.ceil(), "height": ch.ceil() });
@@ -983,14 +994,24 @@ impl HtmlEngine {
                 let node = self.node_param(params)?;
                 let doc = self.doc();
                 let quads: Vec<Value> = crate::layout::document_layout(&doc)
-                    .rect(node)
+                    .client_rect(&doc, node)
                     .filter(|r| r.width > 0.0 && r.height > 0.0)
                     .map(|r| vec![json!(quad(r.x, r.y, r.width, r.height))])
                     .unwrap_or_default();
                 Ok(json!({ "quads": quads }))
             }
-            // Nothing scrolls yet; everything is where it is.
-            "DOM.scrollIntoViewIfNeeded" => Ok(json!({})),
+            // Through the element's own method, so `scroll` events fire.
+            "DOM.scrollIntoViewIfNeeded" => {
+                let node = self.node_param(params)?;
+                let object = self.cdp(&format!("__cdpNode({node})"))?;
+                let id = object.get("objectId").and_then(|v| v.as_str()).unwrap_or("");
+                self.cdp(&format!(
+                    "__cdpCall({}, 'function () {{ this.scrollIntoViewIfNeeded(true); }}', '[]', false, false)",
+                    js_string(id)
+                ))?;
+                self.after_script(out);
+                Ok(json!({}))
+            }
 
             "DOM.focus" => {
                 let node = self.node_param(params)?;
@@ -2360,6 +2381,49 @@ mod tests {
         let error = engine.last_error.clone().unwrap_or_default();
         assert!(error.contains("Failed to resolve module specifier \"vue\""), "{error}");
         assert_eq!(evaluate(&mut engine, "log.join()")["result"]["value"], "error event");
+    }
+
+    #[test]
+    fn pages_scroll_as_agent_browser_drives_them() {
+        let mut engine = engine_with(
+            "<body style='margin:0'>\
+             <div id=list style='height:100px;overflow:auto'><div style='height:400px'></div></div>\
+             <div style='height:1500px'></div>\
+             <button id=far style='display:block;height:40px;width:100px;background:#00f'>far</button>\
+             <div style='height:500px'></div></body>",
+        );
+        evaluate(&mut engine, "window.log = []; addEventListener('scroll', () => log.push('scroll ' + scrollY))");
+
+        // `agent-browser scroll down 300`, through Runtime.evaluate, which
+        // runs the tasks it queued, as the event's is.
+        dispatch(&mut engine, "Runtime.evaluate", json!({ "expression": "window.scrollBy(0, 300)" }));
+        assert_eq!(evaluate(&mut engine, "scrollY")["result"]["value"], 300);
+        assert_eq!(evaluate(&mut engine, "log.join()")["result"]["value"], "scroll 300", "after its task");
+
+        // A click on an element out of view: scrollIntoView, then the
+        // centre of the box, and what is there.
+        let found = evaluate(
+            &mut engine,
+            "(() => { const el = document.getElementById('far');\
+               el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });\
+               const r = el.getBoundingClientRect();\
+               return [Math.round(r.top), document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === el].join() })()",
+        );
+        assert_eq!(found["result"]["value"], "280,true", "centred in the 600px viewport");
+        let far = evaluate(&mut engine, "document.getElementById('far')")["result"]["objectId"].clone();
+        let quads = dispatch(&mut engine, "DOM.getContentQuads", json!({ "objectId": far }));
+        assert_eq!(quads["quads"][0][1], 280.0);
+        let metrics = dispatch(&mut engine, "Page.getLayoutMetrics", json!({}));
+        assert_eq!(metrics["cssLayoutViewport"]["pageY"], 1320.0);
+
+        // The screenshot shows the viewport where it is scrolled to.
+        let png = screenshot_png(&mut engine, json!({}));
+        assert_eq!(crate::images::decode(&png).unwrap().pixel(50, 300), [0, 0, 255, 255]);
+
+        // The wheel over the inner list scrolls the list, not the page.
+        evaluate(&mut engine, "scrollTo(0, 0)");
+        dispatch(&mut engine, "Input.dispatchMouseEvent", json!({ "type": "mouseWheel", "x": 50, "y": 50, "deltaX": 0, "deltaY": 120 }));
+        assert_eq!(evaluate(&mut engine, "[document.getElementById('list').scrollTop, scrollY].join()")["result"]["value"], "120,0");
     }
 
     #[test]

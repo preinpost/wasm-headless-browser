@@ -113,6 +113,13 @@ pub struct Document {
     /// The target's images, for intrinsic sizes and painting. `None` for
     /// documents no target shows, such as `DOMParser`'s.
     images: Option<std::sync::Arc<crate::images::ImageStore>>,
+    /// Scroll offsets: the viewport's under the document node's id, and
+    /// those of scroll containers under theirs. Layout ignores them; they
+    /// are subtracted where positions are used (`Layout::client_rect`).
+    scroll: HashMap<NodeId, (f64, f64)>,
+    /// Bumped by every scroll, which changes what is seen without changing
+    /// the document, so that screencast frames notice.
+    scroll_generation: u64,
 }
 
 impl Default for Document {
@@ -135,7 +142,34 @@ impl Document {
             style_cache: Default::default(),
             layout_cache: Default::default(),
             images: None,
+            scroll: HashMap::new(),
+            scroll_generation: 0,
         }
+    }
+
+    /// How far `id` is scrolled, `(left, top)`. The document node's is the
+    /// viewport's.
+    pub fn scroll_offset(&self, id: NodeId) -> (f64, f64) {
+        self.scroll.get(&id).copied().unwrap_or((0.0, 0.0))
+    }
+
+    /// Sets a scroll offset, already clamped by the caller. Returns whether
+    /// it changed.
+    pub fn set_scroll_offset(&mut self, id: NodeId, offset: (f64, f64)) -> bool {
+        if self.scroll_offset(id) == offset {
+            return false;
+        }
+        if offset == (0.0, 0.0) {
+            self.scroll.remove(&id);
+        } else {
+            self.scroll.insert(id, offset);
+        }
+        self.scroll_generation += 1;
+        true
+    }
+
+    pub fn scroll_generation(&self) -> u64 {
+        self.scroll_generation
     }
 
     pub fn images(&self) -> Option<&std::sync::Arc<crate::images::ImageStore>> {

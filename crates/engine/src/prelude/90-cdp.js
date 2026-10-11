@@ -458,8 +458,15 @@ function dispatchMouse(json) {
       }
       return;
     }
-    case 'mouseWheel':
-      dispatch(target, new WheelEvent('wheel', { ...init, deltaX: Number(p.deltaX) || 0, deltaY: Number(p.deltaY) || 0 }));
+    case 'mouseWheel': {
+      const wheel = new WheelEvent('wheel', { ...init, cancelable: true, deltaX: Number(p.deltaX) || 0, deltaY: Number(p.deltaY) || 0 });
+      dispatch(target, wheel);
+      // Unless the page took the wheel, it scrolls what is under it.
+      if (!wheel.defaultPrevented) {
+        const moved = api.wheel(Number(p.x) || 0, Number(p.y) || 0, wheel.deltaX, wheel.deltaY);
+        if (moved !== undefined) noteScrolled([moved]);
+      }
+    }
   }
 }
 
