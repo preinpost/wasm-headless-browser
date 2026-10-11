@@ -406,3 +406,29 @@ try {
     Object.defineProperty(globalThis, key, { value: EventTarget.prototype[key], writable: true, configurable: true });
   }
 }
+
+// Named access: `<div id=menu>` is `window.menu`, and a bare `menu` in
+// script, as long as nothing else has that name. In a browser these come
+// from an object between the window and Window.prototype; here it is a
+// proxy in that place, which QuickJS consults for bare names too. Real
+// globals and anything script assigns come first, as they do there.
+try {
+  const windowPrototype = Object.getPrototypeOf(globalThis);
+  const namedProperties = new Proxy(windowPrototype, {
+    get(target, key, receiver) {
+      if (typeof key === 'string' && !(key in target)) {
+        const id = api.namedItem(key);
+        if (id !== undefined) return wrap(id);
+      }
+      return Reflect.get(target, key, receiver);
+    },
+    has(target, key) {
+      return Reflect.has(target, key) || (typeof key === 'string' && api.namedItem(key) !== undefined);
+    },
+    // So that `window instanceof Window` still holds.
+    getPrototypeOf: () => windowPrototype,
+  });
+  Object.setPrototypeOf(globalThis, namedProperties);
+} catch (e) {
+  // Without it, pages that use the names fail as they would anywhere else.
+}

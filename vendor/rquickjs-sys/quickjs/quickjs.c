@@ -9211,7 +9211,22 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 if (em) {
                     if (em->get_property) {
                         JSValue obj1, retval;
-                        /* XXX: should pass throw_ref_error */
+                        /* A global variable lookup that reaches an exotic
+                           object, such as a proxy on the global object's
+                           prototype chain, asks it whether it has the name
+                           first, so that an undeclared name is still a
+                           ReferenceError and not `undefined`. Patched in
+                           wasm-headless-browser; see vendor/README.md. */
+                        if (unlikely(throw_ref_error) && em->has_property) {
+                            int found;
+                            obj1 = js_dup(JS_MKPTR(JS_TAG_OBJECT, p));
+                            found = em->has_property(ctx, obj1, prop);
+                            JS_FreeValue(ctx, obj1);
+                            if (found < 0)
+                                return JS_EXCEPTION;
+                            if (!found)
+                                return JS_ThrowReferenceErrorNotDefined(ctx, prop);
+                        }
                         /* Note: if 'p' is a prototype, it can be
                            freed in the called function */
                         obj1 = js_dup(JS_MKPTR(JS_TAG_OBJECT, p));

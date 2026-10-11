@@ -105,6 +105,16 @@ pub struct DomState {
     requests: Arc<Mutex<HashMap<u32, (fetch::Pending, String)>>>,
     /// The page's import maps, merged, for resolving module specifiers.
     import_map: Mutex<crate::modules::ImportMap>,
+    /// The window's named properties, by id and by name, and the document
+    /// version they were read at. See [`DomState::named_item`].
+    named: Mutex<Option<NamedIndex>>,
+}
+
+/// What [`DomState::named_item`] looks names up in.
+struct NamedIndex {
+    version: u64,
+    by_id: HashMap<String, NodeId>,
+    by_name: HashMap<String, NodeId>,
 }
 
 impl DomState {
@@ -127,6 +137,7 @@ impl DomState {
             storage: Arc::new(Mutex::new(HashMap::new())),
             requests: Arc::new(Mutex::new(HashMap::new())),
             import_map: Mutex::new(Default::default()),
+            named: Mutex::new(None),
         }
     }
 
@@ -155,6 +166,36 @@ impl DomState {
         if let Ok(mut map) = self.import_map.lock() {
             *map = Default::default();
         }
+        // A new document's versions start again, so they cannot tell its
+        // index from the last one's.
+        if let Ok(mut named) = self.named.lock() {
+            *named = None;
+        }
+    }
+
+    /// The element `window[name]` names: the first with that id, else the
+    /// first `<img>`, `<form>`, `<embed>` or `<object>` with that `name`, as
+    /// HTML's named access on the window has it. Bundles test globals such
+    /// as `typeof module` often, and each miss lands here, so lookups use an
+    /// index, rebuilt only when the document has changed.
+    pub fn named_item(&self, name: &str) -> Option<NodeId> {
+        let doc = self.doc.lock().ok()?;
+        let mut named = self.named.lock().ok()?;
+        if named.as_ref().is_none_or(|index| index.version != doc.version()) {
+            let mut index = NamedIndex { version: doc.version(), by_id: HashMap::new(), by_name: HashMap::new() };
+            for node in doc.descendants(doc.document_id()).filter(|n| doc.is_element(*n)) {
+                if let Some(id) = doc.attr(node, "id").filter(|v| !v.is_empty()) {
+                    index.by_id.entry(id.to_string()).or_insert(node);
+                }
+                let named_tag = ["img", "form", "embed", "object"].iter().any(|t| doc.is_tag(node, t));
+                if let Some(value) = doc.attr(node, "name").filter(|v| named_tag && !v.is_empty()) {
+                    index.by_name.entry(value.to_string()).or_insert(node);
+                }
+            }
+            *named = Some(index);
+        }
+        let index = named.as_ref()?;
+        index.by_id.get(name).or_else(|| index.by_name.get(name)).copied()
     }
 
     pub fn client(&self) -> &fetch::Client {
@@ -997,6 +1038,10 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
     }
 
     install_fn!(ctx, api, "resolveUrl", |base: String, relative: String| resolve_url(&base, &relative));
+    {
+        let state = Arc::clone(state);
+        install_fn!(ctx, api, "namedItem", move |name: String| state.named_item(&name));
+    }
 
     // A module script. Inline, its source is declared under `name`, unique
     // per script, with `url`, the document's, as `import.meta.url`; external,

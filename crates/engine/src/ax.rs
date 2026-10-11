@@ -29,6 +29,8 @@ pub struct AxNode {
     pub level: Option<u8>,
     /// Current value, for controls that carry one.
     pub value: Option<String>,
+    /// Disabled, as a control or by `aria-disabled`.
+    pub disabled: bool,
 }
 
 /// Builds the tree in document order.
@@ -141,6 +143,7 @@ fn collect(
             children: Vec::new(),
             level: None,
             value: None,
+            disabled: false,
         });
         siblings.push(node_id);
         return;
@@ -168,6 +171,7 @@ fn collect(
             children: Vec::new(),
             level: if is_root { None } else { heading_level(doc, id) },
             value: if is_root { None } else { control_value(doc, id) },
+            disabled: !is_root && is_disabled(doc, id),
         });
 
         let mut children = Vec::new();
@@ -378,6 +382,40 @@ fn heading_level(doc: &Document, id: NodeId) -> Option<u8> {
         return Some(2);
     }
     None
+}
+
+/// Whether `id` is disabled, as HTML defines it for form controls: its own
+/// `disabled`, an `<optgroup disabled>` around an option, or a
+/// `<fieldset disabled>` around it, unless it is in that fieldset's first
+/// `<legend>`. Any element can also say so with `aria-disabled`. The
+/// prelude's `isDisabled` is the same rule, for clicks.
+fn is_disabled(doc: &Document, id: NodeId) -> bool {
+    if doc.attr(id, "aria-disabled") == Some("true") {
+        return true;
+    }
+    const CONTROLS: &[&str] = &["button", "input", "select", "textarea", "optgroup", "option", "fieldset"];
+    if !doc.tag(id).is_some_and(|t| CONTROLS.contains(&t)) {
+        return false;
+    }
+    if doc.has_attr(id, "disabled") {
+        return true;
+    }
+    let mut child = id;
+    let mut ancestor = doc.parent(id);
+    while let Some(node) = ancestor {
+        if doc.is_tag(id, "option") && doc.is_tag(node, "optgroup") && doc.has_attr(node, "disabled") {
+            return true;
+        }
+        if doc.is_tag(node, "fieldset") && doc.has_attr(node, "disabled") {
+            let first_legend = doc.children(node).iter().copied().find(|c| doc.is_element(*c)).filter(|c| doc.is_tag(*c, "legend"));
+            if first_legend != Some(child) {
+                return true;
+            }
+        }
+        child = node;
+        ancestor = doc.parent(node);
+    }
+    false
 }
 
 fn control_value(doc: &Document, id: NodeId) -> Option<String> {
@@ -612,6 +650,9 @@ pub fn to_cdp(nodes: &[AxNode]) -> Value {
             Some(value) => entry["value"] = json!({ "type": "string", "value": value }),
             None => {}
         }
+        if node.disabled {
+            properties.push(json!({ "name": "disabled", "value": { "type": "boolean", "value": true } }));
+        }
         if !properties.is_empty() {
             entry["properties"] = json!(properties);
         }
@@ -772,6 +813,22 @@ mod tests {
         let doc = parse_html("<body><label><img src='x' alt='From alt'> caption</label></body>");
         let nodes = build(&doc);
         assert!(find(&nodes, "img", "From alt").is_some());
+    }
+
+    #[test]
+    fn disabled_controls_say_so() {
+        let doc = parse_html(
+            "<body><input aria-label='off' disabled><input aria-label='on'>\
+             <fieldset disabled><legend><button>in legend</button></legend><button>in fieldset</button></fieldset>\
+             <div role='button' aria-disabled='true'>aria</div>\
+             <select aria-label='s'><optgroup disabled><option>grouped</option></optgroup><option>free</option></select></body>",
+        );
+        let nodes = build(&doc);
+        let disabled: Vec<String> = nodes.iter().filter(|n| n.disabled).map(|n| format!("{} {}", n.role, n.name)).collect();
+        // The fieldset and the optgroup are disabled themselves, as in Chrome.
+        assert_eq!(disabled, ["textbox off", "group ", "button in fieldset", "button aria", "group ", "option grouped"]);
+        let cdp = to_cdp(&nodes).to_string();
+        assert!(cdp.contains(r#"{"name":"disabled","value":{"type":"boolean","value":true}}"#), "{cdp}");
     }
 
     #[test]

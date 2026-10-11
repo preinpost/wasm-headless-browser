@@ -2558,8 +2558,26 @@ mod tests {
         let details = runtime_events(&events).into_iter().find_map(|p| p.get("exceptionDetails")).expect("reported");
         assert_eq!(details["text"], "Uncaught");
         assert_eq!(details["lineNumber"], 2, "{details}");
-        assert!(details["exception"]["description"].as_str().unwrap().starts_with("ReferenceError"));
+        assert!(details["exception"]["description"].as_str().unwrap().starts_with("ReferenceError"), "{details}");
         assert_eq!(evaluate(&mut engine, "window.seen")["result"]["value"], true, "and fires error at the window");
+    }
+
+    #[test]
+    fn elements_are_named_on_the_window_by_id_and_name() {
+        let mut engine = engine_with(
+            "<body><div id=menu>m</div><form name=login></form><img name=logo><input name=user id=field>\
+             <div id=alert>shadowed</div><div id=later></div></body>",
+        );
+        let check = |engine: &mut HtmlEngine, expression: &str| evaluate(engine, expression)["result"]["value"].clone();
+        assert_eq!(check(&mut engine, "menu.textContent + ' ' + (window.menu === document.getElementById('menu'))"), "m true");
+        assert_eq!(check(&mut engine, "[login.tagName, logo.tagName, field.tagName, typeof user].join()"), "FORM,IMG,INPUT,undefined");
+        assert_eq!(check(&mut engine, "typeof alert"), "function", "real globals come first");
+        assert_eq!(check(&mut engine, "'menu' in window && !('nothing' in window) && typeof nothing === 'undefined'"), true);
+        assert_eq!(check(&mut engine, "window instanceof Window"), true);
+        // A name follows the document.
+        assert_eq!(check(&mut engine, "document.getElementById('later').id = 'renamed'; typeof later + ' ' + renamed.tagName"), "undefined DIV");
+        // Script's own globals win, and assigning one does not touch the element.
+        assert_eq!(check(&mut engine, "menu = 5; menu + ' ' + document.getElementById('menu').textContent"), "5 m");
     }
 
     #[test]

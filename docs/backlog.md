@@ -6,7 +6,7 @@
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
 이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
-보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). 다음 후보는 §0.4.
+보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -44,7 +44,7 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 193, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 195, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 42 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
@@ -57,14 +57,12 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 - **참조 사이트 로고.** `div.logo`의 `<img>`가 우리 엔진에서는 `src` 없이 남는다.
   Chrome에서는 보인다. 로고 주소를 정하는 스크립트 경로를 `probe_a_url`로 찾아야 한다.
-- **id로 된 전역 이름.** `<img id=i>`를 `window.i`나 `i`로 부를 수 없다(named access).
-  오래된 페이지가 쓴다.
+- **콘솔이 드러낸 vite.dev의 빈칸.** `SVGAnimatedString`이 없어 프레임워크 청크에서
+  ReferenceError, `TextDecoder('utf-16le')` 미지원, 그 여파로 FloatingVue 초기화 실패.
+  화면(스냅샷 305줄)은 그대로 나온다.
 - **그림자, SVG.** `box-shadow`와 SVG 이미지(`<img src=*.svg>`, 인라인 `<svg>`)는 그리지 않는다.
 - **요청 가로채기 (M3.3).** agent-browser `network route`. `Fetch.requestPaused`는
   엔진이 요청 도중 클라이언트의 답을 기다려야 해서 구조가 바뀐다(§4.4).
-- **접근성 이름에 숨은 글자가 섞인다.** 참조 사이트 스냅샷의 최상위 `generic`(e1)의
-  이름에 `display:none`인 추가 인증 화면의 글자가 들어간다. 내용에서 이름을 만들 때
-  숨은 하위 요소를 빼야 한다(ax.rs). M2.13 전후로 같으므로 원래 있던 문제다.
 
 ### 0.5 이번 세션의 커밋 (오래된 것부터)
 
@@ -391,6 +389,16 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       돌지 않는다(모듈을 지원하는 브라우저처럼). 없는 것: import map의 `scopes`·
       `integrity`, JSON·CSS 모듈, MIME 검사. vite.dev(VitePress)가 네이티브와 WASIX에서
       오류 없이 하이드레이션된다. 모듈 실행으로 0.3~1초가 더 걸린다.
+- [x] M2.15 id 전역 이름(named access). `<div id=menu>`가 `window.menu`이고 맨 이름
+      `menu`로도 불린다. `<img>`·`<form>`·`<embed>`·`<object>`는 `name`으로도. 브라우저처럼
+      창과 `Window.prototype` 사이에 Proxy를 끼우고, 진짜 전역과 스크립트가 대입한 값이
+      먼저다. 조회는 Rust의 id·name 색인(`DomState::named_item`, 문서 버전이 바뀔 때만 다시
+      만듦)이라 번들의 잦은 `typeof module` 같은 검사가 느려지지 않는다(참조 사이트 로딩
+      그대로). QuickJS는 전역 프로토타입 체인의 Proxy를 만나면 `get`의 `undefined`를 그대로
+      써서 선언되지 않은 이름이 ReferenceError가 아니게 됐다. 그래서 QuickJS를 패치했다
+      (`vendor/patches/0002`): 전역 변수 조회가 이국 객체를 만나면 `has`를 먼저 묻는다.
+      원본 소스의 `XXX: should pass throw_ref_error` 자리다. 이때 vendored `build.rs`가
+      C 소스 변경을 감시하지 않는 것도 고쳤다(`rerun-if-changed=quickjs`).
 - [ ] M2.12 `popstate`. 지금은 `pushState`로 만든 항목으로 뒤로 가면 그 URL을
       새로 읽는다.
 - [x] M2.5 마우스. `Input.dispatchMouseEvent`가 히트 테스트로 대상을 찾고
@@ -586,6 +594,14 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
 - **테스트의 `evaluate` 도우미는 태스크를 돌리지 않는다.** 엔진의 원시 평가라서
   `scroll` 이벤트처럼 태스크로 미룬 일은 일어나지 않는다. 클라이언트가 하는 대로 하려면
   `dispatch("Runtime.evaluate")`를 쓴다.
+- **agent-browser의 클릭 가능한 `generic` 이름은 `textContent`다.** 참조 사이트 스냅샷
+  첫 줄에 숨은 화면의 글자가 섞이는 것은 Chrome에서도 글자까지 같다. 엔진 문제가
+  아니다(한때 백로그에 버그로 적었다가 정정).
+- **접근성 트리는 `disabled`를 속성으로 낸다.** Chrome처럼 `{name: disabled, value:
+  {type: boolean, value: true}}`. 참조 사이트 첫 입력란 칸이 `[disabled]`로 나와야 Chrome과
+  같다. 규칙은 프렐류드의 `isDisabled`와 같다(fieldset, 첫 legend 예외, optgroup, aria).
+- **vendored C를 고치면 다시 컴파일되는지 확인한다.** 0002 이전에는 `build.rs`가 C
+  소스를 감시하지 않아 고쳐도 옛 객체 파일이 쓰였다.
 - **배경은 축약 속성과 longhand를 함께 읽는다.** 인라인 `background-image`만 있고
   위치·반복은 시트의 `background` 축약 속성에 있는 경우가 흔하다(참조 사이트). 한쪽만
   읽으면 위치가 가운데로, 반복이 켜진 채로 그려진다.

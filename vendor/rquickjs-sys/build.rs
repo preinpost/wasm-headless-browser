@@ -117,6 +117,9 @@ fn main() {
         println!("cargo:rerun-if-env-changed={}", feature_to_cargo(feature));
     }
     println!("cargo:rerun-if-env-changed=CARGO_CFG_SANITIZE");
+    // The C sources are patched in place (vendor/patches), so a change to
+    // them must rebuild QuickJS. Added in wasm-headless-browser.
+    println!("cargo:rerun-if-changed=quickjs");
 
     let src_dir = Path::new("quickjs");
 
