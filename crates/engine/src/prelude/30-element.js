@@ -667,7 +667,7 @@ const clicking = new WeakSet();
 
 class HTMLElement extends Element {
   get innerText() {
-    return api.textContent(own(this));
+    return api.innerText(own(this));
   }
   set innerText(value) {
     replaceText(this, value);

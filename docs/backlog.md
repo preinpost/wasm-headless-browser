@@ -6,7 +6,7 @@
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
 이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
-보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. EUC-KR 등 모든 인코딩(M1.9). 다음 후보는 §0.4.
+보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. EUC-KR 등 모든 인코딩(M1.9). `innerText`가 보이는 글자다(M2.16). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -44,7 +44,7 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 199, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 202, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 42 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
@@ -57,9 +57,6 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 - **참조 사이트 로고.** `div.logo`의 `<img>`가 우리 엔진에서는 `src` 없이 남는다.
   Chrome에서는 보인다. 로고 주소를 정하는 스크립트 경로를 `probe_a_url`로 찾아야 한다.
-- **`innerText`가 `textContent`와 같다.** Chrome의 `innerText`는 보이는 글자만이고(스크립트·
-  스타일·`display:none` 제외) 블록마다 줄을 바꾼다. 지금은 `<script>` 안의 코드까지 나온다
-  (웃긴대학 본문 첫머리가 `var is_ddn_call = 0; ...`). 에이전트가 `eval`로 읽을 때 잡음이다.
 - **WebAssembly.** QuickJS에 없다. vite.dev의 코드 하이라이터(oniguruma)가 이것 때문에
   실패한다. 인터프리터 안에서 wasm을 돌리는 것은 범위 밖으로 본다.
 - **그림자, SVG.** `box-shadow`와 SVG 이미지(`<img src=*.svg>`, 인라인 `<svg>`)는 그리지 않는다.
@@ -108,6 +105,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `images.rs` | 탭의 이미지 저장소: 가져오기, 크기, 디코딩(PNG·JPEG·GIF·WebP), 기다리기 |
 | `screencast.rs` | `Page.startScreencast`: 바뀐 화면을 JPEG 프레임으로, 응답을 받은 뒤에만 |
 | `scroll.rs` | 스크롤 위치(문서에 저장), 범위, `scrollIntoView` 정렬, 휠 |
+| `text.rs` | `innerText`: 계산 스타일로 보이는 글자를 모으고 공백을 접고 줄을 나눈다 |
 | `encoding.rs` | 문자 인코딩: 문서 인코딩 판정(BOM·헤더·meta·추정), 응답 디코딩, `TextDecoder` |
 | `modules.rs` | ES 모듈의 지정자 해석(import map 포함)과 로딩. QuickJS가 링크와 평가를 맡는다 |
 | `ax.rs` | 접근성 트리 |
@@ -402,6 +400,15 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       돌지 않는다(모듈을 지원하는 브라우저처럼). 없는 것: import map의 `scopes`·
       `integrity`, JSON·CSS 모듈, MIME 검사. vite.dev(VitePress)가 네이티브와 WASIX에서
       오류 없이 하이드레이션된다. 모듈 실행으로 0.3~1초가 더 걸린다.
+- [x] M2.16 `innerText`(`text.rs`). HTML의 rendered text collection을 계산 스타일로 한다.
+      `display:none`(UA 시트상 script·style·head 포함)은 빠지고, `visibility:hidden` 글자는
+      빠지되 보이는 자식은 남는다. `white-space`대로 공백을 접고 줄 앞뒤 공백을 지운다. 블록은
+      앞뒤 한 줄, `<p>`는 빈 줄, `<br>`은 줄바꿈, 표 칸은 탭, 행은 줄바꿈. 이미지 같은 인라인
+      객체가 있는 줄은 빈 줄로 보지 않는다. `text-transform`을 적용한다. 렌더링되지 않는
+      요소는 규격대로 `textContent`. 참조 사이트 로그인 상자는 Chrome과 글자까지 같고, 웃긴대학
+      본문 첫 400자는 빈 줄 3개(Chrome이 `<br>` 등에서 따로 내는 `\n`) 말고는 같다. 이때 UA
+      시트에 `pre`의 `white-space: pre`, `textarea`의 `pre-wrap`, `option`의 `display: block`이
+      빠져 있던 것도 넣었다(레이아웃 비교 결과는 그대로).
 - [x] M2.15 id 전역 이름(named access). `<div id=menu>`가 `window.menu`이고 맨 이름
       `menu`로도 불린다. `<img>`·`<form>`·`<embed>`·`<object>`는 `name`으로도. 브라우저처럼
       창과 `Window.prototype` 사이에 Proxy를 끼우고, 진짜 전역과 스크립트가 대입한 값이

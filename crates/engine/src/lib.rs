@@ -40,6 +40,7 @@ pub mod scroll;
 pub mod secrets;
 pub mod select;
 pub mod style;
+pub mod text;
 #[cfg(test)]
 mod test_server;
 

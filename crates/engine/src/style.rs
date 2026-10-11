@@ -710,6 +710,7 @@ nav, section, dir, dd, dl, dt, menu, ol, ul, fieldset, details, summary, optgrou
 head, script, style, link, meta, title, template, noscript, datalist, param, area, base, basefont,
 rp, [hidden]:not([hidden=until-found i]), input[type=hidden i], dialog:not([open]) { display: none }
 li { display: list-item }
+option { display: block }
 table { display: table } caption { display: table-caption } colgroup { display: table-column-group }
 col { display: table-column } thead { display: table-header-group } tbody { display: table-row-group }
 tfoot { display: table-footer-group } tr { display: table-row } td, th { display: table-cell }
@@ -727,6 +728,8 @@ b, strong, th { font-weight: bold }
 a:any-link { cursor: pointer; color: #0000ee; text-decoration: underline }
 input, select, textarea, button { font-size: 13.3333px }
 pre, code, kbd, samp, tt { font-family: monospace }
+pre, listing, xmp, plaintext { white-space: pre }
+textarea { white-space: pre-wrap }
 dialog[open] { position: absolute; margin: auto }
 fieldset { margin-left: 2px; margin-right: 2px; padding: 0.35em 0.75em 0.625em; border: 2px groove }
 "#;

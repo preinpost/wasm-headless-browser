@@ -710,6 +710,14 @@ fn put_geometry<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         });
     }
 
+    // `innerText`: the text as rendered (text.rs).
+    {
+        let doc = Arc::clone(&state.doc);
+        install_fn!(ctx, api, "innerText", move |id: usize| {
+            with_doc(&doc, |d| crate::text::inner_text(d, id)).unwrap_or_default()
+        });
+    }
+
     // Scrolling (scroll.rs). The document node's id stands for the viewport.
     {
         let doc = Arc::clone(&state.doc);
