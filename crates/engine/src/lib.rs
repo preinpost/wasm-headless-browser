@@ -33,6 +33,7 @@ pub mod paint;
 pub mod parse;
 pub mod png;
 pub mod network;
+pub mod screencast;
 pub mod secrets;
 pub mod select;
 pub mod style;

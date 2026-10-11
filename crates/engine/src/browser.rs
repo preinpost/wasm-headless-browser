@@ -20,6 +20,7 @@ use crate::dom::{Document, NodeData, NodeId};
 use crate::fetch::{self, Request};
 use crate::bindings::Navigation;
 use crate::images::ImageStore;
+use crate::screencast::{Format, Screencast};
 use crate::js::{JsValue, ScriptHost};
 use crate::network::ResourceType;
 use crate::parse::{parse_html, parse_html_bytes};
@@ -53,6 +54,8 @@ pub struct HtmlEngine {
     client: fetch::Client,
     /// This target's images, attached to every document it shows.
     images: Arc<ImageStore>,
+    /// Set between `Page.startScreencast` and `Page.stopScreencast`.
+    screencast: Option<Screencast>,
     /// Credentials, typed only through placeholders and scrubbed from
     /// everything the engine says. Shared by every target.
     secrets: Arc<Secrets>,
@@ -97,6 +100,7 @@ impl HtmlEngine {
             script,
             client,
             images,
+            screencast: None,
             secrets,
             url: "about:blank".to_string(),
             frame_id,
@@ -197,12 +201,8 @@ impl HtmlEngine {
 
     /// `Page.captureScreenshot`: the viewport, or `clip`, painted as PNG.
     fn screenshot(&self, params: &Value) -> Result<Value, CdpError> {
-        let format = params.get("format").and_then(|v| v.as_str()).unwrap_or("png");
-        if format != "png" {
-            return Err(CdpError::internal(format!(
-                "Page.captureScreenshot: only png is supported here, not {format}"
-            )));
-        }
+        let format = Format::parse(params.get("format").and_then(Value::as_str), params.get("quality").and_then(Value::as_u64))
+            .map_err(|e| CdpError::internal(format!("Page.captureScreenshot: {e}")))?;
         let (w, h) = self.viewport;
         let clip = params.get("clip");
         let number = |name: &str, default: f64| {
@@ -227,9 +227,30 @@ impl HtmlEngine {
         let urls = self.image_urls();
         self.images.wait_all(&urls);
         let secrets = Arc::clone(&self.secrets);
-        let canvas = crate::paint::paint(&self.doc(), region, &|text| secrets.scrub_str(text));
+        let focus = self.script.as_ref().and_then(|s| s.state().focused());
+        let canvas = crate::paint::paint(&self.doc(), region, focus, &|text| secrets.scrub_str(text));
         use base64::Engine as _;
-        Ok(json!({ "data": base64::engine::general_purpose::STANDARD.encode(canvas.to_png()) }))
+        Ok(json!({ "data": base64::engine::general_purpose::STANDARD.encode(format.encode(&canvas)) }))
+    }
+
+    /// Sends a screencast frame if one is running, the client is ready, and
+    /// the page changed. Called at the end of every command and navigation:
+    /// nothing changes the page between them.
+    fn emit_frame(&mut self, out: &mut EngineEmit) {
+        if self.screencast.is_none() {
+            return;
+        }
+        let secrets = Arc::clone(&self.secrets);
+        let scrub = |text: &str| secrets.scrub_str(text);
+        let (url, viewport) = (self.url.clone(), self.viewport);
+        let focus = self.script.as_ref().and_then(|s| s.state().focused());
+        let frame = {
+            let doc = self.doc.lock().unwrap_or_else(|p| p.into_inner());
+            self.screencast.as_mut().and_then(|cast| cast.frame(&doc, &url, viewport, focus, &scrub))
+        };
+        if let Some(frame) = frame {
+            out("Page.screencastFrame", frame);
+        }
     }
 
     /// Sends the `Network.*` events recorded since the last call. Requests
@@ -827,6 +848,21 @@ impl HtmlEngine {
             "Page.createIsolatedWorld" => Ok(json!({ "executionContextId": self.context_id })),
 
             "Page.captureScreenshot" => self.screenshot(params),
+            "Page.startScreencast" => {
+                self.screencast = Some(Screencast::start(params).map_err(|e| CdpError::internal(format!("Page.startScreencast: {e}")))?);
+                out("Page.screencastVisibilityChanged", json!({ "visible": true }));
+                Ok(json!({}))
+            }
+            "Page.stopScreencast" => {
+                self.screencast = None;
+                Ok(json!({}))
+            }
+            "Page.screencastFrameAck" => {
+                if let (Some(cast), Some(session)) = (&mut self.screencast, params.get("sessionId").and_then(Value::as_u64)) {
+                    cast.ack(session);
+                }
+                Ok(json!({}))
+            }
 
             // ---- Runtime -------------------------------------------------
             "Runtime.enable" => {
@@ -1126,16 +1162,18 @@ impl Engine for HtmlEngine {
     fn navigate(&mut self, url: &str, out: &mut EngineEmit) -> Result<(), CdpError> {
         let secrets = Arc::clone(&self.secrets);
         let mut scrubbed = |method: &str, mut params: Value| {
-            secrets.scrub(&mut params);
+            scrub_outgoing(&secrets, method, &mut params);
             out(method, params)
         };
-        self.navigate_raw(url, &mut scrubbed).map_err(|e| scrub_error(&self.secrets, e))
+        let result = self.navigate_raw(url, &mut scrubbed).map_err(|e| scrub_error(&self.secrets, e));
+        self.emit_frame(&mut scrubbed);
+        result
     }
 
     fn attach(&mut self, out: &mut EngineEmit) {
         let secrets = Arc::clone(&self.secrets);
         let mut scrubbed = |method: &str, mut params: Value| {
-            secrets.scrub(&mut params);
+            scrub_outgoing(&secrets, method, &mut params);
             out(method, params)
         };
         self.emit_context(&mut scrubbed);
@@ -1144,18 +1182,37 @@ impl Engine for HtmlEngine {
     fn dispatch(&mut self, method: &str, params: &Value, out: &mut EngineEmit) -> Result<Value, CdpError> {
         let secrets = Arc::clone(&self.secrets);
         let mut scrubbed = |method: &str, mut params: Value| {
-            secrets.scrub(&mut params);
+            scrub_outgoing(&secrets, method, &mut params);
             out(method, params)
         };
         let result = self.dispatch_raw(method, params, &mut scrubbed);
         self.emit_network(&mut scrubbed);
+        self.emit_frame(&mut scrubbed);
         match result {
             Ok(mut value) => {
-                self.secrets.scrub(&mut value);
+                scrub_outgoing(&self.secrets, method, &mut value);
                 Ok(value)
             }
             Err(e) => Err(scrub_error(&self.secrets, e)),
         }
+    }
+}
+
+/// Scrubs an outgoing result or event, except a binary payload, which was
+/// scrubbed before it was encoded: screenshots and frames are painted from
+/// scrubbed text, and a base64 response body is scrubbed as bytes. The
+/// string scrub run over base64 could match a short secret by chance, a
+/// username like `kim` about once in a 200 KB image, and corrupt it.
+fn scrub_outgoing(secrets: &Secrets, method: &str, value: &mut Value) {
+    let binary = match method {
+        "Page.captureScreenshot" | "Page.screencastFrame" => Some("data"),
+        "Network.getResponseBody" if value.get("base64Encoded") == Some(&Value::Bool(true)) => Some("body"),
+        _ => None,
+    };
+    let kept = binary.and_then(|field| value.as_object_mut()?.remove(field).map(|v| (field, v)));
+    secrets.scrub(value);
+    if let Some((field, payload)) = kept {
+        value[field] = payload;
     }
 }
 
@@ -2111,8 +2168,11 @@ mod tests {
         assert_eq!(metrics["cssLayoutViewport"]["clientWidth"], 800.0);
 
         let mut sink = |_: &str, _: Value| {};
-        let jpeg = engine.dispatch("Page.captureScreenshot", &json!({ "format": "jpeg" }), &mut sink).unwrap_err();
-        assert!(jpeg.message.contains("only png"), "{}", jpeg.message);
+        let webp = engine.dispatch("Page.captureScreenshot", &json!({ "format": "webp" }), &mut sink).unwrap_err();
+        assert!(webp.message.contains("only png and jpeg"), "{}", webp.message);
+        let jpeg = screenshot_png(&mut engine, json!({ "format": "jpeg", "quality": 50 }));
+        assert_eq!(&jpeg[..3], b"\xff\xd8\xff");
+        assert_eq!(crate::images::dimensions(&jpeg), Some((800, 600)));
         let huge = json!({ "clip": { "x": 0, "y": 0, "width": 100000, "height": 100000, "scale": 1 } });
         assert!(engine.dispatch("Page.captureScreenshot", &huge, &mut sink).is_err());
     }
@@ -2174,6 +2234,62 @@ mod tests {
         let decoded = crate::images::decode(&shot).unwrap();
         assert_eq!(decoded.pixel(15, 5), [255, 0, 0, 255]);
         assert_eq!(decoded.pixel(35, 5), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn a_screencast_sends_a_frame_when_the_page_changes_and_the_last_was_acknowledged() {
+        let mut engine = engine_with("<body><p id=t>one</p></body>");
+        let frames = |engine: &mut HtmlEngine, method: &str, params: Value| -> Vec<Value> {
+            events_of(engine, |e, out| {
+                e.dispatch(method, &params, out).unwrap();
+            })
+            .into_iter()
+            .filter(|(m, _)| m == "Page.screencastFrame")
+            .map(|(_, p)| p)
+            .collect()
+        };
+        let first = frames(&mut engine, "Page.startScreencast", json!({ "format": "jpeg", "quality": 80, "maxWidth": 400, "maxHeight": 400 }));
+        assert_eq!(first.len(), 1);
+        assert!(first[0]["data"].as_str().unwrap().starts_with("/9j/"), "a JPEG");
+        assert_eq!(first[0]["metadata"]["deviceWidth"], 800.0);
+        use base64::Engine as _;
+        let jpeg = base64::engine::general_purpose::STANDARD.decode(first[0]["data"].as_str().unwrap()).unwrap();
+        assert_eq!(crate::images::dimensions(&jpeg), Some((400, 300)), "scaled to fit, not stretched");
+
+        let change = json!({ "expression": "document.getElementById('t').textContent = 'two'" });
+        assert!(frames(&mut engine, "Runtime.evaluate", change.clone()).is_empty(), "the last frame is not acknowledged yet");
+        let session = first[0]["sessionId"].clone();
+        assert_eq!(frames(&mut engine, "Page.screencastFrameAck", json!({ "sessionId": session })).len(), 1, "the change, once acknowledged");
+        let second_session = 2;
+        assert!(frames(&mut engine, "Page.screencastFrameAck", json!({ "sessionId": second_session })).is_empty(), "nothing changed");
+        assert!(frames(&mut engine, "Runtime.evaluate", json!({ "expression": "1 + 1" })).is_empty());
+        // Focus moves the caret, without changing the document.
+        evaluate(&mut engine, "document.body.insertAdjacentHTML('beforeend', '<input id=f>')");
+        let session = frames(&mut engine, "Page.screencastFrameAck", json!({ "sessionId": 2 }))[0]["sessionId"].clone();
+        dispatch(&mut engine, "Page.screencastFrameAck", json!({ "sessionId": session }));
+        assert_eq!(frames(&mut engine, "Runtime.evaluate", json!({ "expression": "document.getElementById('f').focus()" })).len(), 1);
+        dispatch(&mut engine, "Page.stopScreencast", json!({}));
+        assert!(frames(&mut engine, "Runtime.evaluate", change).is_empty());
+    }
+
+    #[test]
+    fn a_short_secret_does_not_corrupt_a_screenshot() {
+        let page = "<body><h1>Hello</h1></body>";
+        use base64::Engine as _;
+        let mut plain = engine_with(page);
+        let data = dispatch(&mut plain, "Page.captureScreenshot", json!({}))["data"].as_str().unwrap().to_string();
+        // A "secret" that occurs in the image's base64 by construction.
+        let mut secrets = Secrets::new();
+        secrets.add("s@http://example.test", data[data.len() / 2..data.len() / 2 + 4].to_string()).unwrap();
+        let mut engine = HtmlEngine::with_shared("t", Arc::new(Mutex::new(CookieJar::new())), Arc::new(secrets));
+        {
+            let mut doc = engine.doc();
+            *doc = parse_html(page);
+            doc.set_url("http://example.test/page");
+        }
+        let shot = dispatch(&mut engine, "Page.captureScreenshot", json!({}))["data"].as_str().unwrap().to_string();
+        assert!(shot == data, "the payload went out untouched");
+        assert!(base64::engine::general_purpose::STANDARD.decode(shot).is_ok());
     }
 
     #[test]

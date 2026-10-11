@@ -5,7 +5,8 @@
 
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
-이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 다음 후보는 §0.4.
+이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
+보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -43,7 +44,7 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 181, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 184, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 40 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
@@ -89,6 +90,8 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `ee1a18c` | 백로그 정리 |
 | `f7b8e6c` | 하위 리소스 병렬 다운로드 (M2.13) |
 | `a38c09f` | `Network.*` 이벤트, 인코딩된 비밀 가리기 (M3.1) |
+| `f113590` | 스크린샷, 내장 한글 글꼴, 레이아웃이 실제 글자 폭 사용 (M1.5) |
+| `bbcdca2` | 이미지 로딩·디코딩, 배경 이미지, 그라디언트 |
 
 ## 1. 엔진 구조
 
@@ -107,6 +110,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `font.rs` | 내장 글꼴(`fonts/NotoSansKR-subset.otf`). 레이아웃의 글자 폭과 그리기의 글리프가 여기서 나온다 |
 | `paint.rs`, `color.rs`, `png.rs` | 스크린샷: 레이아웃을 칠하고 PNG로. 배경 이미지와 그라디언트 해석도 `paint.rs` |
 | `images.rs` | 탭의 이미지 저장소: 가져오기, 크기, 디코딩(PNG·JPEG·GIF·WebP), 기다리기 |
+| `screencast.rs` | `Page.startScreencast`: 바뀐 화면을 JPEG 프레임으로, 응답을 받은 뒤에만 |
 | `ax.rs` | 접근성 트리 |
 | `js.rs` | `ScriptHost`: QuickJS를 전용 스레드(32MB 스택)에 가두고 채널로 부른다. 가상 시계 작업 큐, CDP용 평가 |
 | `bindings.rs` | JS에 주는 원시 함수(`__dom`)와 `PRELUDE` 조립 |
@@ -397,6 +401,20 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       `Secure`·`HttpOnly`를 지킨다. `fetch::Client`가 리다이렉트 응답의 쿠키까지
       저장하고, POST 뒤 302·303은 GET으로 바꾼다. CDP의 쿠키 메서드와
       `document.cookie`가 같은 저장소를 쓴다. 공개 접미사 목록은 없다.
+- [x] M3.6 실시간 보기(`screencast.rs`, `scripts/watch.sh`). agent-browser의 대시보드
+      (`agent-browser dashboard`, `http://localhost:4848`)와 `stream`은 CDP
+      `Page.startScreencast {format: jpeg, quality: 80, maxWidth, maxHeight}`로 프레임을 받고
+      `Page.screencastFrameAck`로 응답하며, 사람의 입력을 `Input.dispatchMouseEvent`와
+      `Input.dispatchKeyEvent`(글자 키는 `keyDown`에 `text`)로 보낸다(Chrome과 캡처해서
+      확인). 합성기가 없으므로 엔진은 명령과 이동이 끝날 때마다 화면을 바꿀 수 있는 것
+      (문서 버전, 이미지 세대, 뷰포트, URL, 포커스)이 바뀌었는지 보고, 바뀌었고 직전
+      프레임에 응답이 왔을 때만 그려서 보낸다. 읽기만 하는 명령에는 비용이 없다.
+      포커스된 입력란에는 커서를 그린다(포커스 테두리는 `:focus` 규칙이 캐스케이드에
+      없어서 그리지 않는다). `Page.captureScreenshot`도 JPEG를 낸다(WebP는 오류).
+      `--cdp`로 연결한 세션도 대시보드에 나온다. 네이티브와 WASIX에서 스트림으로
+      클릭·입력·Backspace가 Chrome과 같은 결과를 낸다. 이 작업에서 고친 것: 출구의 문자열
+      가리기가 스크린샷의 base64까지 훑어서, 짧은 비밀이 우연히 들어 있으면 이미지가
+      깨질 수 있었다. 이진 데이터 필드는 인코딩 전에 가렸으므로 문자열 가리기에서 뺀다.
 - [x] M3.5 `localStorage`·`sessionStorage`는 출처별로 나뉘어 엔진 메모리(`DomState`)에
       있어 페이지를 옮겨도 남는다. 디스크에는 쓰지 않는다. 다만 탭(타깃)마다 따로라
       `localStorage`가 탭 사이에 공유되지 않는다. 쿠키는 공유된다.
@@ -510,6 +528,11 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
   headless shell을 따로 띄우므로 사용자의 Chrome 프로필을 건드리지 않는다. SPA는
   `WAIT_FOR=선택자`를 주고, 애니메이션이 끝나도록 `SETTLE_MS`(기본 2.5초)를 기다린다.
   이걸 안 기다리면 참조 사이트 로그인 상자가 들어오는 도중을 재서 46px 다르게 나온다.
+- **백그라운드로 띄운 스크립트는 SIGINT를 받지 않는다.** 비대화형 셸의 백그라운드
+  작업은 SIGINT를 무시한다. `watch.sh`의 정리 경로를 시험하려면 TERM을 보낸다.
+  터미널에서 Ctrl-C는 포그라운드 그룹에 가므로 그대로 된다.
+- **새로 만든 파일이 읽기 도구에서 안 보일 때가 있다.** 2026-10-10에 `/tmp`의 새 PNG가
+  bash에서는 있는데 읽기 도구는 ENOENT를 냈다. 그때는 PIL로 숫자를 뽑아 확인했다.
 - **배경은 축약 속성과 longhand를 함께 읽는다.** 인라인 `background-image`만 있고
   위치·반복은 시트의 `background` 축약 속성에 있는 경우가 흔하다(참조 사이트). 한쪽만
   읽으면 위치가 가운데로, 반복이 켜진 채로 그려진다.

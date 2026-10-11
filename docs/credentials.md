@@ -78,6 +78,12 @@ what this exists to avoid.
 - **Short values scrub broadly.** Every occurrence is replaced, so a username
   like `kim` also turns `skim` into `s{{secret:user}}`.
 
+- **What a person types into the dashboard is not a secret to the engine.**
+  Typed key by key in `scripts/watch.sh`'s live view, a password travels as
+  key events from agent-browser to the engine, in memory, and the field
+  shows bullets. To have it scrubbed from what the engine sends, give the
+  same value with `--secret` too.
+
 ## Leak paths checked
 
 The M4.3 list, and where each stands.
@@ -91,5 +97,7 @@ The M4.3 list, and where each stands.
 | Engine stderr, including `WHB_TRACE_CDP` | Never written | `verify-login.sh` runs traced and checks stderr |
 | Disk | Never written | The engine has no file writes |
 | Console output from the page | Kept in memory, not sent | Will be scrubbed with everything else once `Runtime.consoleAPICalled` is emitted |
+| Screencast frames | Painted like screenshots | An engine test runs a screencast; frames come from the same painter |
+| Binary payloads | Scrubbed before encoding, then left alone | A screenshot's `data`, a frame's `data` and a base64 response body skip the string scrub, which could match a short secret inside base64 by chance and corrupt the payload. An engine test uses a secret taken from a screenshot's own base64 |
 | Screenshots | A password field paints a bullet per character; other text is scrubbed before it is painted, so a username shows as its placeholder | An engine test paints the secret and a same-length other value and compares the images, and paints a page showing the username against one showing the placeholder |
 | Crash output | Not checked | Values are not part of any panic message the engine raises, but a panic in a dependency is not controlled |

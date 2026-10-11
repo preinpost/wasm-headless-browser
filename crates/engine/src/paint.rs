@@ -13,6 +13,11 @@
 //! gradients, shadows, outlines, rotation and scaling, and font faces other
 //! than the one embedded (bold is smeared, italic is upright).
 //!
+//! The focused text field gets a caret after its text, steady rather than
+//! blinking, so a person watching a screencast can see where typing goes.
+//! There is no focus ring: pages commonly turn it off with `:focus` rules,
+//! which the cascade does not apply.
+//!
 //! A password field paints a bullet per character, never its value. Other
 //! text is painted after the secret scrub, so a username shown on the page
 //! appears as its placeholder in a screenshot, as it does in a snapshot.
@@ -115,6 +120,14 @@ impl Canvas {
 
     pub fn to_png(&self) -> Vec<u8> {
         crate::png::encode(self.width, self.height, &self.rgb)
+    }
+
+    /// Baseline JPEG at `quality`, 1 to 100, as the live stream asks for.
+    pub fn to_jpeg(&self, quality: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+        let _ = image::ImageEncoder::write_image(encoder, &self.rgb, self.width, self.height, image::ExtendedColorType::Rgb8);
+        out
     }
 
     fn blend(&mut self, x: usize, y: usize, color: Rgba, amount: f64) {
@@ -255,9 +268,9 @@ const BUTTON_FACE: Rgba = Rgba::rgb(0xef, 0xef, 0xef);
 const PLACEHOLDER: Rgba = Rgba::rgb(0x75, 0x75, 0x75);
 const ACCENT: Rgba = Rgba::rgb(0x00, 0x75, 0xff);
 
-/// Paints `region` of the document. `scrub` sees every piece of text before
-/// it is drawn.
-pub fn paint(doc: &Document, region: Region, scrub: &dyn Fn(&str) -> String) -> Canvas {
+/// Paints `region` of the document, with a caret in `focus` if it takes
+/// text. `scrub` sees every piece of text before it is drawn.
+pub fn paint(doc: &Document, region: Region, focus: Option<NodeId>, scrub: &dyn Fn(&str) -> String) -> Canvas {
     let styles = style::document_styles(doc);
     let layout = layout::document_layout(doc);
     let width = (region.width * region.scale).round().max(1.0) as u32;
@@ -270,6 +283,7 @@ pub fn paint(doc: &Document, region: Region, scrub: &dyn Fn(&str) -> String) -> 
         region,
         canvas: Canvas::new(width, height, Rgba::WHITE),
         opacity: HashMap::new(),
+        focus,
         scrub,
     };
     let whole = painter.canvas.whole();
@@ -316,6 +330,7 @@ struct Painter<'a> {
     canvas: Canvas,
     /// Effective opacity, the product of every ancestor's, by element.
     opacity: HashMap<NodeId, f64>,
+    focus: Option<NodeId>,
     scrub: &'a dyn Fn(&str) -> String,
 }
 
@@ -680,18 +695,21 @@ impl Painter<'_> {
                     face(self, Rgba::WHITE);
                 }
                 let value = self.doc.current_value(id);
-                if value.is_empty() {
+                let shown = if value.is_empty() {
                     if let Some(placeholder) = self.doc.attr(id, "placeholder").map(str::to_string) {
                         let placeholder = (self.scrub)(&placeholder);
                         self.single_line(&placeholder, style, rect, false, PLACEHOLDER.with_alpha(opacity), clip);
                     }
+                    String::new()
                 } else if kind == "password" {
                     // Never the value: a bullet for each character.
-                    let bullets = "\u{2022}".repeat(value.chars().count());
-                    self.single_line(&bullets, style, rect, false, color, clip);
+                    "\u{2022}".repeat(value.chars().count())
                 } else {
-                    let value = (self.scrub)(&value);
-                    self.single_line(&value, style, rect, false, color, clip);
+                    (self.scrub)(&value)
+                };
+                self.single_line(&shown, style, rect, false, color, clip);
+                if self.focus == Some(id) {
+                    self.caret(&shown, style, rect, color, clip);
                 }
             }
         }
@@ -716,11 +734,17 @@ impl Painter<'_> {
     /// One line in a control, centred vertically, clipped to the content
     /// box, and centred horizontally when `centre` is set or the page asks.
     fn single_line(&mut self, text: &str, style: &ComputedStyle, rect: &Rect, centre: bool, color: Rgba, clip: Area) {
+        let (x, top, height, inner_clip) = self.line_position(text, style, rect, centre, clip);
+        self.line_of_text(text, style, x, top, height, color, inner_clip);
+    }
+
+    /// Where [`single_line`](Self::single_line) sets `text`: its left edge,
+    /// the top and height of its line, and the clip of the content box.
+    fn line_position(&self, text: &str, style: &ComputedStyle, rect: &Rect, centre: bool, clip: Area) -> (f64, f64, f64, Area) {
         let native = native_look(style);
         let inner = self.content_rect(style, rect, native);
         let inner_clip = clip.intersect(self.area(&inner));
-        let size = style.font_size();
-        let (ascent, descent) = font::ascent_descent(size);
+        let (ascent, descent) = font::ascent_descent(style.font_size());
         let width: f64 = text.chars().map(layout::measure_with(style)).sum();
         let offset = match style.get("text-align") {
             _ if centre => (inner.width - width) / 2.0,
@@ -730,8 +754,18 @@ impl Painter<'_> {
         }
         .max(0.0);
         let height = ascent + descent;
-        let top = inner.y + (inner.height - height) / 2.0;
-        self.line_of_text(text, style, inner.x + offset, top, height, color, inner_clip);
+        (inner.x + offset, inner.y + (inner.height - height) / 2.0, height, inner_clip)
+    }
+
+    /// A caret after `text` in a single-line field.
+    fn caret(&mut self, text: &str, style: &ComputedStyle, rect: &Rect, color: Rgba, clip: Area) {
+        let (x, top, height, inner_clip) = self.line_position(text, style, rect, false, clip);
+        let end = x + text.chars().map(layout::measure_with(style)).sum::<f64>();
+        let scale = self.region.scale;
+        let to = |px: f64, py: f64| ((px - self.region.x) * scale, (py - self.region.y) * scale);
+        // A little inside the font's height, as Chrome draws it.
+        let (a, b) = (to(end + 0.5, top + height * 0.1), to(end + 0.5, top + height * 0.9));
+        self.canvas.line(a, b, scale, color, inner_clip.inset(0.0, -2.0 * scale, 0.0, 0.0));
     }
 
     /// A checkbox or radio button as Chrome draws it, 13px, centred in its box.
@@ -1355,7 +1389,7 @@ mod tests {
         let mut doc = parse_html(html);
         doc.set_viewport((200.0, 100.0));
         let region = Region { x: 0.0, y: 0.0, width: 200.0, height: 100.0, scale: 1.0 };
-        let canvas = paint(&doc, region, &|t| t.to_string());
+        let canvas = paint(&doc, region, None, &|t| t.to_string());
         (doc, canvas)
     }
 
@@ -1426,7 +1460,7 @@ mod tests {
         urls.extend(background_urls(&doc));
         store.wait_all(&urls);
         let region = Region { x: 0.0, y: 0.0, width: 200.0, height: 100.0, scale: 1.0 };
-        let canvas = paint(&doc, region, &|t| t.to_string());
+        let canvas = paint(&doc, region, None, &|t| t.to_string());
         (doc, canvas)
     }
 
@@ -1475,6 +1509,20 @@ mod tests {
         assert_eq!((rect("b").width, rect("b").height), (40.0, 40.0));
         assert_eq!(canvas.pixel(55, 5), [255, 0, 0]);
         assert_eq!(canvas.pixel(85, 35), [255, 255, 255]);
+    }
+
+    #[test]
+    fn the_focused_field_has_a_caret_after_its_text() {
+        let mut doc = parse_html("<body style='margin:0'><input id=f value=ab style='position:absolute;left:0;top:0'></body>");
+        doc.set_viewport((200.0, 100.0));
+        let field = doc.find_id(doc.document_id(), "f").unwrap();
+        let region = Region { x: 0.0, y: 0.0, width: 200.0, height: 100.0, scale: 1.0 };
+        let plain = paint(&doc, region, None, &|t| t.to_string());
+        let focused = paint(&doc, region, Some(field), &|t| t.to_string());
+        let changed: Vec<u32> = (0..200u32).filter(|x| (0..100u32).any(|y| plain.pixel(*x, y) != focused.pixel(*x, y))).collect();
+        // Chrome's inset (3px) plus "ab" at 13.33px is about 18px in.
+        assert!(!changed.is_empty() && changed.len() <= 3, "{changed:?}");
+        assert!((15..=22).contains(&changed[0]), "{changed:?}");
     }
 
     #[test]

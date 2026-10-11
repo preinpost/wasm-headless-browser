@@ -150,6 +150,23 @@ security find-generic-password -s gw-password -w \
 agent-browser --cdp http://127.0.0.1:9222 fill @e3 '{{secret:gw}}'
 ```
 
+### Watching it live
+
+`scripts/watch.sh URL` opens a page and starts agent-browser's dashboard at
+`http://localhost:4848`, which shows the engine's page as it changes and
+sends clicks and keys back to it, so a person can watch an agent or drive
+the page themselves:
+
+```bash
+./scripts/watch.sh https://gw.example.com
+security find-generic-password -s gw-password -w \
+  | ./scripts/watch.sh https://gw.example.com --secret gw@https://gw.example.com
+```
+
+The engine implements `Page.startScreencast` for this: after any command
+that changed the page it paints a JPEG frame and sends it once the viewer
+has acknowledged the previous one. The focused field shows a caret.
+
 ## Roadmap
 
 | Milestone | Content |
