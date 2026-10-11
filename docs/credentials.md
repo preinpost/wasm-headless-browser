@@ -72,6 +72,13 @@ what this exists to avoid.
 - **Other encodings are not caught.** Base64 of the value inside a page's
   own request, a hash of it, or a value split across two strings goes out as
   it is. The JSON and form encodings are the ones a login form produces.
+- **A routed request changed by the client goes as the client wrote it.**
+  The client sees a login `POST` with the placeholder in it. Continued as it
+  is, the real value goes to the server; continued with a `postData` of the
+  client's own, that is what goes, and a placeholder in it is not filled in.
+  A client that answers a request itself (`Fetch.fulfillRequest`) can serve
+  a page of its choosing under the secret's origin, which is a hostile
+  client, above.
 - **A client's HAR file is written by the client.** Its `postData` holds the
   placeholder, as `verify-login.sh` checks, but where the file goes is the
   client's business.
@@ -93,6 +100,7 @@ The M4.3 list, and where each stands.
 | CDP results and errors | Scrubbed | `verify-login.sh` reads the field back and gets the placeholder; an engine test throws an error quoting it |
 | CDP events | Scrubbed | Same path as results; covered by the engine tests |
 | `Network.*` events and response bodies | Scrubbed, encoded forms included | `verify-login.sh` records a HAR through the login and checks the POST's `postData` and the HAR file on disk; an engine test uses a password with a quote in it |
+| `Fetch.requestPaused` (`network route`) | Scrubbed: the paused request's `postData` holds the placeholder | It goes out through the same scrub as other events, though it is sent while a command runs; an engine test routes a login `POST` and reads the paused body |
 | Accessibility tree and snapshots | Scrubbed, and a password field never shows its value | `verify-login.sh` keeps every snapshot and checks the transcript |
 | Engine stderr, including `WHB_TRACE_CDP` | Never written | `verify-login.sh` runs traced and checks stderr |
 | Disk | Never written | The engine has no file writes |

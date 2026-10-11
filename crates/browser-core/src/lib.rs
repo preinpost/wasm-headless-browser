@@ -8,6 +8,7 @@
 //! engine later implements the same trait.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 pub mod ids;
 
@@ -36,6 +37,29 @@ pub type BrowserEmit<'a> = dyn FnMut(Option<&str>, &str, Value) + 'a;
 
 /// Emits a protocol event inside one attached session.
 pub type EngineEmit<'a> = dyn FnMut(&str, Value) + 'a;
+
+/// Sends an event inside one session at once, from any thread, even while a
+/// command is still running. Returns `false` when no client is connected to
+/// receive it, so nothing should wait for an answer.
+pub type LiveEmit = Arc<dyn Fn(&str, Value) -> bool + Send + Sync>;
+
+/// Writes a whole message to the connected client. `false` when it could not.
+pub type Sink = Arc<dyn Fn(&Value) -> bool + Send + Sync>;
+
+/// Commands an engine answers outside its command queue.
+///
+/// Commands are otherwise handled one at a time, each to the end, and a page
+/// load is one command. Some answer what that command is waiting for:
+/// `Fetch.continueRequest` releases a request the load paused. Queued behind
+/// the load, it would never run.
+pub trait Concurrent: Send + Sync {
+    /// The answer, or `None` for a command that is not one of these, which
+    /// then goes through [`Engine::dispatch`].
+    fn handle(&self, method: &str, params: &Value) -> Option<Result<Value, CdpError>>;
+
+    /// The client went away. Nothing may wait for it any longer.
+    fn disconnected(&self) {}
+}
 
 /// What a target advertises through `Target.getTargets`.
 #[derive(Debug, Clone)]
@@ -84,6 +108,13 @@ pub trait Engine: Send {
 
     fn dispatch(&mut self, method: &str, params: &Value, out: &mut EngineEmit) -> Result<Value, CdpError>;
 
+    /// Called once when a client attaches, with a way to send events at
+    /// once. An engine with commands to answer outside its queue returns
+    /// them here.
+    fn concurrent(&mut self, _emit: LiveEmit) -> Option<Arc<dyn Concurrent>> {
+        None
+    }
+
     fn close(&mut self) {}
 }
 
@@ -104,6 +135,75 @@ pub struct Browser {
     targets: Vec<Target>,
     sessions: HashMap<String, String>,
     counter: u64,
+    side: Arc<SideDoor>,
+}
+
+/// What answers [`Concurrent`] commands and carries [`LiveEmit`] events.
+/// It has locks of its own: it is used while the [`Browser`] is locked by
+/// the command that is waiting.
+#[derive(Default)]
+pub struct SideDoor {
+    handlers: Mutex<HashMap<String, Arc<dyn Concurrent>>>,
+    /// The connected client: its number, and how to write to it.
+    sink: Mutex<Option<(u64, Sink)>>,
+    connections: Mutex<u64>,
+}
+
+impl SideDoor {
+    /// Starts sending live events to a client. Returns the number to
+    /// [`disconnect`](Self::disconnect) it with. A later client takes over.
+    pub fn connect(&self, sink: Sink) -> u64 {
+        let id = {
+            let mut connections = self.connections.lock().unwrap_or_else(|p| p.into_inner());
+            *connections += 1;
+            *connections
+        };
+        *self.sink.lock().unwrap_or_else(|p| p.into_inner()) = Some((id, sink));
+        id
+    }
+
+    /// The client numbered `id` went away. If it was the one receiving live
+    /// events, whatever waits on it is told.
+    pub fn disconnect(&self, id: u64) {
+        let current = {
+            let mut sink = self.sink.lock().unwrap_or_else(|p| p.into_inner());
+            if sink.as_ref().map(|(i, _)| *i) == Some(id) {
+                *sink = None;
+                true
+            } else {
+                false
+            }
+        };
+        if current {
+            let handlers: Vec<_> = self.handlers().values().cloned().collect();
+            for handler in handlers {
+                handler.disconnected();
+            }
+        }
+    }
+
+    /// The response to `msg`, when it is a command answered here.
+    pub fn handle(&self, msg: &Value) -> Option<Value> {
+        let session = msg.get("sessionId")?.as_str()?;
+        let method = msg.get("method")?.as_str()?;
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        let handler = self.handlers().get(session).cloned()?;
+        let result = handler.handle(method, &params)?;
+        trace(method, &params, &result);
+        Some(response(msg.get("id").cloned()?, Some(session), result))
+    }
+
+    fn send(&self, session: &str, method: &str, params: Value) -> bool {
+        let sink = self.sink.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, s)| Arc::clone(s));
+        match sink {
+            Some(sink) => sink(&json!({ "method": method, "params": params, "sessionId": session })),
+            None => false,
+        }
+    }
+
+    fn handlers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<dyn Concurrent>>> {
+        self.handlers.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 impl Browser {
@@ -122,6 +222,7 @@ impl Browser {
             targets: Vec::new(),
             sessions: HashMap::new(),
             counter,
+            side: Arc::new(SideDoor::default()),
         };
         browser.add_target();
         browser
@@ -133,6 +234,11 @@ impl Browser {
         let engine = (self.factory)(&target_id);
         self.targets.push(Target { engine });
         target_id
+    }
+
+    /// Where commands are answered that must not queue behind a running one.
+    pub fn side_door(&self) -> Arc<SideDoor> {
+        Arc::clone(&self.side)
     }
 
     fn index_of(&self, target_id: &str) -> Option<usize> {
@@ -162,6 +268,13 @@ impl Browser {
         for (method, params) in emitted {
             out(Some(&session_id), &method, params);
         }
+
+        let side = Arc::clone(&self.side);
+        let session = session_id.clone();
+        let live: LiveEmit = Arc::new(move |method: &str, params: Value| side.send(&session, method, params));
+        if let Some(handler) = self.targets[index].engine.concurrent(live) {
+            self.side.handlers().insert(session_id.clone(), handler);
+        }
         session_id
     }
 
@@ -184,26 +297,8 @@ impl Browser {
             None => self.handle_at_browser(&method, &params, out),
         };
 
-        if trace_enabled() {
-            let shown = |v: &Value| v.to_string().chars().take(300).collect::<String>();
-            let logged = redact_typing(&method, &params);
-            match &result {
-                Ok(value) => eprintln!("cdp {method} {} -> {}", shown(&logged), shown(value)),
-                Err(e) => eprintln!("cdp {method} {} -> error {}", shown(&logged), e.message),
-            }
-        }
-
-        let id = id?;
-        Some(match (result, session) {
-            (Ok(value), Some(s)) => json!({ "id": id, "result": value, "sessionId": s }),
-            (Ok(value), None) => json!({ "id": id, "result": value }),
-            (Err(e), Some(s)) => json!({
-                "id": id,
-                "error": { "code": e.code, "message": e.message },
-                "sessionId": s,
-            }),
-            (Err(e), None) => json!({ "id": id, "error": { "code": e.code, "message": e.message } }),
-        })
+        trace(&method, &params, &result);
+        Some(response(id?, session.as_deref(), result))
     }
 
     fn handle_in_session(
@@ -328,6 +423,13 @@ impl Browser {
                     if let Some(index) = self.index_of(target_id) {
                         self.targets[index].engine.close();
                         self.targets.remove(index);
+                        let closed: Vec<String> =
+                            self.sessions.iter().filter(|(_, t)| *t == target_id).map(|(s, _)| s.clone()).collect();
+                        for session in closed {
+                            if let Some(handler) = self.side.handlers().remove(&session) {
+                                handler.disconnected();
+                            }
+                        }
                         self.sessions.retain(|_, t| t != target_id);
                         out(None, "Target.targetDestroyed", json!({ "targetId": target_id }));
                     }
@@ -347,6 +449,29 @@ impl Browser {
             // error. Clients probe optional domains constantly, and an error
             // makes them abort more often than a blank answer does.
             _ => Ok(json!({})),
+        }
+    }
+}
+
+/// A command's response, inside its session if it came in one.
+fn response(id: Value, session: Option<&str>, result: Result<Value, CdpError>) -> Value {
+    let mut response = match result {
+        Ok(value) => json!({ "id": id, "result": value }),
+        Err(e) => json!({ "id": id, "error": { "code": e.code, "message": e.message } }),
+    };
+    if let Some(session) = session {
+        response["sessionId"] = json!(session);
+    }
+    response
+}
+
+fn trace(method: &str, params: &Value, result: &Result<Value, CdpError>) {
+    if trace_enabled() {
+        let shown = |v: &Value| v.to_string().chars().take(300).collect::<String>();
+        let logged = redact_typing(method, params);
+        match result {
+            Ok(value) => eprintln!("cdp {method} {} -> {}", shown(&logged), shown(value)),
+            Err(e) => eprintln!("cdp {method} {} -> error {}", shown(&logged), e.message),
         }
     }
 }
@@ -377,6 +502,88 @@ fn redact_typing(method: &str, params: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine whose `Wait` command waits for `Release`, which only its
+    /// concurrent handler answers, and which says so with a live event.
+    struct Waiting {
+        release: std::sync::mpsc::Receiver<()>,
+        handler: Arc<Release>,
+    }
+
+    struct Release {
+        tx: Mutex<std::sync::mpsc::Sender<()>>,
+        emit: Mutex<Option<LiveEmit>>,
+    }
+
+    impl Concurrent for Release {
+        fn handle(&self, method: &str, _: &Value) -> Option<Result<Value, CdpError>> {
+            (method == "Test.release").then(|| {
+                let _ = self.tx.lock().unwrap().send(());
+                Ok(json!({ "released": true }))
+            })
+        }
+    }
+
+    impl Engine for Waiting {
+        fn info(&self) -> TargetInfo {
+            TargetInfo::new("only")
+        }
+        fn navigate(&mut self, _: &str, _: &mut EngineEmit) -> Result<(), CdpError> {
+            Ok(())
+        }
+        fn dispatch(&mut self, method: &str, _: &Value, _: &mut EngineEmit) -> Result<Value, CdpError> {
+            if method == "Test.wait" {
+                let emit = self.handler.emit.lock().unwrap().clone().unwrap();
+                assert!(emit("Test.waiting", json!({})));
+                self.release.recv().unwrap();
+            }
+            Ok(json!({ "done": method }))
+        }
+        fn concurrent(&mut self, emit: LiveEmit) -> Option<Arc<dyn Concurrent>> {
+            *self.handler.emit.lock().unwrap() = Some(emit);
+            Some(Arc::clone(&self.handler) as Arc<dyn Concurrent>)
+        }
+    }
+
+    #[test]
+    fn the_side_door_answers_what_a_running_command_waits_for() {
+        let browser = Arc::new(Mutex::new(Browser::new(Box::new(|_: &str| {
+            let (tx, release) = std::sync::mpsc::channel();
+            let handler = Arc::new(Release { tx: Mutex::new(tx), emit: Mutex::new(None) });
+            Box::new(Waiting { release, handler }) as Box<dyn Engine>
+        }))));
+        let side = browser.lock().unwrap().side_door();
+        let (sent, live) = std::sync::mpsc::channel::<Value>();
+        let sent = Mutex::new(sent);
+        side.connect(Arc::new(move |message: &Value| sent.lock().unwrap().send(message.clone()).is_ok()));
+
+        let target = browser.lock().unwrap().targets[0].engine.info().target_id;
+        let mut ignore = |_: Option<&str>, _: &str, _: Value| {};
+        let attached = browser
+            .lock()
+            .unwrap()
+            .handle(&json!({ "id": 1, "method": "Target.attachToTarget", "params": { "targetId": target } }), &mut ignore)
+            .unwrap();
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+
+        // Not a side-door command: it queues as usual.
+        assert!(side.handle(&json!({ "id": 2, "method": "Test.wait", "sessionId": session })).is_none());
+        let running = {
+            let (browser, session) = (Arc::clone(&browser), session.clone());
+            std::thread::spawn(move || {
+                let mut ignore = |_: Option<&str>, _: &str, _: Value| {};
+                browser.lock().unwrap().handle(&json!({ "id": 2, "method": "Test.wait", "sessionId": session }), &mut ignore)
+            })
+        };
+        // The live event arrives while the command still holds the browser.
+        let waiting = live.recv().unwrap();
+        assert_eq!(waiting, json!({ "method": "Test.waiting", "params": {}, "sessionId": session }));
+        assert!(browser.try_lock().is_err());
+
+        let released = side.handle(&json!({ "id": 3, "method": "Test.release", "sessionId": session })).unwrap();
+        assert_eq!(released, json!({ "id": 3, "result": { "released": true }, "sessionId": session }));
+        assert_eq!(running.join().unwrap().unwrap()["result"]["done"], "Test.wait");
+    }
 
     #[test]
     fn tracing_never_shows_what_was_typed() {

@@ -94,6 +94,13 @@ pub struct Recording {
     kind: ResourceType,
 }
 
+impl Recording {
+    /// The `requestId` its `Network.*` events carry.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 impl NetLog {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -117,6 +124,10 @@ impl NetLog {
 
     pub fn set_frame(&self, frame_id: &str) {
         self.lock().frame_id = frame_id.to_string();
+    }
+
+    pub fn frame_id(&self) -> String {
+        self.lock().frame_id.clone()
     }
 
     /// The events recorded since the last call, in the order they happened.
@@ -305,7 +316,7 @@ fn response_json(response: &Response) -> Value {
 
 /// Headers as CDP's `Headers` object. Repeated names are joined with a
 /// newline, as Chrome joins them.
-fn header_object<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> Value {
+pub(crate) fn header_object<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> Value {
     let mut object = Map::new();
     for (name, value) in headers {
         match object.get_mut(name) {

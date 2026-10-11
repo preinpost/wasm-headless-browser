@@ -24,6 +24,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use crate::cookies::{self, CookieJar, Source};
+use crate::intercept::{Decision, Interceptor, Outgoing};
 use crate::network::{NetLog, Recording, ResourceType};
 
 const MAX_REDIRECTS: usize = 5;
@@ -83,6 +84,9 @@ pub enum FetchError {
     /// The server answered, but with something we will not show.
     Status(u16, String),
     TooManyRedirects,
+    /// The client failed it through `Fetch.failRequest`, with this `net::`
+    /// error.
+    Intercepted(String),
 }
 
 impl std::fmt::Display for FetchError {
@@ -93,6 +97,7 @@ impl std::fmt::Display for FetchError {
             FetchError::Io(msg) => write!(f, "{msg}"),
             FetchError::Status(code, reason) => write!(f, "HTTP {code} {reason}"),
             FetchError::TooManyRedirects => write!(f, "too many redirects"),
+            FetchError::Intercepted(error) => write!(f, "{error}"),
         }
     }
 }
@@ -252,6 +257,8 @@ pub struct Client {
     slots: Arc<Slots>,
     /// What `Network.*` reports. Every clone records into the same log.
     log: Arc<NetLog>,
+    /// Where requests a client asked to see wait for its answer.
+    interceptor: Arc<Interceptor>,
 }
 
 /// Idle connections kept per host, as browsers bound theirs.
@@ -336,6 +343,7 @@ impl Client {
             preloads: Arc::new(Mutex::new(HashMap::new())),
             slots: Arc::new(Slots::default()),
             log: Arc::new(NetLog::default()),
+            interceptor: Arc::new(Interceptor::default()),
         }
     }
 
@@ -345,6 +353,10 @@ impl Client {
 
     pub fn log(&self) -> &Arc<NetLog> {
         &self.log
+    }
+
+    pub fn interceptor(&self) -> &Arc<Interceptor> {
+        &self.interceptor
     }
 
     pub fn get(&self, url: &str) -> Result<Response, FetchError> {
@@ -442,15 +454,55 @@ impl Client {
     }
 
     /// Sends `request`, and again wherever it is redirected, storing the
-    /// cookies every response sets.
+    /// cookies every response sets. Each hop a client asked to see is
+    /// [paused](Interceptor::pause) first, and may be changed, answered or
+    /// failed by the client instead.
     fn follow_redirects(&self, request: Request, recording: Option<&Recording>) -> Result<Response, FetchError> {
+        let kind = request.kind;
+        let frame_id = self.log.frame_id();
         let mut method = request.method.to_ascii_uppercase();
         let mut headers = request.headers;
         let mut body = request.body;
         let mut current = Url::parse(&request.url)?;
-        for _ in 0..=MAX_REDIRECTS {
-            let cookie = self.jar().header(&current, cookies::now());
-            let response = self.send_once(&current, &method, &headers, cookie.as_deref(), &body)?;
+        let mut job = None;
+        for hop in 0..=MAX_REDIRECTS {
+            let shown = current.to_string_with_path();
+            let outgoing = Outgoing {
+                method: &method,
+                url: &shown,
+                headers: &outgoing_headers(&headers),
+                body: &body,
+                kind,
+                network_id: recording.map(Recording::id),
+                frame_id: &frame_id,
+                hop,
+            };
+            let response = match self.interceptor.pause(&outgoing, &mut job) {
+                Decision::Continue(changes) => {
+                    if let Some(url) = changes.url {
+                        current = Url::parse(&url)?;
+                    }
+                    if let Some(changed) = changes.method {
+                        method = changed.to_ascii_uppercase();
+                    }
+                    if let Some(changed) = changes.headers {
+                        headers = changed;
+                    }
+                    if let Some(changed) = changes.body {
+                        body = changed;
+                    }
+                    let cookie = self.jar().header(&current, cookies::now());
+                    let mut response = self.send_once(&current, &method, &headers, cookie.as_deref(), &body)?;
+                    // A changed URL is not the page's to see, as in Chrome.
+                    response.url = shown;
+                    response
+                }
+                Decision::Fulfill(mut response) => {
+                    response.url = shown;
+                    response
+                }
+                Decision::Fail(error) => return Err(FetchError::Intercepted(error)),
+            };
             {
                 let mut jar = self.jar();
                 let now = cookies::now();
@@ -982,6 +1034,8 @@ fn percent_decode(input: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use serde_json::Value;
     use std::net::TcpListener;
 
     /// Serves one canned response and returns the URL to fetch it from.
@@ -1115,6 +1169,84 @@ mod tests {
         let again = requests.recv().unwrap();
         assert!(again.starts_with("POST /again HTTP/1.1\r\n"), "{again}");
         assert!(again.ends_with("\r\n\r\ndata"), "{again}");
+    }
+
+    /// Starts interception on `client` for every request and answers each
+    /// pause from another thread with what `answer` makes of it, as a CDP
+    /// client would. Returns the pauses seen.
+    fn intercept_all(client: &Client, answer: fn(&Value) -> (&'static str, Value)) -> Arc<Mutex<Vec<Value>>> {
+        use browser_core::Concurrent;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (interceptor, log) = (Arc::downgrade(client.interceptor()), Arc::clone(&seen));
+        client.interceptor().set_emit(Arc::new(move |_: &str, params: Value| {
+            log.lock().unwrap().push(params.clone());
+            let interceptor = interceptor.clone();
+            std::thread::spawn(move || {
+                let (method, mut reply) = answer(&params);
+                reply["requestId"] = params["requestId"].clone();
+                interceptor.upgrade().unwrap().handle(method, &reply).unwrap().unwrap();
+            });
+            true
+        }));
+        client.interceptor().handle("Fetch.enable", &serde_json::json!({})).unwrap().unwrap();
+        seen
+    }
+
+    #[test]
+    fn each_redirect_hop_is_paused_and_a_continue_can_change_the_request() {
+        let (base, requests) = serve_script(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_string(),
+        ]);
+        let client = client();
+        let seen = intercept_all(&client, |paused| {
+            let url = paused["request"]["url"].as_str().unwrap();
+            if url.ends_with("/a") {
+                ("Fetch.continueRequest", serde_json::json!({}))
+            } else {
+                let body = base64::engine::general_purpose::STANDARD.encode(b"changed");
+                let headers = serde_json::json!([{ "name": "X-Route", "value": "1" }]);
+                let url = url.replace("/b", "/c");
+                ("Fetch.continueRequest", serde_json::json!({ "url": url, "method": "PUT", "postData": body, "headers": headers }))
+            }
+        });
+        let response = client.get(&format!("{base}/a")).expect("get");
+        assert_eq!(response.body, b"ok");
+        // The page sees the URL it was sent to, not the one the client chose.
+        assert_eq!(response.url, format!("{base}/b"));
+        let _ = requests.recv().unwrap();
+        let changed = requests.recv().unwrap();
+        assert!(changed.starts_with("PUT /c HTTP/1.1\r\n"), "{changed}");
+        assert!(changed.contains("X-Route: 1\r\n") && changed.ends_with("\r\n\r\nchanged"), "{changed}");
+        let ids: Vec<Value> = seen.lock().unwrap().iter().map(|p| p["requestId"].clone()).collect();
+        assert_eq!(ids, ["interception-job-1.0", "interception-job-1.1"]);
+    }
+
+    #[test]
+    fn a_fulfilled_request_never_reaches_the_server_and_sets_its_cookies() {
+        let client = client();
+        intercept_all(&client, |_| {
+            let body = base64::engine::general_purpose::STANDARD.encode(b"mock");
+            let headers = serde_json::json!([
+                { "name": "Set-Cookie", "value": "routed=1" },
+                { "name": "Content-Type", "value": "text/plain" },
+            ]);
+            ("Fetch.fulfillRequest", serde_json::json!({ "responseCode": 201, "responseHeaders": headers, "body": body }))
+        });
+        // Nothing listens there: only a fulfilled request can succeed.
+        let response = client.get("http://127.0.0.1:9/x").expect("fulfilled");
+        assert_eq!((response.status, response.reason.as_str(), response.body.as_slice()), (201, "Created", &b"mock"[..]));
+        assert_eq!(response.header("content-type"), Some("text/plain"));
+        let jar = client.cookies().lock().unwrap().header(&Url::parse("http://127.0.0.1:9/").unwrap(), cookies::now());
+        assert_eq!(jar.as_deref(), Some("routed=1"));
+    }
+
+    #[test]
+    fn a_failed_request_reports_the_clients_net_error() {
+        let client = client();
+        intercept_all(&client, |_| ("Fetch.failRequest", serde_json::json!({ "errorReason": "BlockedByClient" })));
+        let error = client.get("http://127.0.0.1:9/x").unwrap_err();
+        assert_eq!(error.to_string(), "net::ERR_BLOCKED_BY_CLIENT");
     }
 
     #[test]

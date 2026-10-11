@@ -1,0 +1,15 @@
+<!doctype html>
+<!-- For verify-m1.sh's `network route` checks: an image, a stylesheet and
+     a fetch() for a client to fail, pass through or answer itself. -->
+<title>Route Fixture</title>
+<link rel="stylesheet" href="style.css">
+<p id="out">pending</p>
+<p id="img">image pending</p>
+<img src="pic.png" alt="" onload="document.getElementById('img').textContent = 'img loaded'"
+     onerror="document.getElementById('img').textContent = 'img error'">
+<script>
+  fetch('data.json')
+    .then((r) => r.text().then((t) => `${r.status} ${r.headers.get('content-type')} ${t}`))
+    .then((s) => { document.getElementById('out').textContent = s; },
+          (e) => { document.getElementById('out').textContent = `failed: ${e.message}`; });
+</script>

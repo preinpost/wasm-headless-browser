@@ -119,7 +119,8 @@ class Response {
     return this.status >= 200 && this.status < 300;
   }
   clone() {
-    const copy = new Response(bodies.get(this).text, this);
+    const copy = new Response(null, this);
+    bodies.set(copy, { text: bodies.get(this).text, used: false });
     copy.url = this.url;
     copy.redirected = this.redirected;
     copy.type = this.type;
@@ -197,7 +198,10 @@ function fetch(input, init) {
         reject(new TypeError(`Failed to fetch: ${r.statusText}`));
         return;
       }
-      const response = new Response(r.body, { status: r.status, statusText: r.statusText, headers: r.headers });
+      // The body is set apart from the constructor, which would give a
+      // response the server sent without a content type `text/plain`.
+      const response = new Response(null, { status: r.status, statusText: r.statusText, headers: r.headers });
+      bodies.set(response, { text: r.body, used: false });
       response.url = r.url;
       response.redirected = r.url !== request.url;
       response.type = 'basic';

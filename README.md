@@ -62,8 +62,12 @@ screenshots follow.
 
 Screenshots paint box shadows and SVG, inline and as images (resvg).
 
-Not there yet: sticky positioning, text inside SVG, and request
-interception (`network route`). The WASIX module is 6.2 MB, the font
+Requests can be intercepted (`network route`, CDP's `Fetch` domain): failed,
+answered by the client, or passed on changed, while the page waits for the
+answer.
+
+Not there yet: sticky positioning, text inside SVG, and pausing at the
+response stage. The WASIX module is 6.3 MB, the font
 1.15 MB and the SVG renderer 0.8 MB of it.
 
 ## Why the shape is what it is
@@ -189,7 +193,7 @@ has acknowledged the previous one. The focused field shows a caret.
 | M0 | Protocol plumbing and the engine seam. **Done** |
 | M1 | Real engine: parsing, DOM, fetching over HTTP(S), CSS cascade, layout, screenshots with images. **Done** |
 | M2 | JavaScript: QuickJS (patched, see [`vendor/README.md`](vendor/README.md)), a DOM binding, an event loop, `fetch` and XHR, input, ES modules. **Done** |
-| M3 | Network: cookies and `Network.*` events are **done**; request interception is not |
+| M3 | Network: cookies, `Network.*` events and request interception (`Fetch.*`). **Done** |
 | M4 | Credentials held in memory only, typed by placeholder, scrubbed from CDP. **Done** |
 
 The working log, with what was measured and what is left, is

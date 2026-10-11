@@ -13,5 +13,5 @@ pub mod sha1;
 pub mod ws;
 
 pub use http::{Request, Response};
-pub use server::{serve, Connection, Handler};
+pub use server::{serve, Connection, Handler, Sender};
 pub use ws::{opcode, Frame};

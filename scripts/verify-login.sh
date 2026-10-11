@@ -149,10 +149,14 @@ check "a secret fills a script-owned input" "Done" "$(ab fill "@$(ref_of textbox
 check "the tree shows the placeholder, not the user" 'textbox "User".*{{secret:fixture_user}}' "$(ab snapshot -i)"
 ab fill "@$(ref_of textbox Password "$snap")" '{{secret:fixture_pw}}' >/dev/null
 check "reading the field back gives the placeholder" "{{secret:fixture_pw}}" "$(ab eval "document.getElementById('password').value")"
+# The POST is routed and passed on, so the login waits for the client's
+# answer to a request carrying the secrets, as `network route` makes it.
+check "the login POST can be routed" "Done" "$(ab network route "**/api/login")"
 check "Enter submits" "Done" "$(ab press Enter)"
 check "the signed-in page renders, its name scrubbed" 'heading "Welcome, {{secret:fixture_user}}"' "$(ab snapshot)"
 check "the url moved with pushState" "$SITE/home" "$(ab get url)"
 check "the session cookie is in the jar" "sid=" "$(ab cookies get)"
+ab network unroute >/dev/null
 check_absent "page script cannot see the HttpOnly cookie" "sid=" "$(ab eval 'document.cookie')"
 
 shot_dir="$HAR_DIR/shot.png"
@@ -188,6 +192,7 @@ check_absent "the client never saw the password, HAR included" "$PASSWORD" "$TRA
 check_absent "the client never saw the user name" "Welcome, $USER_NAME" "$TRANSCRIPT"
 check_absent "the engine's stderr, traced, does not carry it" "$PASSWORD" "$(cat "$SERVER_ERR")"
 check "the trace did run" "Input.insertText" "$(cat "$SERVER_ERR")"
+check "the routed POST paused and was passed on" "Fetch.continueRequest" "$(cat "$SERVER_ERR")"
 
 echo
 if ((fail > 0)); then

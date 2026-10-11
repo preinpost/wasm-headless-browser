@@ -145,6 +145,27 @@ check "a script cookie reaches the jar" "whb_lang=ko" "$(agent-browser --cdp "$B
 agent-browser --cdp "$BASE" cookies clear >/dev/null 2>&1 || true
 check_absent "clear empties the jar" "whb_" "$(agent-browser --cdp "$BASE" cookies get 2>&1 || true)"
 
+echo "request interception (network route)"
+ROUTE="http://127.0.0.1:${SITE_PORT}/route/"
+ab() { agent-browser --cdp "$BASE" "$@" 2>&1 || true; }
+ab network route "**/route/pic.png" --abort >/dev/null
+ab network route "**/route/data.json" --body '{"mock": true}' >/dev/null
+check "a page loads while its requests wait for the client" "Route Fixture" "$(ab open "$ROUTE")"
+check "a fetch gets the client's body, with no content type as in Chrome" '200 null {"mock": true}' "$(ab get text '#out')"
+check "an aborted image fails" "img error" "$(ab get text '#img')"
+check "the abort is a failed request" "pic.png (Image)\$" "$(ab network requests --filter pic.png)"
+ab network unroute "**/route/data.json" >/dev/null
+ab reload >/dev/null
+check "unroute lets the fetch through again" '200 application/json {"real":true}' "$(ab get text '#out')"
+ab network route "**/route/style.css" >/dev/null
+ab reload >/dev/null
+check "a route with no action passes the request on" "rgb(255, 0, 0)\|red" \
+  "$(ab eval "getComputedStyle(document.getElementById('out')).color")"
+ab network unroute >/dev/null
+ab reload >/dev/null
+check "unroute with no url removes every route" "img loaded" "$(ab get text '#img')"
+ab open "http://127.0.0.1:${SITE_PORT}/" >/dev/null
+
 echo "what must stay out"
 check_absent "hidden subtrees are excluded" "you should not see this" "$snap"
 

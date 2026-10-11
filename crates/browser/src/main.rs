@@ -6,9 +6,9 @@
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
-use cdp_wire::{serve, Connection, Handler, Request, Response};
+use cdp_wire::{serve, Connection, Handler, Request, Response, Sender};
 use browser_core::{Browser, EngineFactory};
 use engine::secrets::Secrets;
 use engine::HtmlEngine;
@@ -18,16 +18,34 @@ use serde_json::{json, Value};
 #[derive(Clone)]
 struct CdpHandler {
     browser: Arc<Mutex<Browser>>,
+    /// What discovery reports, kept apart from the browser so that
+    /// `/json/version` answers while a command holds the browser, waiting
+    /// on a request a client paused.
+    about: Arc<About>,
+}
+
+struct About {
+    browser_id: String,
+    product: String,
+    user_agent: String,
 }
 
 impl CdpHandler {
+    fn new(browser: Browser) -> Self {
+        let about = About {
+            browser_id: browser.browser_id.clone(),
+            product: browser.product.clone(),
+            user_agent: browser.user_agent.clone(),
+        };
+        CdpHandler { browser: Arc::new(Mutex::new(browser)), about: Arc::new(about) }
+    }
+
     fn ws_url(&self, req: &Request) -> String {
         let host = req
             .header("host")
             .map(str::to_string)
             .unwrap_or_else(|| "127.0.0.1:9222".to_string());
-        let browser = self.browser.lock().unwrap();
-        format!("ws://{host}/devtools/browser/{}", browser.browser_id)
+        format!("ws://{host}/devtools/browser/{}", self.about.browser_id)
     }
 }
 
@@ -36,7 +54,7 @@ impl Handler for CdpHandler {
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/json/version") | ("GET", "/json/version/") => {
                 let ws_url = self.ws_url(req);
-                let browser = self.browser.lock().unwrap();
+                let browser = &self.about;
                 Response::json(
                     serde_json::to_vec(&json!({
                         "Browser": browser.product,
@@ -52,7 +70,7 @@ impl Handler for CdpHandler {
 
             ("GET", "/json/list") | ("GET", "/json/list/") | ("GET", "/json") => {
                 let ws_url = self.ws_url(req);
-                let browser = self.browser.lock().unwrap();
+                let browser = &self.about;
                 Response::json(
                     serde_json::to_vec(&json!([{
                         "id": browser.browser_id,
@@ -89,11 +107,29 @@ impl Handler for CdpHandler {
         }
     }
 
+    /// Reads on this thread and handles commands on another, in order, one
+    /// at a time. A command that answers what a running one waits for, such
+    /// as `Fetch.continueRequest` for a request a page load paused, is
+    /// answered here at once, through the browser's side door, which does
+    /// not need the browser lock that command holds.
     fn websocket(&self, conn: &mut Connection, _path: &str) -> io::Result<()> {
-        loop {
-            let text = match conn.recv_text()? {
-                Some(t) => t,
-                None => return Ok(()),
+        let side = self.browser.lock().unwrap().side_door();
+        let sender = conn.sender();
+        let live = sender.clone();
+        let connection = side.connect(Arc::new(move |message: &Value| live.send_json(message).is_ok()));
+
+        let (queue, commands) = mpsc::channel::<Value>();
+        let browser = Arc::clone(&self.browser);
+        let worker_sender = sender.clone();
+        let worker = std::thread::Builder::new()
+            .name("cdp-commands".into())
+            .spawn(move || handle_commands(&browser, commands, &worker_sender))?;
+
+        let read = loop {
+            let text = match conn.recv_text() {
+                Ok(Some(t)) => t,
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
             };
 
             let msg: Value = match serde_json::from_str(&text) {
@@ -104,27 +140,52 @@ impl Handler for CdpHandler {
                 }
             };
 
-            // Events are collected first so the browser lock is not held while
-            // writing to the socket.
-            let mut events: Vec<(Option<String>, String, Value)> = Vec::new();
-            let response = {
-                let mut browser = self.browser.lock().unwrap();
-                let mut emit = |session: Option<&str>, method: &str, params: Value| {
-                    events.push((session.map(str::to_string), method.to_string(), params));
-                };
-                browser.handle(&msg, &mut emit)
-            };
-
-            for (session, method, params) in events {
-                let mut event = json!({ "method": method, "params": params });
-                if let Some(session) = session {
-                    event["sessionId"] = json!(session);
+            if let Some(response) = side.handle(&msg) {
+                if let Err(e) = sender.send_json(&response) {
+                    break Err(e);
                 }
-                conn.send_json(&event)?;
+            } else if queue.send(msg).is_err() {
+                // The worker stopped: the socket failed under it.
+                break Ok(());
             }
+        };
 
-            if let Some(response) = response {
-                conn.send_json(&response)?;
+        // Release whatever waits on this client before waiting for the
+        // worker, which may be what is waiting.
+        side.disconnect(connection);
+        drop(queue);
+        let _ = worker.join();
+        read
+    }
+}
+
+/// Handles the commands of one connection in the order they came.
+fn handle_commands(browser: &Mutex<Browser>, commands: mpsc::Receiver<Value>, sender: &Sender) {
+    for msg in commands {
+        // Events are collected first so the browser lock is not held while
+        // writing to the socket.
+        let mut events: Vec<(Option<String>, String, Value)> = Vec::new();
+        let response = {
+            let mut browser = browser.lock().unwrap_or_else(|p| p.into_inner());
+            let mut emit = |session: Option<&str>, method: &str, params: Value| {
+                events.push((session.map(str::to_string), method.to_string(), params));
+            };
+            browser.handle(&msg, &mut emit)
+        };
+
+        for (session, method, params) in events {
+            let mut event = json!({ "method": method, "params": params });
+            if let Some(session) = session {
+                event["sessionId"] = json!(session);
+            }
+            if sender.send_json(&event).is_err() {
+                return;
+            }
+        }
+
+        if let Some(response) = response {
+            if sender.send_json(&response).is_err() {
+                return;
             }
         }
     }
@@ -247,11 +308,8 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind(&addr)?;
     let local: SocketAddr = listener.local_addr()?;
 
-    let handler = CdpHandler { browser: Arc::new(Mutex::new(Browser::new(engine.factory(secrets)))) };
-    let ws_url = {
-        let browser = handler.browser.lock().unwrap();
-        format!("ws://{local}/devtools/browser/{}", browser.browser_id)
-    };
+    let handler = CdpHandler::new(Browser::new(engine.factory(secrets)));
+    let ws_url = format!("ws://{local}/devtools/browser/{}", handler.about.browser_id);
 
     println!("wasm-headless-browser ({})", engine.label());
     println!("  discovery : http://{local}/json/version");

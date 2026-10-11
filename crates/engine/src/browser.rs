@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use browser_core::{ids, CdpError, Engine, EngineEmit, TargetInfo};
+use browser_core::{ids, CdpError, Concurrent, Engine, EngineEmit, LiveEmit, TargetInfo};
 use serde_json::{json, Value};
 
 use crate::cookies::{self, Cookie, CookieJar};
@@ -1329,6 +1329,24 @@ impl Engine for HtmlEngine {
         self.emit_context(&mut scrubbed);
     }
 
+    /// The `Fetch` domain, which answers requests paused in the middle of
+    /// a command (intercept.rs). `Fetch.requestPaused` carries a request's
+    /// body, a login's password included, so it is scrubbed like every other
+    /// event.
+    fn concurrent(&mut self, emit: LiveEmit) -> Option<Arc<dyn Concurrent>> {
+        let secrets = Arc::clone(&self.secrets);
+        let interceptor = Arc::clone(self.client.interceptor());
+        interceptor.set_emit(Arc::new(move |method: &str, mut params: Value| {
+            scrub_outgoing(&secrets, method, &mut params);
+            emit(method, params)
+        }));
+        Some(interceptor)
+    }
+
+    fn close(&mut self) {
+        self.client.interceptor().disable();
+    }
+
     fn dispatch(&mut self, method: &str, params: &Value, out: &mut EngineEmit) -> Result<Value, CdpError> {
         let secrets = Arc::clone(&self.secrets);
         let mut scrubbed = |method: &str, mut params: Value| {
@@ -2229,6 +2247,108 @@ mod tests {
         let mut sink = |_: &str, _: Value| {};
         let missing = engine.dispatch("Network.getResponseBody", &json!({ "requestId": "nope" }), &mut sink);
         assert!(missing.is_err());
+    }
+
+    /// Attaches a client that answers every `Fetch.requestPaused` from its
+    /// own thread, as agent-browser's daemon does: the image is failed, the
+    /// data mocked, anything else continued. Returns what it was shown.
+    fn route_like_agent_browser(engine: &mut HtmlEngine) -> Arc<Mutex<Vec<Value>>> {
+        use base64::Engine as _;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let door: Arc<Mutex<Option<Arc<dyn Concurrent>>>> = Arc::new(Mutex::new(None));
+        let (log, answering) = (Arc::clone(&seen), Arc::clone(&door));
+        let handler = engine
+            .concurrent(Arc::new(move |method: &str, params: Value| {
+                assert_eq!(method, "Fetch.requestPaused");
+                log.lock().unwrap().push(params.clone());
+                let door = Arc::clone(&answering);
+                std::thread::spawn(move || {
+                    let url = params["request"]["url"].as_str().unwrap_or("");
+                    let id = params["requestId"].clone();
+                    let (method, reply) = if url.ends_with("/pic.png") {
+                        ("Fetch.failRequest", json!({ "requestId": id, "errorReason": "Failed" }))
+                    } else if url.ends_with("/data.json") {
+                        let body = base64::engine::general_purpose::STANDARD.encode(br#"{"mock":true}"#);
+                        ("Fetch.fulfillRequest", json!({ "requestId": id, "responseCode": 200, "responseHeaders": [], "body": body }))
+                    } else {
+                        ("Fetch.continueRequest", json!({ "requestId": id }))
+                    };
+                    let handler = door.lock().unwrap().clone().unwrap();
+                    handler.handle(method, &reply).unwrap().unwrap();
+                });
+                true
+            }))
+            .expect("the html engine intercepts");
+        *door.lock().unwrap() = Some(Arc::clone(&handler));
+        let patterns = json!({ "patterns": [{ "urlPattern": "*/pic.png" }, { "urlPattern": "*/api/*" }] });
+        handler.handle("Fetch.enable", &patterns).unwrap().unwrap();
+        seen
+    }
+
+    #[test]
+    fn routed_requests_are_failed_mocked_or_continued_while_the_page_loads() {
+        let base = crate::test_server::serve_together(
+            vec![
+                (
+                    "/",
+                    "text/html",
+                    "<input id=p>
+                     <img src=pic.png onload=\"log.push('img loaded')\" onerror=\"log.push('img error')\">
+                     <script>
+                       window.log = [];
+                       fetch('api/data.json').then(r => r.text().then(t => log.push(r.status + ' ' + r.headers.get('content-type') + ' ' + t)));
+                       window.login = () => fetch('api/login', { method: 'POST', body: 'pw=' + document.getElementById('p').value }).then(r => r.text());
+                     </script>"
+                        .into(),
+                ),
+                ("/pic.png", "image/png", b"not reached".to_vec()),
+                ("/api/data.json", "application/json", br#"{"real":true}"#.to_vec()),
+                ("/api/login", "text/plain", b"welcome".to_vec()),
+            ],
+            vec![],
+        );
+        let mut secrets = Secrets::new();
+        secrets.add(&format!("pw@{base}"), "hunter2".into()).unwrap();
+        let mut engine = HtmlEngine::with_shared("t", Arc::new(Mutex::new(CookieJar::new())), Arc::new(secrets));
+        let seen = route_like_agent_browser(&mut engine);
+        dispatch(&mut engine, "Network.enable", json!({}));
+
+        // The load pauses on its own thread's requests, and goes on when
+        // the client answers from another.
+        let events = events_of(&mut engine, |e, out| e.navigate(&format!("{base}/"), out).unwrap());
+        let log = evaluate(&mut engine, "log.join(' | ')")["result"]["value"].clone();
+        assert_eq!(log, r#"200 null {"mock":true} | img error"#);
+
+        let paused = seen.lock().unwrap().clone();
+        let kinds: Vec<String> =
+            paused.iter().map(|p| format!("{} {}", p["resourceType"].as_str().unwrap(), p["request"]["url"])).collect();
+        assert_eq!(kinds.len(), 2, "{kinds:?}");
+        assert!(kinds.contains(&format!("Image \"{base}/pic.png\"")), "{kinds:?}");
+        // A fetch() is XHR here, as Chrome reports it to the Fetch domain.
+        assert!(kinds.contains(&format!("XHR \"{base}/api/data.json\"")), "{kinds:?}");
+        assert!(paused.iter().all(|p| p["frameId"] == json!(engine.frame_id)));
+
+        let network = network_only(&events);
+        let image = paused.iter().find(|p| p["resourceType"] == "Image").unwrap();
+        let failed = network.iter().find(|(m, p)| *m == "Network.loadingFailed" && p["requestId"] == image["networkId"]);
+        assert_eq!(failed.unwrap().1["errorText"], "net::ERR_FAILED");
+
+        // A POST shows its body to the client, the password as a placeholder.
+        evaluate(&mut engine, "document.getElementById('p').focus()");
+        dispatch(&mut engine, "Input.insertText", json!({ "text": "{{secret:pw}}" }));
+        let answer = dispatch(&mut engine, "Runtime.evaluate", json!({ "expression": "login()", "awaitPromise": true }));
+        assert_eq!(answer["result"]["value"], "welcome");
+        let paused = seen.lock().unwrap().clone();
+        let login = paused.iter().find(|p| p["request"]["method"] == "POST").expect("the login was paused");
+        assert_eq!(login["request"]["postData"], "pw={{secret:pw}}");
+        assert!(!login.to_string().contains("hunter2"));
+
+        // Disabled, nothing pauses.
+        engine.client.interceptor().handle("Fetch.disable", &json!({})).unwrap().unwrap();
+        let before = seen.lock().unwrap().len();
+        engine.load(&format!("{base}/"));
+        assert_eq!(evaluate(&mut engine, "log.join(' | ')")["result"]["value"], r#"200 application/json {"real":true} | img error"#);
+        assert_eq!(seen.lock().unwrap().len(), before);
     }
 
     #[test]

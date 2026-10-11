@@ -7,7 +7,8 @@
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
 이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
 보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. EUC-KR 등 모든 인코딩(M1.9). `innerText`가 보이는 글자다(M2.16). 같은 문서의 뒤로·앞으로가 `popstate`다(M2.12). 접근성 트리가 Chrome 스냅샷과 맞는다(M1.2b).
-스크린샷에 그림자와 SVG가 나온다(M1.5b). 다음 후보는 §0.4.
+스크린샷에 그림자와 SVG가 나온다(M1.5b). `network route`로 요청을 가로챈다(M3.3).
+다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -45,10 +46,10 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 208, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 218, browser-core 2, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
-| `./scripts/verify-m1.sh` | 43 |
-| `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
+| `./scripts/verify-m1.sh` | 50 |
+| `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 35 |
 | `WAIT_FOR='<첫 입력란 선택자>' ./scripts/compare-layout.sh <참조 사이트 URL>` | Chrome과 비교. 13개 중 8개가 2px 안, 평균 1.4px |
 | `WHB_PROBE_URL=<참조 사이트 URL> cargo test --release -p engine probe_a_url -- --ignored --nocapture` | 오류 없이 로그인 화면까지 |
 
@@ -67,31 +68,44 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
   그리는데 우리는 상자 자리가 어긋나고 제목이 안 보인다. 제목은 배치되지만(y=166, 60px) 계산
   색이 `#16171d`로 어두운 배경과 같다. Chrome에서는 흰색이다. VitePress의 다크 모드
   캐스케이드(`.dark` 클래스와 CSS 변수)가 다르게 풀리는 것으로 보이며 확인하지 않았다.
-- **요청 가로채기 (M3.3).** agent-browser `network route`. `Fetch.requestPaused`는
-  엔진이 요청 도중 클라이언트의 답을 기다려야 해서 구조가 바뀐다(§4.4).
+- **응답 단계 가로채기.** `Fetch.enable`의 `requestStage: "Response"`, `continueResponse`,
+  `getResponseBody`는 거절한다. agent-browser는 쓰지 않는다. HTTP 인증(`authRequired`)도 없다.
 
 ### 0.5 이번 세션의 커밋 (오래된 것부터)
 
 | 커밋 | 내용 |
 |---|---|
-| `7794b8e` | BL-010: M2 엔진 연결 검증. `textContent` setter, sloppy 평가, 락파일 정리 |
-| `9ecfa0e` | HTTPS: rustls + ring을 게스트 안에서 (M1.11) |
-| `84e6ff8` | 쿠키 저장소, POST, 히스토리, 문서마다 새 JS 컨텍스트 (M3.2) |
-| `c30f103` | DOM 프렐류드 재작성(`prelude/*.js`), 외부 스크립트, 이벤트 루프, fetch/XHR (M2.6·M2.7·M2.9) |
-| `77494d7` | QuickJS 패치(`Function.caller`), 스택 32MB. 참조 사이트 로그인 화면이 뜸 (M2.10) |
-| `4862ea2` | 원격 객체, 글자·키 입력, keep-alive 연결 풀, `WHB_TRACE_CDP` (M2.4·M2.8·M2.14) |
-| `10820d2` | 추적 로그에서 입력 글자 가리기 |
-| `f2771cc` | 인라인 스타일로 숨긴 요소를 접근성 트리에서 제외 (M1.4a) |
-| `8f1ad7f` | 선택자 엔진 재작성 (M1.10) |
-| `bffaf73` | CSS 파서와 캐스케이드 계산 (M1.4b) |
-| `0cf68cb` | 캐스케이드를 페이지에 연결: 시트 수집, 캐시, 접근성 트리, `getComputedStyle` |
-| `8abfeaa` | 레이아웃(taffy), 히트 테스트, 마우스 입력 (M1.4·M2.5) |
-| `d9c4296` | 자격증명: stdin, 자리표시자, CDP 출력 가리기 (M4) |
-| `ee1a18c` | 백로그 정리 |
-| `f7b8e6c` | 하위 리소스 병렬 다운로드 (M2.13) |
-| `a38c09f` | `Network.*` 이벤트, 인코딩된 비밀 가리기 (M3.1) |
-| `f113590` | 스크린샷, 내장 한글 글꼴, 레이아웃이 실제 글자 폭 사용 (M1.5) |
-| `bbcdca2` | 이미지 로딩·디코딩, 배경 이미지, 그라디언트 |
+| `6368019` | BL-010: M2 엔진 연결 검증. `textContent` setter, sloppy 평가, 락파일 정리 |
+| `1e857cd` | HTTPS: rustls + ring을 게스트 안에서 (M1.11) |
+| `034ffc9` | 쿠키 저장소, POST, 히스토리, 문서마다 새 JS 컨텍스트 (M3.2) |
+| `0f36b37` | DOM 프렐류드 재작성(`prelude/*.js`), 외부 스크립트, 이벤트 루프, fetch/XHR (M2.6·M2.7·M2.9) |
+| `b021068` | QuickJS 패치(`Function.caller`), 스택 32MB. 참조 사이트 로그인 화면이 뜸 (M2.10) |
+| `77b9551` | 원격 객체, 글자·키 입력, keep-alive 연결 풀, `WHB_TRACE_CDP` (M2.4·M2.8·M2.14) |
+| `60edca4` | 추적 로그에서 입력 글자 가리기 |
+| `6321336` | 인라인 스타일로 숨긴 요소를 접근성 트리에서 제외 (M1.4a) |
+| `338cb7d` | 선택자 엔진 재작성 (M1.10) |
+| `131dde6` | CSS 파서와 캐스케이드 계산 (M1.4b) |
+| `20b2974` | 캐스케이드를 페이지에 연결: 시트 수집, 캐시, 접근성 트리, `getComputedStyle` |
+| `e6f0255` | 레이아웃(taffy), 히트 테스트, 마우스 입력 (M1.4·M2.5) |
+| `921c45a` | 자격증명: stdin, 자리표시자, CDP 출력 가리기 (M4) |
+| `9e7b7ff` | 백로그 정리 |
+| `961e800` | 하위 리소스 병렬 다운로드 (M2.13) |
+| `1679811` | `Network.*` 이벤트, 인코딩된 비밀 가리기 (M3.1) |
+| `ba91e04` | 스크린샷, 내장 한글 글꼴, 레이아웃이 실제 글자 폭 사용 (M1.5) |
+| `44aaaa5` | 이미지 로딩·디코딩, 배경 이미지, 그라디언트 |
+| `89d5c7c` | 실시간 화면 전송 `Page.startScreencast` (M3.6) |
+| `ef89e38` | `watch.sh`: agent-browser 뷰포트에 맞추고 남의 대시보드는 건드리지 않음 |
+| `22db2ef` | ES 모듈, import map (M2.11) |
+| `4fff8ea` | 스크롤 (M1.12) |
+| `1b90441` | 콘솔과 잡히지 않은 예외 (M3.7) |
+| `e7159f7` | 창의 이름 접근, 비활성 컨트롤 (M2.15) |
+| `7e6af7c` | 모든 인코딩, EUC-KR (M1.9) |
+| `7931596` | `innerText` (M2.16) |
+| `40dc08a` | 같은 문서 안의 뒤로·앞으로, `popstate` (M2.12) |
+| `185a3ed` | 접근성 트리를 Chrome에 맞춤 (M1.2b) |
+| `15dd4ce` | 그림자와 SVG (M1.5b) |
+| `2349b82` | 참조 사이트를 알아볼 수 있는 정보 삭제(히스토리 재작성. 그 전 해시는 모두 바뀌었다) |
+| (다음) | 요청 가로채기 `Fetch.*`, 사이드 도어 (M3.3) |
 
 ## 1. 엔진 구조
 
@@ -102,6 +116,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `browser.rs` | `HtmlEngine`. CDP 메서드, 로드 순서(가져오기 → 스타일시트 → 스크립트), 히스토리. 맨 바깥 `impl Engine`이 모든 출력에서 비밀을 가린다 |
 | `fetch.rs` | HTTP/1.1 클라이언트. TLS, keep-alive 풀, 리다이렉트, 쿠키. `start`(스레드에서 요청, 호스트당 6개)와 `preload` |
 | `network.rs` | `Network.*` 기록. 요청마다 이벤트와 응답 본문을 남기고 엔진이 출구에서 내보낸다 |
+| `intercept.rs` | `Fetch.*` 요청 가로채기. 패턴, 멈춘 요청, 클라이언트의 답. `Concurrent`로 명령 대기열 밖에서 답한다 |
 | `cookies.rs` | RFC 6265 쿠키 저장소. 메모리 전용, 모든 타깃이 공유 |
 | `dom.rs`, `parse.rs` | 아레나 DOM과 html5ever 싱크. 폼 상태(`Control`), 변경 버전, 스타일·레이아웃 캐시 |
 | `select.rs` | 선택자 파서·매처·명시도 |
@@ -134,6 +149,12 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
   노드를 바꾸는 `dom.rs`의 모든 함수가 버전을 올린다. 새 변경 함수를 만들면 `touch()`를 부른다.
 - CDP 출력은 `impl Engine for HtmlEngine` 한 곳을 지난다. 새 메서드는 `dispatch_raw`에
   넣으면 가리기가 저절로 적용된다.
+- **명령은 한 번에 하나씩, 끝까지 처리된다.** 연결 스레드는 읽기만 하고 명령은 작업
+  스레드(`cdp-commands`)가 차례로 처리한다. 페이지 로드도 명령 하나다. 그 로드가
+  기다리는 답(`Fetch.continueRequest` 등)은 대기열 뒤에 서면 영영 오지 않으므로
+  **사이드 도어**(`browser_core::SideDoor`)가 읽는 즉시 답한다. 엔진은 `Engine::concurrent`로
+  그런 명령의 처리기를 주고, `LiveEmit`으로 명령 도중에 이벤트를 바로 보낸다.
+  사이드 도어는 브라우저 잠금을 쓰지 않는다. 그 잠금은 기다리는 명령이 쥐고 있다.
 - 원시 접근자는 매크로로 만들면 매크로 위생 때문에 실패한다. 그래서 `bindings.rs`의
   `put_*` 함수는 명시적으로 쓴다.
 
@@ -151,7 +172,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | 호스트 페이지에서 안으로 들어오는 경로(E3)는 필요 없다. 설령 되더라도 HTTP 전용이라 CDP의 WebSocket 업그레이드는 지나가지 못한다 | [harness/README.md](../harness/README.md) |
 | 브라우저 샌드박스에서 외부 TCP·HTTPS가 된다. WISP 릴레이를 쓴다 (E4·E5) | 이 문서의 §3 |
 | QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다. 엔진에서는 `full-wasi`를 쓸 수 없다 (§6) | [docs/quickjs.md](quickjs.md) |
-| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 글꼴과 래스터라이저까지 4.7MB, 이미지 디코더까지 5.2MB, 인코딩 5.4MB, resvg까지 6.2MB. 앞의 몇 개는 빌드 스크립트 표시값이라 실제보다 클 수 있다 | `ls -l`, 커밋 기록 |
+| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 글꼴과 래스터라이저까지 4.7MB, 이미지 디코더까지 5.2MB, 인코딩 5.4MB, resvg까지 6.2MB(요청 가로채기 +41KB, 6,258,603바이트). 앞의 몇 개는 빌드 스크립트 표시값이라 실제보다 클 수 있다 | `ls -l`, 커밋 기록 |
 | 참조 사이트 배경은 인라인 `background-image`(1920×1080 JPEG)이고, 크기·위치는 스타일시트 규칙의 `background: ... no-repeat top; background-size: 1920px 1080px`에서 온다. `cover`를 쓰는 규칙은 `min-height:1081px` 미디어 쿼리 안이라 800×600에서는 안 맞는다 | 2026-10-10 Chrome과 비교 |
 | 참조 사이트는 Noto Sans KR 웹 글꼴을 쓴다. 왼쪽 절반은 화면 전체에 깔린 배경 이미지와 그 위의 흰 글자이고, 로그인 상자는 그 위의 80% 흰색이다 | 2026-10-09 CSS와 Chrome 스크린샷 |
 | 참조 사이트 로그인 상자는 오른쪽에서 미끄러져 들어온다. Chrome에서 열자마자 재면 x가 수십 px 다르다 | 같은 날 |
@@ -530,12 +551,24 @@ E5 PASS: HTTP/1.1 200 OK
 - [x] M3.5 `localStorage`·`sessionStorage`는 출처별로 나뉘어 엔진 메모리(`DomState`)에
       있어 페이지를 옮겨도 남는다. 디스크에는 쓰지 않는다. 다만 탭(타깃)마다 따로라
       `localStorage`가 탭 사이에 공유되지 않는다. 쿠키는 공유된다.
-- [ ] M3.3 요청 가로채기를 구현한다. `agent-browser network route`. CDP로는
-      `Fetch.enable` 뒤 `Fetch.requestPaused`를 받은 클라이언트가
-      `Fetch.fulfillRequest`/`continueRequest`/`failRequest`로 답한다. 지금 엔진은
-      명령 하나를 처리하는 동안 다음 명령을 받지 않으므로, 페이지 로드 중에 멈춘
-      요청이 그 답을 기다리면 교착한다. 로드를 디스패치 밖으로 빼거나, 규칙을
-      엔진에 미리 넘기는 방식이 필요하다.
+- [x] M3.3 요청 가로채기(`agent-browser network route`, `unroute`). `Fetch.enable`의
+      패턴(`*`, `?`, `\` 이스케이프, `resourceType`)에 맞는 요청은 보내기 전에 멈추고
+      `Fetch.requestPaused`가 바로 나간다. 클라이언트가 `continueRequest`(URL·메서드·헤더·
+      본문 변경 가능, 바뀐 URL은 페이지에 안 보임), `fulfillRequest`(상태·헤더·본문,
+      `Set-Cookie`도 저장), `failRequest`(`net::ERR_*`)로 답할 때까지 보낸 스레드가 기다린다.
+      리다이렉트는 홉마다 다시 멈춘다(`interception-job-N.홉`). 문제는 교착이었다. 엔진은
+      명령 하나를 끝까지 처리하고 페이지 로드도 명령 하나인데, 그 로드가 기다리는 답이
+      다음 명령으로 온다. 그래서 연결을 읽기 스레드와 명령 작업 스레드로 나누고, `Fetch.*`는
+      브라우저 잠금 없이 사이드 도어에서 바로 답한다(§1). 규칙을 엔진에 미리 넘기는 방식은
+      CDP가 아니라서 택하지 않았다. `Fetch.disable`, 타깃 닫기, 클라이언트 연결 끊김은 멈춘
+      요청을 그대로 보낸다(Chrome과 같음). 받을 클라이언트가 없으면 멈추지 않는다.
+      `requestPaused`의 본문은 다른 출력처럼 비밀을 가린다. 오류는 Chrome과 같다(활성화 전
+      -32000 "Fetch domain is not enabled", 모르는 id -32602 "Invalid InterceptionId.").
+      응답 단계(`requestStage: "Response"`, `interceptResponse`)와 `continueWithAuth`는
+      거절한다. `verify-m1.sh`가 abort·body·통과·unroute를 확인하고(7개, 네이티브),
+      `verify-login.sh`는 비밀이 든 로그인 POST를 가로채 통과시킨다(네이티브와 WASIX).
+      WASIX에서 m1의 순서도 손으로 확인했다. 참조 사이트를 모든 요청 가로채서(71개, 모두 통과) 열면
+      3.22초 → 3.41초.
 - [x] M3.4 `Page.captureScreenshot`. M1.5 참조.
 
 ### 4.5 M4 자격증명 (P1, 목표의 핵심)
@@ -696,6 +729,13 @@ E5 PASS: HTTP/1.1 200 OK
   rquickjs-sys를 같은 방식으로 복사하고 `vendor/patches/`를 다시 적용한다.
   경로 의존성이 되면서 빌드 때 "using bundled bindings" 경고가 보이는데, 원래도
   나던 것이 이제 숨겨지지 않을 뿐이다.
+- **Chrome은 `fetch()`를 `Fetch.requestPaused`에서 `XHR`이라 한다.** 같은 요청이
+  `Network.requestWillBeSent`에서는 `Fetch`다(Chrome 149에서 캡처). agent-browser의
+  `network route --resource-type`은 이 값으로 거르므로 `fetch`로는 `fetch()`가 안 걸린다.
+  엔진도 같게 보고한다.
+- **`Fetch.fulfillRequest`의 헤더 없는 응답은 `content-type`이 없다.** Chrome에서
+  `r.headers.get('content-type')`은 `null`이다. 프렐류드가 네트워크 응답을 `new Response(text)`로
+  만들어서 `text/plain;charset=UTF-8`이 붙던 것을 이번에 고쳤다(`clone()`도).
 - **`rquickjs`의 `intrinsic::Performance`는 존재하지 않는 심볼을 가리킨다.**
   실제 이름은 `JS_AddPerformance`다. WASIX와 무관한 rquickjs 쪽 문제이므로
   그 타입은 쓰지 않는다.

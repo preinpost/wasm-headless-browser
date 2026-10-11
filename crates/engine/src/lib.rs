@@ -28,6 +28,7 @@ pub mod encoding;
 pub mod fetch;
 pub mod font;
 pub mod images;
+pub mod intercept;
 pub mod js;
 pub mod layout;
 pub mod paint;
