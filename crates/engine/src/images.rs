@@ -7,9 +7,9 @@
 //! bumps [`ImageStore::generation`], which is part of the layout cache's key,
 //! so the next layout uses it.
 //!
-//! PNG, JPEG, GIF (its first frame) and WebP are decoded. SVG is not: it
-//! needs a renderer of its own, and an SVG image measures as zero and paints
-//! nothing, as a broken image would.
+//! PNG, JPEG, GIF (its first frame) and WebP are decoded, and SVG is drawn
+//! by resvg (svg.rs) at twice its own size, so it stays sharp when a page
+//! scales it up a little.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -33,9 +33,13 @@ const MAX_PIXELS: u64 = 8192 * 4320;
 
 /// Straight-alpha RGBA, row by row.
 pub struct Image {
+    /// The pixels' size.
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// The size the image has of its own, in CSS pixels: the pixels' for a
+    /// raster image, the SVG's own for a drawn one.
+    pub natural: (f64, f64),
 }
 
 impl Image {
@@ -226,16 +230,28 @@ fn reader(bytes: &[u8]) -> Option<image::ImageReader<Cursor<&[u8]>>> {
 
 /// Width and height from the header alone.
 pub fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if crate::svg::is_svg(bytes) {
+        return crate::svg::size(bytes);
+    }
     reader(bytes)?.into_dimensions().ok()
 }
 
+/// The largest side an SVG is drawn at.
+const MAX_SVG_SIDE: u32 = 4096;
+
 pub fn decode(bytes: &[u8]) -> Option<Image> {
     let (width, height) = dimensions(bytes)?;
+    if crate::svg::is_svg(bytes) {
+        let scale = (2.0f64).min(MAX_SVG_SIDE as f64 / width.max(height) as f64);
+        let side = |v: u32| ((v as f64 * scale).round() as u32).max(1);
+        return crate::svg::rasterize(bytes, side(width), side(height));
+    }
     if width as u64 * height as u64 > MAX_PIXELS {
         return None;
     }
     let rgba = reader(bytes)?.decode().ok()?.into_rgba8();
-    Some(Image { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() })
+    let natural = (rgba.width() as f64, rgba.height() as f64);
+    Some(Image { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw(), natural })
 }
 
 #[cfg(test)]
@@ -263,7 +279,8 @@ mod tests {
         assert_eq!(dimensions(&jpeg), Some((16, 8)));
         let decoded = decode(&jpeg).unwrap();
         assert!(decoded.pixel(3, 3)[0].abs_diff(200) < 4);
-        assert_eq!(decode(b"<svg xmlns='http://www.w3.org/2000/svg'/>").map(|i| i.width), None);
+        let svg = decode(b"<svg xmlns='http://www.w3.org/2000/svg' width='3' height='2'/>").unwrap();
+        assert_eq!((svg.natural, svg.width), ((3.0, 2.0), 6), "drawn at twice its size");
     }
 
     #[test]

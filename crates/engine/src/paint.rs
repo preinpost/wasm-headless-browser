@@ -9,9 +9,8 @@
 //! screenshot shows is where `DOM.getBoxModel` says it is, and where a click
 //! lands.
 //!
-//! What is not: images (nothing is decoded), background images and
-//! gradients, shadows, outlines, rotation and scaling, and font faces other
-//! than the one embedded (bold is smeared, italic is upright).
+//! What is not: outlines, rotation and scaling, filters, and font faces
+//! other than the one embedded (bold is smeared, italic is upright).
 //!
 //! The focused text field gets a caret after its text, steady rather than
 //! blinking, so a person watching a screencast can see where typing goes.
@@ -440,6 +439,8 @@ impl Painter<'_> {
         let corner = radius(style, &rect) * scale;
 
         let shape = Shape { area, radius: corner };
+        // Outer shadows go under the box, inset ones over its background.
+        self.shadows(style, area, corner, false, opacity, clip);
         // A colour the canvas took over is not painted again; images are.
         if !background_propagated {
             if let Some(bg) = background_color(style) {
@@ -447,8 +448,12 @@ impl Painter<'_> {
             }
         }
         self.background_layers(style, &rect, opacity, clip, shape);
+        self.shadows(style, area, corner, true, opacity, clip);
         if tag == "img" {
             self.replaced_image(id, style, &rect, opacity, clip, shape);
+        }
+        if tag == "svg" {
+            self.inline_svg(id, style, &rect, opacity, clip, shape);
         }
         let widths = border_widths(style).map(|w| w * scale);
         if widths.iter().any(|w| *w > 0.0) {
@@ -1144,6 +1149,148 @@ impl Gradient {
 
 
 
+
+// ---- shadows ----------------------------------------------------------------
+
+/// One `box-shadow` layer, in CSS pixels.
+#[derive(Debug, Clone, PartialEq)]
+struct BoxShadow {
+    inset: bool,
+    x: f64,
+    y: f64,
+    blur: f64,
+    spread: f64,
+    color: Rgba,
+}
+
+/// `box-shadow`: comma-separated layers of `[inset] x y [blur [spread]]
+/// [color]`, in any order between the colour, the lengths and `inset`.
+fn box_shadows(style: &ComputedStyle) -> Vec<BoxShadow> {
+    let value = style.get("box-shadow").trim();
+    let value = value.trim_end_matches("!important").trim();
+    if value.is_empty() || value == "none" {
+        return Vec::new();
+    }
+    let current = text_color(style);
+    let mut out = Vec::new();
+    for layer in split_outside_parens(value, ',') {
+        let mut lengths = Vec::new();
+        let mut shadow = BoxShadow { inset: false, x: 0.0, y: 0.0, blur: 0.0, spread: 0.0, color: current };
+        for token in tokens(layer) {
+            if token.eq_ignore_ascii_case("inset") {
+                shadow.inset = true;
+            } else if let Some(length) = style::length_px(token, style.font_size(), 16.0, 0.0) {
+                lengths.push(length);
+            } else if let Some(color) = color::parse(token, current) {
+                shadow.color = color;
+            }
+        }
+        if lengths.len() < 2 {
+            continue;
+        }
+        shadow.x = lengths[0];
+        shadow.y = lengths[1];
+        shadow.blur = lengths.get(2).copied().unwrap_or(0.0).max(0.0);
+        shadow.spread = lengths.get(3).copied().unwrap_or(0.0);
+        out.push(shadow);
+    }
+    out
+}
+
+/// The complementary error function, to within about 1e-7 (Abramowitz and
+/// Stegun 7.1.26).
+fn erfc(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    let erf = 1.0 - poly * (-x * x).exp();
+    if x >= 0.0 { 1.0 - erf } else { 1.0 + erf }
+}
+
+/// How much of a blurred shadow reaches a pixel `d` from its edge,
+/// negative inside: a Gaussian of sigma half the blur radius, as CSS
+/// specifies, applied across the edge.
+fn shadow_coverage(d: f64, sigma: f64) -> f64 {
+    if sigma < 0.5 {
+        return coverage(d);
+    }
+    0.5 * erfc(d / (sigma * std::f64::consts::SQRT_2))
+}
+
+impl Canvas {
+    /// An outer shadow: `shape`, blurred by `sigma`, wherever it is not
+    /// under the box that casts it.
+    fn outer_shadow(&mut self, shape: (Area, f64), sigma: f64, color: Rgba, caster: (Area, f64), clip: Area) {
+        let (area, radius) = shape;
+        let reach = (sigma * 3.0).ceil() + 1.0;
+        let bounds = area.inset(-reach, -reach, -reach, -reach).intersect(clip);
+        if bounds.is_empty() || !color.is_visible() {
+            return;
+        }
+        let (x0, y0, x1, y1) = bounds.pixels(self);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let under = coverage(caster.0.distance(px, py, caster.1));
+                if under >= 1.0 {
+                    continue;
+                }
+                let amount = shadow_coverage(area.distance(px, py, radius), sigma) * (1.0 - under) * clip_coverage(clip, px, py);
+                self.blend(x, y, color, amount);
+            }
+        }
+    }
+
+    /// An inset shadow: inside `inside`, everywhere but `hole`, blurred.
+    fn inset_shadow(&mut self, inside: (Area, f64), hole: (Area, f64), sigma: f64, color: Rgba, clip: Area) {
+        let bounds = inside.0.intersect(clip);
+        if bounds.is_empty() || !color.is_visible() {
+            return;
+        }
+        let (x0, y0, x1, y1) = bounds.pixels(self);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let within = coverage(inside.0.distance(px, py, inside.1));
+                if within <= 0.0 {
+                    continue;
+                }
+                let hole_distance = if hole.0.is_empty() { -1e9 } else { hole.0.distance(px, py, hole.1) };
+                let amount = (1.0 - shadow_coverage(hole_distance, sigma)) * within * clip_coverage(clip, px, py);
+                self.blend(x, y, color, amount);
+            }
+        }
+    }
+}
+
+impl Painter<'_> {
+    /// The element's shadows of one kind, last listed painted first, as CSS
+    /// stacks them.
+    fn shadows(&mut self, style: &ComputedStyle, area: Area, corner: f64, inset: bool, opacity: f64, clip: Area) {
+        let scale = self.region.scale;
+        let shadows: Vec<BoxShadow> = box_shadows(style).into_iter().filter(|s| s.inset == inset).collect();
+        if shadows.is_empty() {
+            return;
+        }
+        let widths = border_widths(style).map(|w| w * scale);
+        let padding_box = area.inset(widths[0], widths[1], widths[2], widths[3]);
+        let inner_radius = (corner - widths.iter().cloned().fold(0.0, f64::max)).max(0.0);
+        for shadow in shadows.iter().rev() {
+            let (dx, dy, spread, sigma) = (shadow.x * scale, shadow.y * scale, shadow.spread * scale, shadow.blur * scale / 2.0);
+            let color = shadow.color.with_alpha(opacity);
+            let moved = |a: Area| Area { x0: a.x0 + dx, y0: a.y0 + dy, x1: a.x1 + dx, y1: a.y1 + dy };
+            if inset {
+                let hole = moved(padding_box).inset(spread, spread, spread, spread);
+                let hole_radius = (inner_radius - spread).max(0.0);
+                self.canvas.inset_shadow((padding_box, inner_radius), (hole, hole_radius), sigma, color, clip);
+            } else {
+                let cast = moved(area).inset(-spread, -spread, -spread, -spread);
+                let radius = if corner > 0.0 { (corner + spread).max(0.0) } else { 0.0 };
+                self.canvas.outer_shadow((cast, radius), sigma, color, (area, corner), clip);
+            }
+        }
+    }
+}
+
 // ---- images -----------------------------------------------------------------
 
 /// A shape to stay inside: a box with rounded corners.
@@ -1291,7 +1438,7 @@ impl Painter<'_> {
                 Layer::Gradient(gradient) => self.canvas.gradient_in(gradient, origin_area, opacity, clip, shape),
                 Layer::Url(url) => {
                     let Some(image) = self.image_for(url) else { continue };
-                    let (iw, ih) = (image.width as f64, image.height as f64);
+                    let (iw, ih) = image.natural;
                     let (ow, oh) = (origin.width, origin.height);
                     let size_words: Vec<&str> = bg.size.split_whitespace().collect();
                     let (tw, th) = match size_words.as_slice() {
@@ -1354,6 +1501,29 @@ impl Painter<'_> {
         }
     }
 
+    /// An inline `<svg>`, drawn from its markup into its content box.
+    fn inline_svg(&mut self, id: NodeId, style: &ComputedStyle, rect: &Rect, opacity: f64, clip: Area, shape: Shape) {
+        let border = border_widths(style);
+        let pad = padding(style, rect.width);
+        let content = Rect {
+            x: rect.x + border[3] + pad[3],
+            y: rect.y + border[0] + pad[0],
+            width: (rect.width - border[1] - border[3] - pad[1] - pad[3]).max(0.0),
+            height: (rect.height - border[0] - border[2] - pad[0] - pad[2]).max(0.0),
+        };
+        let dest = self.area(&content);
+        let (w, h) = (dest.width().round(), dest.height().round());
+        if w < 1.0 || h < 1.0 || w * h > 16.0 * 1024.0 * 1024.0 {
+            return;
+        }
+        let set = |name: &str| Some(style.get(name)).filter(|v| !v.is_empty());
+        let markup = crate::browser::serialize(self.doc, id);
+        let document = crate::svg::standalone(&markup, text_color(style), set("fill"), set("stroke"));
+        let Some(image) = crate::svg::rasterize(document.as_bytes(), w as u32, h as u32) else { return };
+        let inside = clip.intersect(dest);
+        self.canvas.image(&image, dest, opacity, inside, shape);
+    }
+
     /// An `<img>`'s picture in its content box, as `object-fit` says.
     fn replaced_image(&mut self, id: NodeId, style: &ComputedStyle, rect: &Rect, opacity: f64, clip: Area, shape: Shape) {
         let Some(url) = self.doc.image_url(id) else { return };
@@ -1366,7 +1536,7 @@ impl Painter<'_> {
             width: (rect.width - border[1] - border[3] - pad[1] - pad[3]).max(0.0),
             height: (rect.height - border[0] - border[2] - pad[0] - pad[2]).max(0.0),
         };
-        let (iw, ih) = (image.width as f64, image.height as f64);
+        let (iw, ih) = image.natural;
         let (w, h) = match style.get("object-fit") {
             "contain" => {
                 let s = (content.width / iw).min(content.height / ih);
@@ -1533,6 +1703,36 @@ mod tests {
         // Chrome's inset (3px) plus "ab" at 13.33px is about 18px in.
         assert!(!changed.is_empty() && changed.len() <= 3, "{changed:?}");
         assert!((15..=22).contains(&changed[0]), "{changed:?}");
+    }
+
+    #[test]
+    fn shadows_fall_outside_the_box_and_insets_inside() {
+        let (_, canvas) = render(
+            "<body style='margin:0'>\
+             <div style='position:absolute;left:20px;top:20px;width:40px;height:40px;background:#fff;box-shadow:5px 5px 0 #000'></div>\
+             <div style='position:absolute;left:100px;top:20px;width:40px;height:40px;background:#fff;box-shadow:0 0 10px rgba(0,0,0,.5), inset 0 0 0 4px red'></div>\
+             </body>",
+        );
+        assert_eq!(canvas.pixel(62, 62), [0, 0, 0], "the hard shadow, offset");
+        assert_eq!(canvas.pixel(40, 40), [255, 255, 255], "not under the box");
+        assert_eq!(canvas.pixel(18, 40), [255, 255, 255], "not on the far side");
+        assert_eq!(canvas.pixel(102, 40), [255, 0, 0], "the inset ring");
+        assert_eq!(canvas.pixel(120, 40), [255, 255, 255], "inside the ring");
+        let near = canvas.pixel(141, 40)[0];
+        let far = canvas.pixel(148, 40)[0];
+        assert!(near < far && far < 255, "a blur fades out: {near} {far}");
+        assert_eq!(canvas.pixel(170, 40), [255, 255, 255], "and ends");
+    }
+
+    #[test]
+    fn inline_svg_is_drawn_in_the_pages_colour() {
+        let (_, canvas) = render(
+            "<style>.icon { color: #0a0 }</style><body style='margin:0'>\
+             <svg class=icon width=20 height=20 viewBox='0 0 2 2' style='position:absolute;left:10px;top:10px'>\
+             <rect width=1 height=2 fill=currentColor /></svg></body>",
+        );
+        assert_eq!(canvas.pixel(14, 20), [0, 0xaa, 0], "the left half, in the page's colour");
+        assert_eq!(canvas.pixel(25, 20), [255, 255, 255], "the right half is empty");
     }
 
     #[test]

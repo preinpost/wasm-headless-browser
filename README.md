@@ -60,9 +60,11 @@ Pages scroll: script, `scrollIntoView`, the wheel and agent-browser's
 `scroll` move the viewport and scroll containers, and boxes, clicks and
 screenshots follow.
 
-Not there yet: shadows and SVG in screenshots, sticky positioning, and
-request interception (`network route`). The WASIX module is 5.2 MB, the font
-1.15 MB of it.
+Screenshots paint box shadows and SVG, inline and as images (resvg).
+
+Not there yet: sticky positioning, text inside SVG, and request
+interception (`network route`). The WASIX module is 6.2 MB, the font
+1.15 MB and the SVG renderer 0.8 MB of it.
 
 ## Why the shape is what it is
 

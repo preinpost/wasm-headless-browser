@@ -6,7 +6,8 @@
 마지막 갱신: 2026-10-09. 로그인 흐름 다섯 단계(네트워크, JS, 입력, 클릭,
 자격증명)를 모두 마쳤고, 하위 리소스를 병렬로 받게 했다(M2.13). `Network.*`
 이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
-보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. EUC-KR 등 모든 인코딩(M1.9). `innerText`가 보이는 글자다(M2.16). 같은 문서의 뒤로·앞으로가 `popstate`다(M2.12). 다음 후보는 §0.4.
+보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. EUC-KR 등 모든 인코딩(M1.9). `innerText`가 보이는 글자다(M2.16). 같은 문서의 뒤로·앞으로가 `popstate`다(M2.12). 접근성 트리가 Chrome 스냅샷과 맞는다(M1.2b).
+스크린샷에 그림자와 SVG가 나온다(M1.5b). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -44,7 +45,7 @@ export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전�
 
 | 명령 | 검사 수 |
 |---|---|
-| `cargo test` | 엔진 204, browser-core 1, cdp-wire 3 |
+| `cargo test` | 엔진 208, browser-core 1, cdp-wire 3 |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 43 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 33 |
@@ -62,7 +63,10 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
   `MenuListPopup`을 내고, `<tbody>`의 rowgroup은 무시한다. 우리는 하지 않는다.
 - **WebAssembly.** QuickJS에 없다. vite.dev의 코드 하이라이터(oniguruma)가 이것 때문에
   실패한다. 인터프리터 안에서 wasm을 돌리는 것은 범위 밖으로 본다.
-- **그림자, SVG.** `box-shadow`와 SVG 이미지(`<img src=*.svg>`, 인라인 `<svg>`)는 그리지 않는다.
+- **vite.dev 레이아웃.** Chrome은 히어로 제목("The Build Tool for the Web")과 두 단 구성을
+  그리는데 우리는 상자 자리가 어긋나고 제목이 안 보인다. 제목은 배치되지만(y=166, 60px) 계산
+  색이 `#16171d`로 어두운 배경과 같다. Chrome에서는 흰색이다. VitePress의 다크 모드
+  캐스케이드(`.dark` 클래스와 CSS 변수)가 다르게 풀리는 것으로 보이며 확인하지 않았다.
 - **요청 가로채기 (M3.3).** agent-browser `network route`. `Fetch.requestPaused`는
   엔진이 요청 도중 클라이언트의 답을 기다려야 해서 구조가 바뀐다(§4.4).
 
@@ -104,7 +108,8 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | `css.rs`, `style.rs` | 시트 파싱, 캐스케이드, 계산 스타일 (`document_styles`) |
 | `layout.rs` | taffy 위의 배치, 칠하는 순서, 히트 테스트 (`document_layout`) |
 | `font.rs` | 내장 글꼴(`fonts/NotoSansKR-subset.otf`). 레이아웃의 글자 폭과 그리기의 글리프가 여기서 나온다 |
-| `paint.rs`, `color.rs`, `png.rs` | 스크린샷: 레이아웃을 칠하고 PNG로. 배경 이미지와 그라디언트 해석도 `paint.rs` |
+| `paint.rs`, `color.rs`, `png.rs` | 스크린샷: 레이아웃을 칠하고 PNG로. 배경 이미지·그라디언트·그림자도 `paint.rs` |
+| `svg.rs` | SVG를 resvg로 그린다: SVG 이미지와 인라인 `<svg>` |
 | `images.rs` | 탭의 이미지 저장소: 가져오기, 크기, 디코딩(PNG·JPEG·GIF·WebP), 기다리기 |
 | `screencast.rs` | `Page.startScreencast`: 바뀐 화면을 JPEG 프레임으로, 응답을 받은 뒤에만 |
 | `scroll.rs` | 스크롤 위치(문서에 저장), 범위, `scrollIntoView` 정렬, 휠 |
@@ -146,7 +151,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | 호스트 페이지에서 안으로 들어오는 경로(E3)는 필요 없다. 설령 되더라도 HTTP 전용이라 CDP의 WebSocket 업그레이드는 지나가지 못한다 | [harness/README.md](../harness/README.md) |
 | 브라우저 샌드박스에서 외부 TCP·HTTPS가 된다. WISP 릴레이를 쓴다 (E4·E5) | 이 문서의 §3 |
 | QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다. 엔진에서는 `full-wasi`를 쓸 수 없다 (§6) | [docs/quickjs.md](quickjs.md) |
-| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 글꼴과 래스터라이저까지 4.7MB, 이미지 디코더까지 5.2MB. 앞의 몇 개는 빌드 스크립트 표시값이라 실제보다 클 수 있다 | `ls -l`, 커밋 기록 |
+| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 글꼴과 래스터라이저까지 4.7MB, 이미지 디코더까지 5.2MB, 인코딩 5.4MB, resvg까지 6.2MB. 앞의 몇 개는 빌드 스크립트 표시값이라 실제보다 클 수 있다 | `ls -l`, 커밋 기록 |
 | 참조 사이트 배경은 인라인 `background-image`(`/api/login-step`, 1920×1080 JPEG 766KB)이고, 크기·위치는 `.login-background`의 `background: ... no-repeat top; background-size: 1920px 1080px`에서 온다. `cover`를 쓰는 규칙은 `min-height:1081px` 미디어 쿼리 안이라 800×600에서는 안 맞는다 | 2026-10-10 Chrome과 비교 |
 | 참조 사이트는 `Noto Sans KR, ...`으로 Noto Sans KR 웹 글꼴을 쓴다. 왼쪽 절반은 화면 전체에 깔린 배경 이미지와 그 위의 흰 글자이고, 로그인 상자는 그 위의 80% 흰색이다 | 2026-10-09 CSS와 Chrome 스크린샷 |
 | 참조 사이트 로그인 상자는 오른쪽에서 미끄러져 들어온다. Chrome에서 열자마자 재면 x가 수십 px 다르다 | 같은 날 |
@@ -344,6 +349,17 @@ the grid library 번들을 받은 뒤 JS가 그립니다. **"HTML을 가져온�
       스타일시트의 `url()`은 시트 주소 기준으로 절대화해서 저장한다. 참조 사이트 로그인
       화면이 Chrome과 거의 같게 나온다(배경 사진, 그 위 흰 글자, 반투명 로그인 상자).
       로드 시간은 그대로(약 2.8초). WASIX 모듈 4.7MB → 5.2MB(5,188,554바이트).
+- [x] M1.5b 그림자와 SVG. `box-shadow`는 여러 겹, 오프셋·흐림·퍼짐·색·`inset`을 그린다.
+      흐림은 둥근 상자까지의 부호 거리에 가우스(시그마는 흐림의 절반, CSS 규격)를 씌운 근사이고,
+      바깥 그림자는 그 상자 밑에는 칠하지 않는다. 바깥은 배경 전에, inset은 배경 뒤에 칠한다.
+      참조 사이트 "다음" 버튼 밑 그림자가 Chrome처럼 나온다. SVG는 resvg(usvg 파서 + tiny-skia,
+      순수 Rust, 기본 기능 끔)로 그린다. `<img>`·배경의 SVG는 고유 크기의 두 배로 래스터화하고
+      (`Image::natural`이 고유 크기), 인라인 `<svg>`는 마크업을 직렬화해 SVG 네임스페이스를
+      붙이고 루트에 페이지의 계산 `color`(icon의 `currentColor`)와 `fill`·`stroke`를 줘서 내용
+      상자 크기로 그린다. vite.dev의 SVG 로고가 또렷하게 나온다. 안 되는 것: SVG 안의 글자
+      (글꼴 로딩과 셰이핑이 필요), `<svg>` 밖 요소를 가리키는 `<use>`, SVG 안의 래스터 이미지,
+      페이지 스타일시트가 SVG 내부 요소에 주는 규칙. WASIX 모듈 5,444,493 → 6,217,771바이트
+      (+773KB, 거의 전부 resvg).
 - [ ] M1.6 실제 사이트로 다시 측정한다. 참조 사이트 로그인 화면은 레이아웃까지
       Chrome과 비교했다(§2). 로그인 뒤 화면과 CDP 표면 재캡처는 아직이다.
 - [x] M1.7 `browser` 바이너리에 `--engine fake|html` 플래그를 넣었다.
