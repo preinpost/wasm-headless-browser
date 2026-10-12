@@ -60,16 +60,24 @@ async function main() {
   }
 
   const wasmer = new Wasmer()
-  const [engineBytes, clientBytes] = await Promise.all([
+  const [engineBytes, clientBytes, whbBytes] = await Promise.all([
     fetch('/engine.wasm').then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)),
     fetch('/loopback-client.wasm').then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)),
+    // Optional: an older public/ may not have it, and E7 is then skipped.
+    fetch('/whb.wasm').then((r) => (r.ok ? r.arrayBuffer().then((b) => new Uint8Array(b)) : null)),
   ])
-  log(`engine.wasm ${engineBytes.byteLength} bytes, loopback-client.wasm ${clientBytes.byteLength} bytes`)
+  log(
+    `engine.wasm ${engineBytes.byteLength} bytes, loopback-client.wasm ${clientBytes.byteLength} bytes` +
+      (whbBytes ? `, whb.wasm ${whbBytes.byteLength} bytes` : ', no whb.wasm'),
+  )
 
-  const pkg = await wasmer.packages.create({
-    modules: { engine: engineBytes, client: clientBytes },
-    commands: { engine: { module: 'engine' }, client: { module: 'client' } },
-  })
+  const modules = { engine: engineBytes, client: clientBytes }
+  const commands = { engine: { module: 'engine' }, client: { module: 'client' } }
+  if (whbBytes) {
+    modules.whb = whbBytes
+    commands.whb = { module: 'whb' }
+  }
+  const pkg = await wasmer.packages.create({ modules, commands })
   log(`package ${pkg.id}; commands=${JSON.stringify(pkg.commands ?? {})}`)
 
   const network = mode === 'wisp' && wispUrl ? { mode, url: wispUrl } : { mode }
@@ -233,6 +241,40 @@ async function main() {
       )
     } catch (e) {
       record('E6 real engine loads a page in the sandbox', false, e?.message ?? String(e))
+    }
+  }
+
+  // ---- E7: whb drives the engine, one command per process ---------------
+  // As an agent in the sandbox would: each step is its own process, and the
+  // tab and the refs carry over in a state file in the sandbox's filesystem.
+  if (engineKind === 'html' && whbBytes) {
+    // The sandbox's own filesystem lives under /workspace, and every command
+    // in it sees it. A command's /tmp is its own.
+    const stateDir = '/workspace/.whb'
+    const whb = async (...args) => {
+      const out = await sandbox
+        .command('whb', ['--cdp', `127.0.0.1:${port}`, ...args], { env: { WHB_STATE_DIR: stateDir } })
+        .run({ timeoutMs: 120_000, check: false })
+      const text = (out.stdout?.text?.() ?? '') + (out.stderr?.text?.() ?? '')
+      for (const line of text.split('\n')) if (line.trim()) log(`  [whb ${args[0]}] ${line}`)
+      return text
+    }
+    try {
+      await sandbox.fs.mkdir(stateDir, { recursive: true })
+      const opened = await whb('open', pageUrl)
+      const kept = await sandbox.fs.readDir(stateDir).then((e) => e.map((x) => x.name).join(','), (e) => `unreadable: ${e}`)
+      log(`  [whb] state after open: ${kept}`)
+      const snapshot = await whb('snapshot', '-i')
+      const title = await whb('eval', 'document.title')
+      const refs = (snapshot.match(/ref=e\d+/g) ?? []).length
+      const ok = opened.startsWith('\u2713') && refs > 0 && /^".*"\s*$/.test(title.trim())
+      record(
+        'E7 whb drives the engine in the sandbox',
+        ok,
+        ok ? `title ${title.trim()}, ${refs} refs` : [opened, snapshot, title].join(' | ').slice(0, 200),
+      )
+    } catch (e) {
+      record('E7 whb drives the engine in the sandbox', false, e?.message ?? String(e))
     }
   }
 

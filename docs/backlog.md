@@ -10,7 +10,7 @@
 스크린샷에 그림자와 SVG가 나온다(M1.5b). `network route`로 요청을 가로챈다(M3.3).
 네이버에서 누락되던 인라인 SVG 로고를 수정했다(M1.5c). 클리핑·의사 요소·인라인 배치를 넣었다(M1.4c).
 macOS에서 깨지던 WASIX 빌드를 고쳤다(§6). 브라우저 샌드박스 안에서 실제 엔진이 페이지를
-불러오는 것까지 확인했다(E6, §2). 다음 후보는 §0.4.
+불러오는 것까지 확인했다(E6, §2). 샌드박스 안 클라이언트 `whb`를 넣었다(E7, §5). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -52,7 +52,8 @@ M1 50개, 로그인 35개를 다시 통과했다. WASIX에서도 M0 16개, 로�
 
 | 명령 | 검사 수 |
 |---|---|
-| `ENGINE=html ./scripts/verify-harness.sh` | 브라우저 샌드박스 E0·E1·E2·E4·E6, 5개 (2026-10-12) |
+| `ENGINE=html ./scripts/verify-harness.sh` | 브라우저 샌드박스 E0·E1·E2·E4·E6·E7, 6개 (2026-10-12) |
+| `./scripts/verify-client.sh`, `MODE=wasix ./scripts/verify-client.sh` | `whb`로 로그인 흐름, 31개씩 (2026-10-12) |
 | `cargo test --release --workspace` | 엔진 242, browser-core 2, cdp-wire 3 (2026-10-12) |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 50 |
@@ -63,6 +64,16 @@ M1 50개, 로그인 35개를 다시 통과했다. WASIX에서도 M0 16개, 로�
 WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다린다(§6).
 
 ### 0.4 다음 후보
+
+- **WASIX에서 무거운 페이지를 몇 번 불러오면 엔진이 죽는다.** 한 엔진 프로세스로 네이버를
+  불러오면 Wasmer CLI에서는 세 번째에, 브라우저 샌드박스에서는 두 번째에 런타임이
+  `thread_spawn`(`lib/wasix/src/syscalls/wasix/thread_spawn.rs:217`, `Errno::overflow`)에서
+  패닉한다. 엔진은 요청마다 스레드를 만들고(`fetch.rs`의 `Client::start`, 네이버 한 번에
+  70개 넘게), 탭마다 32MB 스택의 스크립트 스레드를 둔다(`js.rs`). WASIX는 스레드 스택을
+  wasm 선형 메모리 안에 두므로, 회수되지 않거나 늦게 회수되면 곧 한계에 닿는다는 것이
+  추정이다. 가장 먼저 확인할 것은 요청 스레드를 재사용하는 풀(호스트당 6개)과 스레드
+  스택 크기다. 재현: `ENGINE=html PAGE_URL=https://www.naver.com/ ./scripts/verify-harness.sh`
+  (E7 실패), 또는 같은 엔진에 `wasix-loopback-client.rs`의 `cdp` 모드를 세 번.
 
 - **과거 참조 사이트 로고 기록은 재현이 필요하다.** `<img>`에 `src`가 없다는 기록은
   있지만 이번 세션에는 재현 URL이 없었다. 대신 네이버를 검사했다. 네이버의 이미지 `src`와
@@ -625,11 +636,14 @@ E5 PASS: HTTP/1.1 200 OK
 - [ ] **`Context::full`을 살릴지.** `wasixcc`는 이미 설치되어 있고, QuickJS도 이제
       `vendor/`에서 직접 패치할 수 있다. 하지만 `performance`는 프렐류드가 가상 시계로
       제공하므로 급하지 않다.
-- [ ] **클라이언트를 무엇으로 할지.** 세 후보다.
-      `agent-browser`는 Rust CLI라 `cargo wasix`로 WASIX에 올릴 수 있고,
-      `inno-creed`를 올린 경로와 같다. Playwright는 Node 기반이고 페이지 JS에
-      훨씬 많이 의존하므로 M2가 훨씬 두꺼워져야 한다. 자체 클라이언트를 만들면
-      표면을 우리가 정할 수 있지만 기존 도구 생태계를 잃는다.
+- [x] **클라이언트를 무엇으로 할지.** 직접 만든 `whb`(`crates/client`)로 정했다(2026-10-12).
+      먼저 agent-browser를 WASIX로 옮겨 봤다. 컴파일은 되고(11.4MB) CLI와 데몬 사이 통신도
+      됐지만, 데몬이 tokio로 엔진에 연결한 소켓의 읽기가 `ETIMEDOUT`으로 실패해 멈추었다
+      ([experiments/agent-browser](../experiments/agent-browser/README.md)). `whb`는 블로킹
+      소켓만 쓰고, agent-browser의 명령과 출력(`snapshot -i`의 `@e3` ref)을 따른다.
+      데몬 없이 명령마다 프로세스가 뜨고, 엔진이 탭을 유지하며, 세션별 상태 파일이
+      ref를 이어 준다. 문서가 바뀐 뒤의 옛 ref는 거부한다. WASIX 모듈은 273KB다.
+      Playwright는 샌드박스 안 Node가 필요해 보류했다.
 - [ ] **백로그 말고 다른 문서도 한국어로 할지.** 현재 README와 `docs/*.md`는
       영어입니다.
 
@@ -645,7 +659,7 @@ E5 PASS: HTTP/1.1 200 OK
   `lines()` 비동기 제너레이터를 쓴다. `pipeTo`는 실패한다.
 - **`@wasmer/sdk`는 파일 배치를 그대로 유지해야 한다.** 자기 워커와
   wasm-bindgen 모듈을 `import.meta.url` 기준으로 찾는다.
-- **`whb`의 accept 루프가 `os error 73`을 찍는다.** 클라이언트가 끊길 때
+- **엔진(`wasm-headless-browser`)의 accept 루프가 `os error 73`을 찍는다.** 클라이언트가 끊길 때
   나오는 잡음이고 동작에는 영향이 없다. 다만 로그에는 남으므로 나중에
   조용히 하거나 이유를 밝히는 편이 좋다.
 - **`@wasmer/sdk`는 JSPI를 요구한다.** `SharedArrayBuffer`만으로는 부족하다.

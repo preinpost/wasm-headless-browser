@@ -29,5 +29,7 @@ copyFileSync(
   `${root}target/wasm32-wasmer-wasi/release/wasm-headless-browser.wasm`,
   'public/engine.wasm',
 )
+// whb, the in-tree CDP client, comes from the same WASIX build.
+copyFileSync(`${root}target/wasm32-wasmer-wasi/release/whb.wasm`, 'public/whb.wasm')
 
-console.log('copied engine.wasm and built loopback-client.wasm into public/')
+console.log('copied engine.wasm and whb.wasm and built loopback-client.wasm into public/')

@@ -1,0 +1,406 @@
+diff --git a/cli/src/connection.rs b/cli/src/connection.rs
+index 8d5f66a..9afe102 100644
+--- a/cli/src/connection.rs
++++ b/cli/src/connection.rs
+@@ -174,7 +174,7 @@ pub fn cleanup_stale_files(session: &str) {
+         let _ = fs::remove_file(&socket_path);
+     }
+ 
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     {
+         let port_path = get_port_path(session);
+         let _ = fs::remove_file(&port_path);
+@@ -194,6 +194,11 @@ pub fn is_pid_alive(pid: u32) -> bool {
+         }
+         std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+     }
++    #[cfg(target_os = "wasi")]
++    {
++        let _ = pid;
++        true
++    }
+     #[cfg(windows)]
+     unsafe {
+         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+@@ -362,12 +367,12 @@ pub fn walk_daemons() -> DaemonInventory {
+     inventory
+ }
+ 
+-#[cfg(windows)]
++#[cfg(any(windows, target_os = "wasi"))]
+ fn get_port_path(session: &str) -> PathBuf {
+     get_socket_dir().join(format!("{}.port", session))
+ }
+ 
+-#[cfg(windows)]
++#[cfg(any(windows, target_os = "wasi"))]
+ fn port_identity_for_session(session: &str) -> String {
+     if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
+         let namespace = sanitize_session_component(&namespace);
+@@ -378,7 +383,7 @@ fn port_identity_for_session(session: &str) -> String {
+     session.to_string()
+ }
+ 
+-#[cfg(windows)]
++#[cfg(any(windows, target_os = "wasi"))]
+ pub fn get_port_for_session(session: &str) -> u16 {
+     let mut hash: i32 = 0;
+     for c in port_identity_for_session(session).chars() {
+@@ -392,7 +397,7 @@ pub fn get_port_for_session(session: &str) -> u16 {
+ /// Read the actual daemon port from the `.port` file written by the daemon.
+ /// Falls back to the hash-derived port if the file does not exist or is
+ /// unreadable (e.g. daemon has not started yet).
+-#[cfg(windows)]
++#[cfg(any(windows, target_os = "wasi"))]
+ pub fn resolve_port(session: &str) -> u16 {
+     let port_path = get_port_path(session);
+     fs::read_to_string(&port_path)
+@@ -402,12 +407,20 @@ pub fn resolve_port(session: &str) -> u16 {
+ }
+ 
+ pub fn daemon_ready(session: &str) -> bool {
++    // Wasmer reports a TCP connect to a closed loopback port as a success,
++    // so connecting alone cannot tell a running daemon from none. A daemon
++    // writes its port and version files once it listens, and removes them
++    // when it stops.
++    #[cfg(target_os = "wasi")]
++    if !get_port_path(session).exists() || !get_version_path(session).exists() {
++        return false;
++    }
+     #[cfg(unix)]
+     {
+         let socket_path = get_socket_path(session);
+         UnixStream::connect(&socket_path).is_ok()
+     }
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     {
+         let port = resolve_port(session);
+         TcpStream::connect_timeout(
+@@ -666,6 +679,18 @@ fn ready_existing_daemon_result(
+             already_running: true,
+             restarted: false,
+         }),
++        // In a sandbox the daemon is usually started by hand, and it never
++        // gets the config file a spawning CLI writes. Its options only shape
++        // a browser it launches, and a sandbox attaches over --cdp instead.
++        #[cfg(target_os = "wasi")]
++        DaemonConfigStatus::Missing => {
++            let _ = (opts, timeout);
++            Some(DaemonResult {
++                already_running: true,
++                restarted: false,
++            })
++        }
++        #[cfg(not(target_os = "wasi"))]
+         DaemonConfigStatus::Missing => {
+             if wait_for_matching_ready_daemon(session, opts, timeout) {
+                 Some(DaemonResult {
+@@ -744,7 +769,7 @@ fn kill_stale_daemon(session: &str) {
+                     thread::sleep(Duration::from_millis(100));
+                 }
+             }
+-            #[cfg(windows)]
++            #[cfg(any(windows, target_os = "wasi"))]
+             {
+                 let _ = Command::new("taskkill")
+                     .args(["/PID", &pid.to_string(), "/F"])
+@@ -864,6 +889,12 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
+         }
+     }
+ 
++    // WASI has no current_exe(); a sandbox resolves the command by name.
++    #[cfg(target_os = "wasi")]
++    let exe_path = std::path::PathBuf::from(
++        env::var("AGENT_BROWSER_COMMAND").unwrap_or_else(|_| "agent-browser".to_string()),
++    );
++    #[cfg(not(target_os = "wasi"))]
+     let exe_path = env::current_exe().map_err(|e| e.to_string())?;
+     let exe_path = exe_path.canonicalize().unwrap_or(exe_path);
+ 
+@@ -894,6 +925,29 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
+         );
+     }
+ 
++    #[cfg(target_os = "wasi")]
++    {
++        let mut cmd = Command::new(&exe_path);
++        cmd.env("AGENT_BROWSER_DAEMON", "1");
++        apply_daemon_env(&mut cmd, session, opts);
++        daemon_child = Some(
++            cmd.stdin(Stdio::null())
++                .stdout(Stdio::null())
++                .stderr(Stdio::piped())
++                .spawn()
++                .map_err(|e| {
++                    format!(
++                        "Failed to start daemon as `{}`: {}. Start it yourself with \
++                         AGENT_BROWSER_DAEMON=1 AGENT_BROWSER_SESSION={} in the same sandbox, \
++                         or set AGENT_BROWSER_COMMAND to a command the sandbox can run.",
++                        exe_path.display(),
++                        e,
++                        session
++                    )
++                })?,
++        );
++    }
++
+     #[cfg(windows)]
+     {
+         use std::os::windows::process::CommandExt;
+@@ -987,7 +1041,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
+         "socket: {}",
+         get_socket_dir().join(format!("{}.sock", session)).display()
+     );
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     let endpoint_info = format!("port: 127.0.0.1:{}", resolve_port(session));
+ 
+     Err(format!("Daemon failed to start ({})", endpoint_info))
+@@ -1001,7 +1055,7 @@ fn connect(session: &str) -> Result<Connection, String> {
+             .map(Connection::Unix)
+             .map_err(|e| format!("Failed to connect: {}", e))
+     }
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     {
+         let port = resolve_port(session);
+         TcpStream::connect(format!("127.0.0.1:{}", port))
+@@ -1523,7 +1577,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     fn test_get_port_for_session() {
+         let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
+         guard.remove("AGENT_BROWSER_NAMESPACE");
+@@ -1535,7 +1589,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     fn test_get_port_for_session_includes_namespace() {
+         let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
+         guard.remove("AGENT_BROWSER_NAMESPACE");
+diff --git a/cli/src/install.rs b/cli/src/install.rs
+index c69e5d2..08eda1d 100644
+--- a/cli/src/install.rs
++++ b/cli/src/install.rs
+@@ -797,6 +797,12 @@ fn which_exists(cmd: &str) -> bool {
+             .map(|s| s.success())
+             .unwrap_or(false)
+     }
++    // A sandbox has no package manager or browser to install.
++    #[cfg(target_os = "wasi")]
++    {
++        let _ = cmd;
++        false
++    }
+     #[cfg(windows)]
+     {
+         Command::new("where")
+diff --git a/cli/src/main.rs b/cli/src/main.rs
+index 9878fc1..8b8e6b7 100644
+--- a/cli/src/main.rs
++++ b/cli/src/main.rs
+@@ -955,7 +955,7 @@ fn write_dashboard_config(config: &DashboardConfig) -> std::io::Result<()> {
+         file.write_all(&contents)
+     }
+ 
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     {
+         fs::write(path, contents)
+     }
+diff --git a/cli/src/native/cdp/chrome.rs b/cli/src/native/cdp/chrome.rs
+index a397c90..4cd3bed 100644
+--- a/cli/src/native/cdp/chrome.rs
++++ b/cli/src/native/cdp/chrome.rs
+@@ -1765,6 +1765,12 @@ fn build_playwright_binary_path(chromium_dir: &Path) -> PathBuf {
+     chromium_dir.join("chrome-mac/Chromium.app/Contents/MacOS/Chromium")
+ }
+ 
++// No browser is launched from a sandbox; the Linux layout keeps the search total.
++#[cfg(target_os = "wasi")]
++fn build_playwright_binary_path(chromium_dir: &Path) -> PathBuf {
++    chromium_dir.join("chrome-linux/chrome")
++}
++
+ #[cfg(target_os = "windows")]
+ fn build_playwright_binary_path(chromium_dir: &Path) -> PathBuf {
+     chromium_dir.join("chrome-win/chrome.exe")
+diff --git a/cli/src/native/cdp/client.rs b/cli/src/native/cdp/client.rs
+index 97885a4..f7406c2 100644
+--- a/cli/src/native/cdp/client.rs
++++ b/cli/src/native/cdp/client.rs
+@@ -151,7 +151,9 @@ fn extract_command_id(msg: &str) -> Option<u64> {
+ 
+ pub struct CdpClient {
+     ws_tx: WsTx,
+-    socket: socket2::Socket,
++    // None under WASIX, where a duplicated socket stops the original one
++    // from seeing further reads.
++    socket: Option<socket2::Socket>,
+     closed: Arc<AtomicBool>,
+     close_complete: AtomicBool,
+     close_lock: Mutex<()>,
+@@ -243,9 +245,16 @@ impl CdpClient {
+         enable_tcp_keepalive(ws_stream.get_ref());
+         let tcp_stream = underlying_tcp_stream(ws_stream.get_ref())
+             .ok_or_else(|| "Unsupported CDP stream type".to_string())?;
+-        let socket = socket2::SockRef::from(tcp_stream)
+-            .try_clone()
+-            .map_err(|error| format!("Failed to duplicate CDP socket: {}", error))?;
++        let socket = if cfg!(target_os = "wasi") {
++            let _ = tcp_stream;
++            None
++        } else {
++            Some(
++                socket2::SockRef::from(tcp_stream)
++                    .try_clone()
++                    .map_err(|error| format!("Failed to duplicate CDP socket: {}", error))?,
++            )
++        };
+ 
+         let (ws_tx, mut ws_rx) = ws_stream.split();
+         let ws_tx = Arc::new(Mutex::new(ws_tx));
+@@ -458,7 +467,9 @@ impl CdpClient {
+         })
+         .await;
+ 
+-        let _ = self.socket.shutdown(Shutdown::Both);
++        if let Some(socket) = &self.socket {
++            let _ = socket.shutdown(Shutdown::Both);
++        }
+         Self::abort_task(&self.reader_handle).await;
+         self.pending.lock().await.clear();
+         self.close_complete.store(true, Ordering::SeqCst);
+@@ -670,6 +681,12 @@ impl InspectProxyHandle {
+ /// This is best-effort: failures are silently ignored since the WebSocket-level
+ /// Ping keepalive provides the primary connection liveness mechanism.
+ fn enable_tcp_keepalive(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>) {
++    // Under Wasmer, SO_KEEPALIVE makes reads on the socket fail with
++    // ETIMEDOUT, so the CDP reader dies on its first wait. The WebSocket
++    // Ping keepalive below still watches the connection.
++    if cfg!(target_os = "wasi") {
++        return;
++    }
+     let Some(tcp_stream) = underlying_tcp_stream(stream) else {
+         return;
+     };
+diff --git a/cli/src/native/daemon.rs b/cli/src/native/daemon.rs
+index 28689d2..ea41498 100644
+--- a/cli/src/native/daemon.rs
++++ b/cli/src/native/daemon.rs
+@@ -78,7 +78,7 @@ pub async fn run_daemon(session: &str) {
+         let _ = fs::remove_file(&socket_path);
+     }
+ 
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     {
+         let _ = fs::remove_file(socket_dir.join(format!("{}.port", session)));
+     }
+@@ -147,7 +147,7 @@ pub async fn run_daemon(session: &str) {
+     {
+         let _ = fs::remove_file(&socket_path);
+     }
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     {
+         let _ = fs::remove_file(socket_dir.join(format!("{}.port", session)));
+     }
+@@ -356,7 +356,7 @@ async fn run_socket_server(
+     Ok(())
+ }
+ 
+-#[cfg(windows)]
++#[cfg(any(windows, target_os = "wasi"))]
+ async fn run_socket_server(
+     socket_path: &PathBuf,
+     session: &str,
+@@ -373,16 +373,23 @@ async fn run_socket_server(
+     let preferred_port = get_port_for_session(session);
+     // Try the hash-derived port first; if it is blocked (e.g. Windows Hyper-V
+     // excluded port range), fall back to an OS-assigned ephemeral port.
+-    let listener = match TcpListener::bind(format!("127.0.0.1:{}", preferred_port)).await {
+-        Ok(l) => l,
+-        Err(_) => TcpListener::bind("127.0.0.1:0")
+-            .await
+-            .map_err(|e| format!("Failed to bind TCP: {}", e))?,
++    let (listener, bound_port) = match TcpListener::bind(format!("127.0.0.1:{}", preferred_port)).await {
++        Ok(l) => (l, preferred_port),
++        Err(_) => (
++            TcpListener::bind("127.0.0.1:0")
++                .await
++                .map_err(|e| format!("Failed to bind TCP: {}", e))?,
++            0,
++        ),
++    };
++    // Wasmer reports port 0 from local_addr() even after binding a fixed
++    // port, so fall back to the port that was asked for.
++    let actual_port = match listener.local_addr().map(|a| a.port()) {
++        Ok(port) if port != 0 => port,
++        _ if bound_port != 0 => bound_port,
++        Ok(_) => return Err("Failed to get local address: port 0".to_string()),
++        Err(e) => return Err(format!("Failed to get local address: {}", e)),
+     };
+-    let actual_port = listener
+-        .local_addr()
+-        .map_err(|e| format!("Failed to get local address: {}", e))?
+-        .port();
+ 
+     let socket_dir = socket_path.parent().unwrap_or(std::path::Path::new("."));
+     let port_path = socket_dir.join(format!("{}.port", session));
+@@ -654,7 +661,7 @@ async fn shutdown_signal() {
+         }
+     }
+ 
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     {
+         if let Err(e) = signal::ctrl_c().await {
+             let _ = writeln!(std::io::stderr(), "Failed to install Ctrl+C handler: {}", e);
+@@ -667,7 +674,7 @@ fn get_daemon_socket_dir() -> PathBuf {
+     crate::connection::get_socket_dir()
+ }
+ 
+-#[cfg(windows)]
++#[cfg(any(windows, target_os = "wasi"))]
+ fn get_port_for_session(session: &str) -> u16 {
+     crate::connection::get_port_for_session(session)
+ }
+@@ -764,7 +771,7 @@ mod tests {
+         ));
+     }
+ 
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     #[test]
+     fn test_port_matches_client_algorithm() {
+         let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
+diff --git a/cli/src/native/stream/http.rs b/cli/src/native/stream/http.rs
+index 394677d..c84593c 100644
+--- a/cli/src/native/stream/http.rs
++++ b/cli/src/native/stream/http.rs
+@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::sync::RwLock;
+ 
+ use crate::connection::get_socket_dir;
+-#[cfg(windows)]
++#[cfg(any(windows, target_os = "wasi"))]
+ use crate::connection::resolve_port;
+ 
+ use super::chat::{chat_status_json, handle_chat_request, handle_models_request};
+@@ -416,7 +416,7 @@ pub(super) async fn relay_command_to_daemon(
+             .map_err(|e| format!("Failed to connect to daemon: {}", e))?
+     };
+ 
+-    #[cfg(windows)]
++    #[cfg(any(windows, target_os = "wasi"))]
+     let stream = {
+         let port = resolve_port(session_name);
+         tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))

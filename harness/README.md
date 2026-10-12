@@ -23,6 +23,7 @@ does not, CDP has to be carried over a pipe, or the client has to run outside.
 | E4 | Can the sandbox reach the public internet at all? |
 | E5 | Can the sandbox complete a real HTTPS request? |
 | E6 | Does the **real engine** load and script a page inside the sandbox? |
+| E7 | Does **whb**, one process per command, drive the engine there? |
 
 Two WASIX modules are loaded into one sandbox as commands: `engine` is the real
 `wasm-headless-browser`, and `client` is `scripts/wasix-loopback-client.rs`,
@@ -36,6 +37,12 @@ engine over loopback and sends `Target.createTarget`, `Target.attachToTarget`,
 `Page.navigate` and `Runtime.evaluate`. The engine fetches the page through the
 WISP relay with TLS in the guest and runs its scripts in QuickJS, and the
 evaluated value comes back.
+
+E7 runs too when `whb.wasm` is served: `whb open`, `whb snapshot -i` and
+`whb eval`, each as its own command, as an agent in the sandbox would run
+them. They share the tab and the refs through a state file under
+`/workspace`: the SDK's sandbox filesystem, which every command sees. A
+command's `/tmp` is its own, and the SDK refuses paths outside `/workspace`.
 
 E4 and E5 are a different question from E0-E3, and need the WISP relay, because
 the browser sandbox has no direct network access. E4 opens a plain TCP
@@ -63,6 +70,14 @@ the link made by the page's external script, and `https://www.naver.com/` as
 `{"title":"NAVER","links":172}`. The whole NAVER run of `verify-harness.sh`,
 server and sandbox start included, took about 23 seconds; natively the page
 alone loads in about 4.7. The page load in the sandbox was not timed apart.
+
+E7 passes on `https://example.com/` (`title "Example Domain", 1 refs`). On
+`https://www.naver.com/` it fails, and not in whb: the engine dies loading
+NAVER a second time in one process, E6 having loaded it once. The Wasmer CLI
+shows why on the third load, a runtime panic in `thread_spawn`
+(`Errno::overflow`). The engine starts a thread per request and one with a
+32 MB stack per tab, and in a WASIX sandbox they run out after a few heavy
+pages. See the backlog.
 
 ## Running it
 

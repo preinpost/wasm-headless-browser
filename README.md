@@ -70,6 +70,22 @@ Not there yet: sticky positioning, text inside SVG, and pausing at the
 response stage. The WASIX module is 6.3 MB, the font
 1.15 MB and the SVG renderer 0.8 MB of it.
 
+### A client for the same sandbox
+
+`whb` (`crates/client`) drives the engine from inside the sandbox, where
+agent-browser does not yet run (see
+[`experiments/agent-browser`](experiments/agent-browser/README.md)). Its
+commands and output follow agent-browser's: `open`, `snapshot -i` with
+`@e3` refs, `click`, `fill` (placeholders included), `press`, `eval`, `get`,
+`screenshot`, `close`. Each command is its own process, as an agent runs
+them: the engine keeps the tab, and a small state file per session keeps the
+refs, so a ref is refused once the page it came from is gone. It is 273 KB as
+a WASIX module and uses blocking sockets only.
+
+`scripts/verify-client.sh` runs the login flow with it, natively and with
+both sides under Wasmer (`MODE=wasix`), and the harness runs it in the
+browser sandbox (E7).
+
 ## Why the shape is what it is
 
 **No rendering engine.** A headless browser for automation needs the DOM, a
@@ -116,6 +132,7 @@ crates/
                   (src/prelude/*.js).
   engine-fake/    M0 engine: fixed page model, accessibility projection, PNG encoder.
   browser/        The binary. Wires a transport to an engine, chosen with --engine.
+  client/         whb, a CDP client for the sandbox: agent-browser's commands, no daemon.
 docs/
   cdp-surface.md          The measured protocol surface, and what it implies.
   wasix.md                What the WASIX run proved, and how it was measured.
@@ -126,14 +143,16 @@ docs/
 experiments/
   quickjs/                Probe: QuickJS evaluating JavaScript inside WASIX.
   tls/                    Probe: rustls with ring inside WASIX.
+  agent-browser/          How far agent-browser got under WASIX, and the patch.
 vendor/rquickjs-sys/      QuickJS, patched; see vendor/README.md.
 tools/cdp-log-proxy/      The logging proxy used to take that capture.
 fixtures/                 Pages the M1 test serves, and fixtures/login, a login site.
-harness/                  Browser-sandbox experiments (E0-E5) and a runner page.
+harness/                  Browser-sandbox experiments (E0-E7) and a runner page.
 scripts/
   verify-m0.sh            M0 acceptance test, native or WASIX.
   verify-m1.sh            M1 acceptance test: fetch, parse, script, snapshot, click.
   verify-login.sh         Login with secrets, with leak checks.
+  verify-client.sh        The same login driven by whb, native or WASIX.
   compare-layout.sh       Lays a page out here and in Chrome and compares the boxes.
   make-font.sh            Rebuilds the embedded font subset.
   verify-harness.sh       Runs the browser-sandbox probes and judges them.
@@ -156,6 +175,17 @@ Then point any CDP client at it. With `agent-browser`:
 ```bash
 agent-browser --cdp http://127.0.0.1:9222 open https://example.com
 agent-browser --cdp http://127.0.0.1:9222 snapshot
+```
+
+Or with `whb`, which also runs as a WASIX module next to the engine:
+
+```bash
+./target/release/whb --cdp 9222 open https://example.com
+./target/release/whb --cdp 9222 snapshot -i
+
+# under Wasmer: each command its own run, sharing a mounted state directory
+wasmer run --net --volume /tmp/whb:/state --env WHB_STATE_DIR=/state \
+  target/wasm32-wasmer-wasi/release/whb.wasm -- --cdp 9222 snapshot -i
 ```
 
 A bare port (`--cdp 9222`) also works; `host:port` without a scheme does not.
@@ -201,10 +231,9 @@ The working log, with what was measured and what is left, is
 
 ## Open questions
 
-- **Does `@wasmer/sdk` share loopback with the host page?** Under the Wasmer CLI
-  it does, so a client outside the sandbox can reach the engine. The browser
-  sandbox is a different runtime and needs its own check. If it does not,
-  running both sides inside the sandbox is already known to work.
+- **Does `@wasmer/sdk` share loopback with the host page?** It does not need
+  to: the engine and its client share one sandbox (E1), and whb drives the
+  engine there (E7).
 - **How much of Playwright is reachable?** Playwright leans harder on page-side
   JavaScript than `agent-browser` does, so it needs a more complete engine.
 - **Do we compile QuickJS against the WASIX sysroot?** It currently builds with

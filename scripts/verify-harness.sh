@@ -57,23 +57,29 @@ if [[ ! -f "$BUILT" ]]; then
   echo "no WASIX build at $BUILT; run scripts/wasix-build.sh first" >&2
   exit 1
 fi
-if [[ ! -f "$HARNESS/public/engine.wasm" || ! -f "$HARNESS/public/loopback-client.wasm" \
+if [[ ! -f "$HARNESS/public/engine.wasm" || ! -f "$HARNESS/public/loopback-client.wasm" || ! -f "$HARNESS/public/whb.wasm" \
   || "$ROOT/scripts/wasix-loopback-client.rs" -nt "$HARNESS/public/loopback-client.wasm" ]]; then
   echo "building the WASIX probes"
   (cd "$HARNESS" && node copy-wasm.mjs)
-elif ! cmp -s "$BUILT" "$HARNESS/public/engine.wasm"; then
-  # Only copied when missing, the page would go on testing an old engine.
-  echo "refreshing public/engine.wasm from the WASIX build"
-  cp "$BUILT" "$HARNESS/public/engine.wasm"
+else
+  # Only copied when missing, the page would go on testing old modules.
+  for pair in "wasm-headless-browser.wasm:engine.wasm" "whb.wasm:whb.wasm"; do
+    built="$ROOT/target/wasm32-wasmer-wasi/release/${pair%%:*}"
+    served="$HARNESS/public/${pair##*:}"
+    if [[ -f "$built" ]] && ! cmp -s "$built" "$served"; then
+      echo "refreshing public/${pair##*:} from the WASIX build"
+      cp "$built" "$served"
+    fi
+  done
 fi
 echo "engine.wasm: $(wc -c <"$HARNESS/public/engine.wasm" | tr -d ' ') bytes"
 
 echo "starting wisp relay on 127.0.0.1:${WISP_PORT}"
-(cd "$HARNESS" && PORT="$WISP_PORT" node wisp-server.mjs) >/tmp/whb-wisp.log 2>&1 &
+(cd "$HARNESS" && PORT="$WISP_PORT" exec node wisp-server.mjs) >/tmp/whb-wisp.log 2>&1 &
 WISP_PID=$!
 
 echo "starting harness on 127.0.0.1:${PORT}"
-(cd "$HARNESS" && PORT="$PORT" node serve.mjs) >/tmp/whb-harness.log 2>&1 &
+(cd "$HARNESS" && PORT="$PORT" exec node serve.mjs) >/tmp/whb-harness.log 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 60); do
@@ -88,6 +94,7 @@ fi
 if [[ "$ENGINE_KIND" == "html" ]]; then
   PAGE="${PAGE}&page=${PAGE_URL}"
   EXPECTED+=("E6 real engine loads a page in the sandbox")
+  EXPECTED+=("E7 whb drives the engine in the sandbox")
 fi
 if [[ -n "$CURL_URL" ]]; then
   PAGE="${PAGE}&curl=${CURL_URL}"
@@ -99,9 +106,11 @@ agent-browser open "$PAGE" >/dev/null 2>&1 || true
 
 # Poll until the page reports it is done. The probes include a curl download, a
 # registry fetch and, for the real engine, a page load in the sandbox, so this
-# is not instant.
+# is not instant. The wait is by the clock, not by tries: one slow eval must
+# not stretch it without bound.
 RESULTS=""
-for _ in $(seq 1 240); do
+deadline=$((SECONDS + ${HARNESS_TIMEOUT:-300}))
+while ((SECONDS < deadline)); do
   if [[ "$(agent-browser eval "window.__harnessDone === true" 2>/dev/null || echo '')" == "true" ]]; then
     RESULTS="$(agent-browser eval "JSON.stringify(window.__harness)" 2>/dev/null || echo '')"
     break
