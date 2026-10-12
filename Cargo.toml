@@ -12,6 +12,7 @@ members = [
     "crates/engine-fake",
     "crates/engine",
     "crates/browser",
+    "crates/client",
 ]
 
 [workspace.package]
