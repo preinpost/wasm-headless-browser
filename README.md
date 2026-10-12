@@ -70,11 +70,20 @@ Not there yet: sticky positioning, text inside SVG, and pausing at the
 response stage. The WASIX module is 6.3 MB, the font
 1.15 MB and the SVG renderer 0.8 MB of it.
 
-### A client for the same sandbox
+### Clients in the same sandbox
 
-`whb` (`crates/client`) drives the engine from inside the sandbox, where
-agent-browser does not yet run (see
-[`experiments/agent-browser`](experiments/agent-browser/README.md)). Its
+The client has to run inside the sandbox too: the browser sandbox has no way
+in for a WebSocket (E3). Two do, both checked in the browser sandbox by the
+harness.
+
+**agent-browser itself**, patched for WASIX and built by
+`scripts/build-agent-browser-wasix.sh` (11.4 MB). Under WASIX the CLI cannot
+start its daemon, so whatever starts the engine starts the daemon too; see
+[`experiments/agent-browser`](experiments/agent-browser/README.md) for how,
+for the two patches, and for the bug in the WASIX fork of mio that one of
+them fixes.
+
+**`whb`** (`crates/client`), this repository's own. Its
 commands and output follow agent-browser's: `open`, `snapshot -i` with
 `@e3` refs, `click`, `fill` (placeholders included), `press`, `eval`, `get`,
 `screenshot`, `close`. Each command is its own process, as an agent runs
@@ -83,8 +92,8 @@ refs, so a ref is refused once the page it came from is gone. It is 273 KB as
 a WASIX module and uses blocking sockets only.
 
 `scripts/verify-client.sh` runs the login flow with it, natively and with
-both sides under Wasmer (`MODE=wasix`), and the harness runs it in the
-browser sandbox (E7).
+both sides under Wasmer (`MODE=wasix`). The harness runs whb (E7) and
+agent-browser (E8) in the browser sandbox.
 
 ## Why the shape is what it is
 
@@ -139,15 +148,16 @@ docs/
   quickjs.md              Why Context::full aborts, and the context setup that works.
   credentials.md          How secrets are typed and kept from the client, and the limits.
   backlog.md              What is measured, what is left, and what was decided against.
+  wasix-org-mio-patch/    A bug in the WASIX fork of mio: repro, patch, issue to file.
   capture/                Raw frames and expressions from a real Chrome session.
 experiments/
   quickjs/                Probe: QuickJS evaluating JavaScript inside WASIX.
   tls/                    Probe: rustls with ring inside WASIX.
-  agent-browser/          How far agent-browser got under WASIX, and the patch.
+  agent-browser/          agent-browser under WASIX: its patches, and the mio fix.
 vendor/rquickjs-sys/      QuickJS, patched; see vendor/README.md.
 tools/cdp-log-proxy/      The logging proxy used to take that capture.
 fixtures/                 Pages the M1 test serves, and fixtures/login, a login site.
-harness/                  Browser-sandbox experiments (E0-E7) and a runner page.
+harness/                  Browser-sandbox experiments (E0-E8) and a runner page.
 scripts/
   verify-m0.sh            M0 acceptance test, native or WASIX.
   verify-m1.sh            M1 acceptance test: fetch, parse, script, snapshot, click.
@@ -157,7 +167,9 @@ scripts/
   make-font.sh            Rebuilds the embedded font subset.
   verify-harness.sh       Runs the browser-sandbox probes and judges them.
   harness-stop.sh         Frees the harness ports if a manual run was abandoned.
-  wasix-build.sh          Builds the WASIX module.
+  wasix-build.sh          Builds the WASIX modules: the engine and whb.
+  build-agent-browser-wasix.sh  Builds agent-browser for WASIX with its patches.
+  lib/llvm-ar.sh          Finds an llvm-ar that can archive wasm objects.
   wasix-run.sh            Runs it under Wasmer with networking enabled.
   wasix-netprobe.rs       Isolated probe for the loopback question.
   wasix-loopback-client.rs  Sandbox-side HTTP client, used for loopback and egress.
@@ -232,8 +244,8 @@ The working log, with what was measured and what is left, is
 ## Open questions
 
 - **Does `@wasmer/sdk` share loopback with the host page?** It does not need
-  to: the engine and its client share one sandbox (E1), and whb drives the
-  engine there (E7).
+  to: the engine and its client share one sandbox (E1), and whb and
+  agent-browser drive the engine there (E7, E8).
 - **How much of Playwright is reachable?** Playwright leans harder on page-side
   JavaScript than `agent-browser` does, so it needs a more complete engine.
 - **Do we compile QuickJS against the WASIX sysroot?** It currently builds with

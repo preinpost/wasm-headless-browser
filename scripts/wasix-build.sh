@@ -48,63 +48,27 @@ WASIX_FORKS=(libc cc ring getrandom)
 
 TARGET_DIR="$ROOT/target/wasm32-wasmer-wasi/release"
 
-# The directory of an `llvm-ar` that can archive wasm objects, or nothing.
-# In order: wasi-sdk (also what rquickjs-sys reads), PATH, rustup's
-# llvm-tools, Homebrew's LLVM, and last the wasi-sdk that rquickjs-sys
-# fetched into this target directory for QuickJS.
-find_llvm_archiver() {
-  local candidates=()
-  [[ -n "${WASI_SDK:-}" ]] && candidates+=("$WASI_SDK/bin")
-  [[ -n "${WASI_SDK_PATH:-}" ]] && candidates+=("$WASI_SDK_PATH/bin")
-  if command -v llvm-ar >/dev/null 2>&1; then
-    candidates+=("$(dirname "$(command -v llvm-ar)")")
-  fi
-  local sysroot host
-  if sysroot="$(rustc --print sysroot 2>/dev/null)" && host="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"; then
-    candidates+=("$sysroot/lib/rustlib/$host/bin")
-  fi
-  candidates+=(/opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin)
-  local fetched
-  fetched="$(ls -td "$TARGET_DIR"/build/rquickjs-sys-*/out/wasi-sdk/bin 2>/dev/null | head -1 || true)"
-  [[ -n "$fetched" ]] && candidates+=("$fetched")
-  local dir
-  for dir in "${candidates[@]}"; do
-    if [[ -x "$dir/llvm-ar" ]]; then
-      echo "$dir"
-      return
-    fi
-  done
-}
+# shellcheck source=lib/llvm-ar.sh
+source "$ROOT/scripts/lib/llvm-ar.sh"
 
 cargo wasix init >/dev/null
 cargo update --quiet "${WASIX_FORKS[@]/#/-p}"
 
 # An archiver the caller chose is used as it is.
 if [[ -z "${AR_wasm32_wasmer_wasi:-}" ]]; then
-  llvm_bin="$(find_llvm_archiver)"
+  llvm_bin="$(find_llvm_archiver "$TARGET_DIR")"
   if [[ -z "$llvm_bin" ]]; then
     # A clean build fetches wasi-sdk for QuickJS anyway; fetch it first and
     # use its llvm-ar for the rest of the C code too.
     echo "no wasm-capable llvm-ar found; fetching wasi-sdk through rquickjs-sys" >&2
     cargo wasix build --release -p rquickjs-sys >/dev/null
-    llvm_bin="$(find_llvm_archiver)"
+    llvm_bin="$(find_llvm_archiver "$TARGET_DIR")"
   fi
   if [[ -z "$llvm_bin" ]]; then
-    cat >&2 <<'EOF'
-no llvm-ar that understands wasm objects was found. Any one of these works:
-  WASI_SDK=/path/to/wasi-sdk-24 scripts/wasix-build.sh
-  rustup component add llvm-tools
-  brew install llvm
-EOF
+    echo "$LLVM_AR_HELP" >&2
     exit 1
   fi
-  export AR_wasm32_wasmer_wasi="$llvm_bin/llvm-ar"
-  if [[ -x "$llvm_bin/llvm-ranlib" ]]; then
-    export RANLIB_wasm32_wasmer_wasi="$llvm_bin/llvm-ranlib"
-  else
-    export RANLIB_wasm32_wasmer_wasi="$llvm_bin/llvm-ar s"
-  fi
-  echo "archiving C code with $AR_wasm32_wasmer_wasi" >&2
+  use_llvm_archiver "$llvm_bin"
 fi
 
 # ring's build script does not rerun when the archiver changes, so an archive

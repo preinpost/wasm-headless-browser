@@ -24,6 +24,7 @@ does not, CDP has to be carried over a pipe, or the client has to run outside.
 | E5 | Can the sandbox complete a real HTTPS request? |
 | E6 | Does the **real engine** load and script a page inside the sandbox? |
 | E7 | Does **whb**, one process per command, drive the engine there? |
+| E8 | Does **agent-browser** itself, patched for WASIX, drive it there? |
 
 Two WASIX modules are loaded into one sandbox as commands: `engine` is the real
 `wasm-headless-browser`, and `client` is `scripts/wasix-loopback-client.rs`,
@@ -43,6 +44,13 @@ E7 runs too when `whb.wasm` is served: `whb open`, `whb snapshot -i` and
 them. They share the tab and the refs through a state file under
 `/workspace`: the SDK's sandbox filesystem, which every command sees. A
 command's `/tmp` is its own, and the SDK refuses paths outside `/workspace`.
+
+E8 runs when `public/agent-browser.wasm` is served, which `verify-harness.sh`
+does for `AGENT_BROWSER_WASM=<path>` (build it with
+`../scripts/build-agent-browser-wasix.sh`). The page starts agent-browser's
+daemon as it starts the engine, since the CLI cannot spawn it under WASIX, and
+then runs `agent-browser open`, `snapshot -i` and `eval` as separate commands.
+See [`../experiments/agent-browser`](../experiments/agent-browser/README.md).
 
 E4 and E5 are a different question from E0-E3, and need the WISP relay, because
 the browser sandbox has no direct network access. E4 opens a plain TCP
@@ -79,6 +87,9 @@ shows why on the third load, a runtime panic in `thread_spawn`
 32 MB stack per tab, and in a WASIX sandbox they run out after a few heavy
 pages. See the backlog.
 
+E8 passes on `https://example.com/` (2026-10-12): agent-browser 0.38.2 with
+both patches, 11.4 MB, in the browser sandbox.
+
 ## Running it
 
 The easy way drives and judges everything:
@@ -88,6 +99,8 @@ The easy way drives and judges everything:
 OUTBOUND=login.example.com:443 CURL=https://login.example.com/ ../scripts/verify-harness.sh
 ENGINE=html ../scripts/verify-harness.sh                      # adds E6
 ENGINE=html PAGE_URL=https://www.naver.com/ ../scripts/verify-harness.sh
+ENGINE=html AGENT_BROWSER_WASM=../target/agent-browser-wasix/agent-browser.wasm \
+  ../scripts/verify-harness.sh                                 # adds E8
 ```
 
 It starts the harness and the WISP relay, refreshes `public/engine.wasm` when

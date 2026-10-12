@@ -60,11 +60,14 @@ async function main() {
   }
 
   const wasmer = new Wasmer()
-  const [engineBytes, clientBytes, whbBytes] = await Promise.all([
+  const [engineBytes, clientBytes, whbBytes, agentBrowserBytes] = await Promise.all([
     fetch('/engine.wasm').then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)),
     fetch('/loopback-client.wasm').then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)),
     // Optional: an older public/ may not have it, and E7 is then skipped.
     fetch('/whb.wasm').then((r) => (r.ok ? r.arrayBuffer().then((b) => new Uint8Array(b)) : null)),
+    // Optional, and not built here: agent-browser patched for WASIX
+    // (experiments/agent-browser). E8 runs only when it is served.
+    fetch('/agent-browser.wasm').then((r) => (r.ok ? r.arrayBuffer().then((b) => new Uint8Array(b)) : null)),
   ])
   log(
     `engine.wasm ${engineBytes.byteLength} bytes, loopback-client.wasm ${clientBytes.byteLength} bytes` +
@@ -76,6 +79,11 @@ async function main() {
   if (whbBytes) {
     modules.whb = whbBytes
     commands.whb = { module: 'whb' }
+  }
+  if (agentBrowserBytes) {
+    log(`agent-browser.wasm ${agentBrowserBytes.byteLength} bytes`)
+    modules['agent-browser'] = agentBrowserBytes
+    commands['agent-browser'] = { module: 'agent-browser' }
   }
   const pkg = await wasmer.packages.create({ modules, commands })
   log(`package ${pkg.id}; commands=${JSON.stringify(pkg.commands ?? {})}`)
@@ -275,6 +283,54 @@ async function main() {
       )
     } catch (e) {
       record('E7 whb drives the engine in the sandbox', false, e?.message ?? String(e))
+    }
+  }
+
+  // ---- E8: agent-browser itself, as pi in a page would run it -----------
+  // The page starts agent-browser's daemon, as it starts the engine: under
+  // WASIX the CLI cannot spawn it (no current_exe). Each CLI command is then
+  // its own process, finding the daemon through files under /workspace.
+  if (engineKind === 'html' && agentBrowserBytes) {
+    const dir = '/workspace/.agent-browser'
+    const env = { HOME: '/workspace', AGENT_BROWSER_SOCKET_DIR: dir, AGENT_BROWSER_SESSION: 'pi' }
+    const ab = async (...args) => {
+      const out = await sandbox
+        .command('agent-browser', ['--cdp', `http://127.0.0.1:${port}`, ...args], { env })
+        .run({ timeoutMs: 90_000, check: false })
+      const text = (out.stdout?.text?.() ?? '') + (out.stderr?.text?.() ?? '')
+      for (const line of text.split('\n')) if (line.trim()) log(`  [ab ${args[0]}] ${line}`)
+      return text
+    }
+    try {
+      await sandbox.fs.mkdir(dir, { recursive: true })
+      const daemon = await sandbox
+        .command('agent-browser', [], { env: { ...env, AGENT_BROWSER_DAEMON: '1', AGENT_BROWSER_DEBUG: '1' } })
+        .spawn({})
+      void (async () => {
+        for await (const line of daemon.stderr.lines()) if (line.trim()) log(`  [ab daemon!] ${line}`)
+      })().catch(() => {})
+      let port = ''
+      for (let i = 0; i < 100 && !port; i++) {
+        port = await sandbox.fs.readText(`${dir}/pi.port`).then((t) => t.trim(), () => '')
+        if (!port) await sleep(100)
+      }
+      log(`  [ab] daemon port file: ${port || 'never written'}`)
+      if (!port) {
+        record('E8 agent-browser drives the engine in the sandbox', false, 'the daemon never wrote its port file')
+      } else {
+        const opened = await ab('open', pageUrl)
+        const snapshot = opened.startsWith('\u2713') ? await ab('snapshot', '-i') : ''
+        const title = snapshot ? await ab('eval', 'document.title') : ''
+        const refs = (snapshot.match(/ref=e\d+/g) ?? []).length
+        const ok = opened.startsWith('\u2713') && refs > 0 && /^".*"\s*$/.test(title.trim())
+        record(
+          'E8 agent-browser drives the engine in the sandbox',
+          ok,
+          ok ? `title ${title.trim()}, ${refs} refs` : [opened, snapshot, title].join(' | ').slice(0, 300),
+        )
+      }
+    } catch (e) {
+      record('E8 agent-browser drives the engine in the sandbox', false, e?.message ?? String(e))
     }
   }
 

@@ -10,6 +10,9 @@
 #   ENGINE=html ./scripts/verify-harness.sh        # the real engine, which also
 #                                                  # loads a page (E6)
 #   ENGINE=html PAGE_URL=https://example.org/ ./scripts/verify-harness.sh
+#   ENGINE=html AGENT_BROWSER_WASM=path/to/agent-browser.wasm ./scripts/verify-harness.sh
+#                                                  # adds E8: agent-browser patched
+#                                                  # for WASIX (experiments/agent-browser)
 #
 # Requirements: the harness dependencies installed (cd harness && npm install),
 # a WASIX build present, and Chrome reachable by agent-browser. The SDK needs
@@ -73,6 +76,13 @@ else
   done
 fi
 echo "engine.wasm: $(wc -c <"$HARNESS/public/engine.wasm" | tr -d ' ') bytes"
+# agent-browser is served only when asked for, so ordinary runs stay as they were.
+if [[ -n "${AGENT_BROWSER_WASM:-}" ]]; then
+  cp "$AGENT_BROWSER_WASM" "$HARNESS/public/agent-browser.wasm"
+  echo "agent-browser.wasm: $(wc -c <"$HARNESS/public/agent-browser.wasm" | tr -d ' ') bytes"
+else
+  rm -f "$HARNESS/public/agent-browser.wasm"
+fi
 
 echo "starting wisp relay on 127.0.0.1:${WISP_PORT}"
 (cd "$HARNESS" && PORT="$WISP_PORT" exec node wisp-server.mjs) >/tmp/whb-wisp.log 2>&1 &
@@ -95,6 +105,7 @@ if [[ "$ENGINE_KIND" == "html" ]]; then
   PAGE="${PAGE}&page=${PAGE_URL}"
   EXPECTED+=("E6 real engine loads a page in the sandbox")
   EXPECTED+=("E7 whb drives the engine in the sandbox")
+  [[ -n "${AGENT_BROWSER_WASM:-}" ]] && EXPECTED+=("E8 agent-browser drives the engine in the sandbox")
 fi
 if [[ -n "$CURL_URL" ]]; then
   PAGE="${PAGE}&curl=${CURL_URL}"
@@ -158,6 +169,9 @@ done
 
 echo
 if ((fail > 0)); then
+  echo "the page log, last lines:"
+  agent-browser eval "document.getElementById('log').textContent" 2>/dev/null \
+    | python3 -c 'import json,sys; t=sys.stdin.read(); t=json.loads(t) if t.strip().startswith("\"") else t; print("\n".join(t.splitlines()[-40:]))' || true
   echo "HARNESS FAILED: ${pass} passed, ${fail} failed"
   exit 1
 fi
