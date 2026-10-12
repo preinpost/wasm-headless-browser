@@ -25,6 +25,7 @@ does not, CDP has to be carried over a pipe, or the client has to run outside.
 | E6 | Does the **real engine** load and script a page inside the sandbox? |
 | E7 | Does **whb**, one process per command, drive the engine there? |
 | E8 | Does **agent-browser** itself, patched for WASIX, drive it there? |
+| E9 | Do repeated loads in the same engine still navigate and evaluate? |
 
 Two WASIX modules are loaded into one sandbox as commands: `engine` is the real
 `wasm-headless-browser`, and `client` is `scripts/wasix-loopback-client.rs`,
@@ -79,16 +80,23 @@ the link made by the page's external script, and `https://www.naver.com/` as
 server and sandbox start included, took about 23 seconds; natively the page
 alone loads in about 4.7. The page load in the sandbox was not timed apart.
 
-E7 passes on `https://example.com/` (`title "Example Domain", 1 refs`). On
-`https://www.naver.com/` it fails, and not in whb: the engine dies loading
-NAVER a second time in one process, E6 having loaded it once. The Wasmer CLI
-shows why on the third load, a runtime panic in `thread_spawn`
-(`Errno::overflow`). The engine starts a thread per request and one with a
-32 MB stack per tab, and in a WASIX sandbox they run out after a few heavy
-pages. See the backlog.
+E7 and E8 pass on both the small page and NAVER (2026-10-12). E8 uses
+agent-browser 0.38.2 with both patches, 11.4 MB, in the browser sandbox.
 
-E8 passes on `https://example.com/` (2026-10-12): agent-browser 0.38.2 with
-both patches, 11.4 MB, in the browser sandbox.
+Repeated heavy loads initially failed: a third load under the Wasmer CLI
+panicked in `thread_spawn` (`Errno::overflow`), and a second in the browser
+killed the engine. Fetches now reuse twelve process-wide workers (six per
+host), rather than starting a thread for each request, including waiters.
+That exposed another memory problem: computed styles copied thousands of
+inherited CSS variables into every element and pseudo-element. The custom
+property map and its immutable strings are now shared. Script threads still
+use 32 MB stacks, reused across navigations.
+
+With `LOADS=10`, E9 keeps one tab and WebSocket, navigating and evaluating
+after each load. NAVER passes E6, E7, E8 and those ten extra loads in the
+same engine (eight checks in all); allocated linear memory at the end of
+the final verification run was 339.2 MiB. This is allocated linear memory, which cannot
+shrink, not the live heap. `RESOURCES=1` prints it and QuickJS usage.
 
 ## Running it
 
@@ -98,7 +106,7 @@ The easy way drives and judges everything:
 ../scripts/verify-harness.sh
 OUTBOUND=login.example.com:443 CURL=https://login.example.com/ ../scripts/verify-harness.sh
 ENGINE=html ../scripts/verify-harness.sh                      # adds E6
-ENGINE=html PAGE_URL=https://www.naver.com/ ../scripts/verify-harness.sh
+ENGINE=html LOADS=10 RESOURCES=1 PAGE_URL=https://www.naver.com/ ../scripts/verify-harness.sh
 ENGINE=html AGENT_BROWSER_WASM=../target/agent-browser-wasix/agent-browser.wasm \
   ../scripts/verify-harness.sh                                 # adds E8
 ```
@@ -137,7 +145,10 @@ Query parameters:
 - `curl` — the E5 URL.
 - `engine` — passed to the binary as `--engine`; unset starts its default, the
   M0 fake engine. `html` starts the real engine and runs E6.
-- `page` — the page E6 loads, default `https://example.com/`.
+- `page` — the page E6–E9 load, default `https://example.com/`.
+- `loads` — additional navigations in E9; greater than 1 enables it. `LOADS` in the runner.
+- `resources=1` — guest resource tracing; `RESOURCES=1` in the runner. Reports
+  allocated linear memory and QuickJS usage without logging page content.
 
 ## Notes
 

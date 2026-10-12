@@ -13,6 +13,8 @@
 #   ENGINE=html AGENT_BROWSER_WASM=path/to/agent-browser.wasm ./scripts/verify-harness.sh
 #                                                  # adds E8: agent-browser patched
 #                                                  # for WASIX (experiments/agent-browser)
+#   ENGINE=html LOADS=10 RESOURCES=1 PAGE_URL=https://example.org/ ./scripts/verify-harness.sh
+#                                                  # adds E9 and resource tracing
 #
 # Requirements: the harness dependencies installed (cd harness && npm install),
 # a WASIX build present, and Chrome reachable by agent-browser. The SDK needs
@@ -102,10 +104,11 @@ if [[ -n "$ENGINE_KIND" ]]; then
   PAGE="${PAGE}&engine=${ENGINE_KIND}"
 fi
 if [[ "$ENGINE_KIND" == "html" ]]; then
-  PAGE="${PAGE}&page=${PAGE_URL}"
+  PAGE="${PAGE}&page=${PAGE_URL}&resources=${RESOURCES:-0}&loads=${LOADS:-1}"
   EXPECTED+=("E6 real engine loads a page in the sandbox")
   EXPECTED+=("E7 whb drives the engine in the sandbox")
   [[ -n "${AGENT_BROWSER_WASM:-}" ]] && EXPECTED+=("E8 agent-browser drives the engine in the sandbox")
+  if ((${LOADS:-1} > 1)); then EXPECTED+=("E9 repeated page loads keep the engine alive"); fi
 fi
 if [[ -n "$CURL_URL" ]]; then
   PAGE="${PAGE}&curl=${CURL_URL}"
@@ -134,6 +137,11 @@ if [[ -z "$RESULTS" ]]; then
   agent-browser eval "document.getElementById('log').textContent" 2>&1 | tail -20 >&2 || true
   echo "FAILED: harness did not finish" >&2
   exit 1
+fi
+
+if [[ "${RESOURCES:-0}" == 1 ]]; then
+  agent-browser eval "document.getElementById('log').textContent" 2>/dev/null \
+    | python3 -c 'import json,sys; t=json.loads(sys.stdin.read()); print("\n".join(line for line in t.splitlines() if "[resources]" in line))' || true
 fi
 
 echo "results"
@@ -171,7 +179,7 @@ echo
 if ((fail > 0)); then
   echo "the page log, last lines:"
   agent-browser eval "document.getElementById('log').textContent" 2>/dev/null \
-    | python3 -c 'import json,sys; t=sys.stdin.read(); t=json.loads(t) if t.strip().startswith("\"") else t; print("\n".join(t.splitlines()[-40:]))' || true
+    | python3 -c 'import json,sys; t=sys.stdin.read(); t=json.loads(t) if t.strip().startswith("\"") else t; print("\n".join(t.splitlines()[-200:]))' || true
   echo "HARNESS FAILED: ${pass} passed, ${fail} failed"
   exit 1
 fi

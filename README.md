@@ -156,12 +156,13 @@ experiments/
 vendor/rquickjs-sys/      QuickJS, patched; see vendor/README.md.
 tools/cdp-log-proxy/      The logging proxy used to take that capture.
 fixtures/                 Pages the M1 test serves, and fixtures/login, a login site.
-harness/                  Browser-sandbox experiments (E0-E8) and a runner page.
+harness/                  Browser-sandbox experiments (E0-E9) and a runner page.
 scripts/
   verify-m0.sh            M0 acceptance test, native or WASIX.
   verify-m1.sh            M1 acceptance test: fetch, parse, script, snapshot, click.
   verify-login.sh         Login with secrets, with leak checks.
   verify-client.sh        The same login driven by whb, native or WASIX.
+  verify-loads.sh         Repeated heavy loads and large CSS themes, native or WASIX.
   compare-layout.sh       Lays a page out here and in Chrome and compares the boxes.
   make-font.sh            Rebuilds the embedded font subset.
   verify-harness.sh       Runs the browser-sandbox probes and judges them.

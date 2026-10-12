@@ -23,7 +23,10 @@ use crate::select::{self, Context, Selector, Simple};
 /// One element's computed style.
 #[derive(Debug, Clone, Default)]
 pub struct ComputedStyle {
-    props: HashMap<String, String>,
+    props: HashMap<String, Arc<str>>,
+    // A theme can define thousands of custom properties at its root. Share
+    // the entire map through inheritance and render copies, not just values.
+    custom: Arc<HashMap<Arc<str>, Arc<str>>>,
     /// Winning author declarations, even when they reset to initial values.
     authored: HashSet<String>,
 }
@@ -31,21 +34,27 @@ pub struct ComputedStyle {
 impl ComputedStyle {
     /// The computed value, or the property's initial value.
     pub fn get(&self, name: &str) -> &str {
-        self.props.get(name).map(String::as_str).unwrap_or_else(|| initial_value(name))
+        let value = if name.starts_with("--") { self.custom.get(name) } else { self.props.get(name) };
+        value.map(AsRef::as_ref).unwrap_or_else(|| initial_value(name))
     }
 
     /// Every property set on or inherited by this element.
     pub fn properties(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.props.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+        self.props.iter().map(|(k, v)| (k.as_str(), v.as_ref()))
+            .chain(self.custom.iter().map(|(k, v)| (k.as_ref(), v.as_ref())))
     }
 
     pub(crate) fn inherited_text(&self) -> Self {
         Self { props: self.props.iter().filter(|(n, _)| INHERITED.contains(&n.as_str()))
-            .map(|(n,v)| (n.clone(),v.clone())).collect(), authored: HashSet::new() }
+            .map(|(n,v)| (n.clone(),v.clone())).collect(), custom: Arc::default(), authored: HashSet::new() }
     }
 
     pub(crate) fn with_value(mut self, name: &str, value: &str) -> Self {
-        self.props.insert(name.to_string(), value.to_string());
+        if name.starts_with("--") {
+            Arc::make_mut(&mut self.custom).insert(Arc::from(name), Arc::from(value));
+        } else {
+            self.props.insert(name.to_string(), Arc::from(value));
+        }
         self
     }
 
@@ -422,28 +431,34 @@ fn cascade(
     }
 
     // Inherited properties and custom properties start from the parent.
-    let mut props: HashMap<String, String> = HashMap::new();
+    let mut props: HashMap<String, Arc<str>> = HashMap::new();
     if let Some(parent) = parent {
-        for (name, value) in parent.properties() {
-            if name.starts_with("--") || INHERITED.contains(&name) {
-                props.insert(name.to_string(), value.to_string());
+        for (name, value) in &parent.props {
+            if INHERITED.contains(&name.as_str()) {
+                props.insert(name.clone(), Arc::clone(value));
             }
         }
     }
 
-    // Resolve the complete dependency graph before using or inheriting
-    // custom values. An alias may refer to a declaration that sorts later.
-    let custom = resolve_custom_properties(&specified, &props);
-    for (name, value) in custom {
-        props.remove(&name);
-        if let Some(value) = value {
-            props.insert(name, value);
+    // Most elements do not redefine theme variables. Sharing the map avoids
+    // millions of entries across elements and their ::before/::after styles.
+    let mut custom = parent.map(|p| Arc::clone(&p.custom)).unwrap_or_default();
+    if specified.keys().any(|name| name.starts_with("--")) {
+        // Resolve all dependencies against the parent's values before applying
+        // local declarations; an alias may refer to one that sorts later.
+        let resolved = resolve_custom_properties(&specified, &custom);
+        let values = Arc::make_mut(&mut custom);
+        for (name, value) in resolved {
+            values.remove(name.as_str());
+            if let Some(value) = value {
+                values.insert(Arc::from(name), value);
+            }
         }
     }
 
     let parent_font = parent.map(ComputedStyle::font_size).unwrap_or(16.0);
     for (name, value) in specified.iter().filter(|(n, _)| !n.starts_with("--")) {
-        let Some(value) = substitute_vars(value, &mut |name| props.get(name).cloned()) else {
+        let Some(value) = substitute_vars(value, &mut |name| custom.get(name).map(|v| v.to_string())) else {
             // Invalid at computed-value time: inherit, or use the initial
             // value, rather than keeping an empty colour or an earlier rule.
             if !INHERITED.contains(&name.as_str()) {
@@ -454,7 +469,7 @@ fn cascade(
         let keyword = value.trim().to_ascii_lowercase();
         let inherits = INHERITED.contains(&name.as_str());
         match keyword.as_str() {
-            "inherit" => match parent.map(|p| p.get(name).to_string()) {
+            "inherit" => match parent.map(|p| p.props.get(name).cloned().unwrap_or_else(|| Arc::from(p.get(name)))) {
                 Some(v) => {
                     props.insert(name.clone(), v);
                 }
@@ -472,15 +487,15 @@ fn cascade(
             }
             _ if name == "font-size" => {
                 if let Some(px) = font_size_px(&keyword, parent_font, root_font.get()) {
-                    props.insert(name.clone(), format!("{px}px"));
+                    props.insert(name.clone(), format!("{px}px").into());
                 }
             }
             _ => {
-                props.insert(name.clone(), value.trim().to_string());
+                props.insert(name.clone(), Arc::from(value.trim()));
             }
         }
     }
-    ComputedStyle { props, authored }
+    ComputedStyle { props, custom, authored }
 }
 
 /// Resolves local custom properties against already-computed inherited
@@ -489,17 +504,17 @@ fn cascade(
 /// property can still recover with a fallback.
 fn resolve_custom_properties(
     specified: &HashMap<String, String>,
-    inherited: &HashMap<String, String>,
-) -> HashMap<String, Option<String>> {
+    inherited: &HashMap<Arc<str>, Arc<str>>,
+) -> HashMap<String, Option<Arc<str>>> {
     struct Resolver<'a> {
         raw: HashMap<&'a str, &'a str>,
-        inherited: &'a HashMap<String, String>,
-        resolved: HashMap<String, Option<String>>,
+        inherited: &'a HashMap<Arc<str>, Arc<str>>,
+        resolved: HashMap<String, Option<Arc<str>>>,
         stack: Vec<String>,
         invalid: HashSet<String>,
     }
     impl Resolver<'_> {
-        fn resolve(&mut self, name: &str) -> Option<String> {
+        fn resolve(&mut self, name: &str) -> Option<Arc<str>> {
             if let Some(value) = self.resolved.get(name) {
                 return value.clone();
             }
@@ -522,7 +537,7 @@ fn resolve_custom_properties(
                 match value.trim() {
                     "initial" => None,
                     "inherit" | "unset" | "revert" | "revert-layer" => self.inherited.get(name).cloned(),
-                    _ => substitute_vars(value, &mut |dependency| self.resolve(dependency)),
+                    _ => substitute_vars(value, &mut |dependency| self.resolve(dependency).map(|v| v.to_string())).map(Arc::from),
                 }
             };
             self.stack.pop();
@@ -981,6 +996,48 @@ mod tests {
         assert_eq!(svg.get("fill"), "green");
         assert_eq!(path.get("fill"), "green");
         assert_eq!(path.get("stroke"), "red");
+    }
+
+    #[test]
+    fn large_inherited_values_and_style_copies_share_storage() {
+        let value = format!("url(data:image/svg+xml,{})", "x".repeat(64 * 1024));
+        let (doc, s) = styles(
+            "<div id='d'><span id='s'></span><span id='override'></span></div>",
+            &format!("#d {{ --image: {value}; color: teal }} #override {{ --image: none }}"),
+        );
+        let parent = s.get(by_id(&doc, "d")).unwrap();
+        let child = s.get(by_id(&doc, "s")).unwrap();
+        assert_eq!(child.get("--image"), value);
+        assert!(Arc::ptr_eq(&parent.custom, &child.custom));
+        assert_eq!(parent.get("--image").as_ptr(), child.get("--image").as_ptr());
+        let copy = child.clone();
+        assert!(Arc::ptr_eq(&child.custom, &copy.custom));
+        assert_eq!(child.get("--image").as_ptr(), copy.get("--image").as_ptr());
+        assert_eq!(parent.get("color").as_ptr(), child.get("color").as_ptr());
+        assert_eq!(s.get(by_id(&doc, "override")).unwrap().get("--image"), "none");
+        assert_eq!(parent.get("--image"), value, "overriding a child cannot change its parent");
+    }
+
+    #[test]
+    fn a_large_theme_is_shared_by_elements_and_pseudos() {
+        let mut sheet = String::from(":root {");
+        for n in 0..1600 {
+            sheet.push_str(&format!("--theme-token-{n}: value-{n};"));
+        }
+        sheet.push_str("} span::before { content: none }");
+        let (doc, styles) = styles(&"<span>theme</span>".repeat(100), &sheet);
+        let root = doc.descendants(doc.document_id()).find(|id| doc.is_tag(*id, "html")).unwrap();
+        let theme = &styles.get(root).unwrap().custom;
+        assert_eq!(theme.len(), 1600);
+        for id in doc.descendants(doc.document_id()).filter(|id| doc.is_element(*id)) {
+            let style = styles.get(id).unwrap();
+            assert!(Arc::ptr_eq(theme, &style.custom));
+            assert_eq!(style.get("--theme-token-1599"), "value-1599");
+            assert!(style.properties().any(|(n, v)| n == "--theme-token-0" && v == "value-0"));
+            for name in ["before", "after"] {
+                assert!(Arc::ptr_eq(theme, &styles.pseudo(id, name).unwrap().custom));
+            }
+        }
     }
 
     #[test]

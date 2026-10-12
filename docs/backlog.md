@@ -11,7 +11,9 @@
 네이버에서 누락되던 인라인 SVG 로고를 수정했다(M1.5c). 클리핑·의사 요소·인라인 배치를 넣었다(M1.4c).
 macOS에서 깨지던 WASIX 빌드를 고쳤다(§6). 브라우저 샌드박스 안에서 실제 엔진이 페이지를
 불러오는 것까지 확인했다(E6, §2). 샌드박스 안 클라이언트 `whb`를 넣었고(E7), agent-browser도
-패치해 브라우저 샌드박스에서 돌렸다(E8, §5). 다음 후보는 §0.4.
+패치해 브라우저 샌드박스에서 돌렸다(E8, §5). 무거운 페이지 반복 로드도 검증했다(E9).
+다운로드 스레드를 프로세스 공용 풀로 재사용하고, 상속된 CSS 변수 맵을 공유해 스택과
+계산 스타일의 메모리 증가를 줄였다(§6). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -55,7 +57,9 @@ M1 50개, 로그인 35개를 다시 통과했다. WASIX에서도 M0 16개, 로�
 |---|---|
 | `ENGINE=html AGENT_BROWSER_WASM=target/agent-browser-wasix/agent-browser.wasm ./scripts/verify-harness.sh` | 브라우저 샌드박스 E0·E1·E2·E4·E6·E7·E8, 7개 (2026-10-12). 모듈은 `scripts/build-agent-browser-wasix.sh`로 만든다 |
 | `./scripts/verify-client.sh`, `MODE=wasix ./scripts/verify-client.sh` | `whb`로 로그인 흐름, 31개씩 (2026-10-12) |
-| `cargo test --release --workspace` | 엔진 242, browser-core 2, cdp-wire 3 (2026-10-12) |
+| `cargo test --release --workspace` | 엔진 249, browser-core 2, cdp-wire 4, 클라이언트 9 (2026-10-12) |
+| `./scripts/verify-loads.sh`, `MODE=wasix ./scripts/verify-loads.sh` | 각각 탭 3개 × 로드 10회, 리소스 2,400개. 페이지마다 CSS 변수 1,600개와 span 800개 (2026-10-12) |
+| `ENGINE=html LOADS=10 RESOURCES=1 PAGE_URL=<공개 페이지 URL> AGENT_BROWSER_WASM=target/agent-browser-wasix/agent-browser.wasm ./scripts/verify-harness.sh` | E9 포함 8개. 네이버에서 E6·E7·E8과 추가 로드 10회 통과, 마지막 실행 선형 메모리 339.2MB (2026-10-12) |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 50 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 35 |
@@ -66,15 +70,9 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 ### 0.4 다음 후보
 
-- **WASIX에서 무거운 페이지를 몇 번 불러오면 엔진이 죽는다.** 한 엔진 프로세스로 네이버를
-  불러오면 Wasmer CLI에서는 세 번째에, 브라우저 샌드박스에서는 두 번째에 런타임이
-  `thread_spawn`(`lib/wasix/src/syscalls/wasix/thread_spawn.rs:217`, `Errno::overflow`)에서
-  패닉한다. 엔진은 요청마다 스레드를 만들고(`fetch.rs`의 `Client::start`, 네이버 한 번에
-  70개 넘게), 탭마다 32MB 스택의 스크립트 스레드를 둔다(`js.rs`). WASIX는 스레드 스택을
-  wasm 선형 메모리 안에 두므로, 회수되지 않거나 늦게 회수되면 곧 한계에 닿는다는 것이
-  추정이다. 가장 먼저 확인할 것은 요청 스레드를 재사용하는 풀(호스트당 6개)과 스레드
-  스택 크기다. 재현: `ENGINE=html PAGE_URL=https://www.naver.com/ ./scripts/verify-harness.sh`
-  (E7 실패), 또는 같은 엔진에 `wasix-loopback-client.rs`의 `cdp` 모드를 세 번.
+- **브라우저 페이지에서 실행되는 pi와 연결한다.** E8까지는 페이지가 정해진 CLI 명령을
+  실행하는 검증이다. 실제 에이전트가 도구 호출로 `sandbox.command(...)`를 실행하고 결과를
+  받아 다음 동작을 정하는 흐름은 아직 연결하지 않았다.
 
 - **과거 참조 사이트 로고 기록은 재현이 필요하다.** `<img>`에 `src`가 없다는 기록은
   있지만 이번 세션에는 재현 URL이 없었다. 대신 네이버를 검사했다. 네이버의 이미지 `src`와
@@ -135,7 +133,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | 파일 | 하는 일 |
 |---|---|
 | `browser.rs` | `HtmlEngine`. CDP 메서드, 로드 순서(가져오기 → 스타일시트 → 스크립트), 히스토리. 맨 바깥 `impl Engine`이 모든 출력에서 비밀을 가린다 |
-| `fetch.rs` | HTTP/1.1 클라이언트. TLS, keep-alive 풀, 리다이렉트, 쿠키. `start`(스레드에서 요청, 호스트당 6개)와 `preload` |
+| `fetch.rs`, `fetch_pool.rs` | HTTP/1.1 클라이언트와 공용 작업 풀. TLS, keep-alive, 리다이렉트, 쿠키. `start`·`preload`는 전체 최대 12개 작업 스레드를 재사용하며 호스트당 6개를 실행한다 |
 | `network.rs` | `Network.*` 기록. 요청마다 이벤트와 응답 본문을 남기고 엔진이 출구에서 내보낸다 |
 | `intercept.rs` | `Fetch.*` 요청 가로채기. 패턴, 멈춘 요청, 클라이언트의 답. `Concurrent`로 명령 대기열 밖에서 답한다 |
 | `cookies.rs` | RFC 6265 쿠키 저장소. 메모리 전용, 모든 타깃이 공유 |
@@ -470,7 +468,7 @@ E5 PASS: HTTP/1.1 200 OK
       TCP·TLS였고, keep-alive 연결 풀로 3.5초가 됐다. 스타일시트를 받게 되면서 다시
       약 5초. 그때 요청 71개(25.7MB)를 하나씩 받는 데 3.5초였다.
       이제 요청은 필요가 생긴 순간 시작하고 결과는 원래 쓰던 자리에서 받는다.
-      `Client::start`가 스레드에서 보내고(호스트당 6개, Chrome과 같음), 파서가 찾은
+      `Client::start`가 프로세스 공용 풀에서 보내고(전체 12개, 호스트당 6개), 파서가 찾은
       스타일시트와 클래식 스크립트는 파싱 직후 `preload`한다. 스크립트가 넣은
       `<script src>`·`<link rel=stylesheet>`, 비동기 `fetch`·XHR은 호출하는 순간
       시작하고 그 태스크에서 결과를 받는다. 그래서 실행·이벤트 순서는 그대로다.
@@ -654,6 +652,22 @@ E5 PASS: HTTP/1.1 200 OK
 
 되짚지 않도록 적어둡니다.
 
+- **무거운 페이지 반복 로드에는 두 가지 메모리 문제가 있었다(2026-10-12 수정).**
+  요청마다 스레드를 만들고 나서 호스트 제한을 기다렸으므로, 대기 요청도 스택을 썼다.
+  Wasmer CLI에서는 세 번째 네이버 로드 때 `thread_spawn`의 `Errno::overflow`를 재현했다.
+  `fetch_pool.rs`는 프로세스 전체에 최대 12개 작업 스레드(각 스택 2MB)를 두고 재사용하며,
+  호스트당 6개가 실행 중이면 해당 요청은 대기열에 남긴다. 다른 호스트의 작업은 건너 골라
+  실행한다. 쿠키·가로채기·네트워크 기록은 작업을 제출한 클라이언트의 것을 그대로 쓴다.
+  이것만 고친 뒤에도 브라우저 샌드박스에서는 메모리 할당 실패가 남았다. 임시 할당 계측으로
+  계산 스타일과 렌더 트리에 상속된 CSS 변수를 요소·의사 요소마다 복사하는 것을 확인했다.
+  한 페이지에서 약 500만 개의 속성 항목이 생기고, 속성 이름만 약 150MB를 차지했다.
+  `ComputedStyle`은 이제 사용자 정의 속성 맵을 `Arc`로 공유하고, 재정의할 때만 복사한다.
+  문자열 값도 공유한다. 네이버에서 E6·E7·E8과 E9의 추가 로드 10회가 통과했으며,
+  마지막 실행에서 반복 로드가 끝난 뒤 선형 메모리는 339.2MB였다. 선형 메모리는 줄어들지 않으므로
+  이것은 현재 사용량이 아니라 할당된 크기의 최고치다. 스크립트 스택은 32MB 그대로다.
+  문서 변경 시 재사용되고 탭 종료 시 join하므로, 이번 수정에서는 크기를 줄이지 않았다.
+  `RESOURCES=1` 하니스나 게스트 환경 변수 `WHB_TRACE_RESOURCES=1`로 메모리와 QuickJS 사용량을
+  기록할 수 있다. 로컬 회귀 검증은 `verify-loads.sh`, 브라우저 반복 검증은 `LOADS=10`이다.
 - **소켓 거부가 `EOPNOTSUPP`로 온다.** WASIX가 소켓을 못 여는 것처럼 읽히지만
   런타임 정책이며, Wasmer에서는 `--net`으로 풀린다.
 - **`agent-browser --cdp`는 포트나 완전한 URL만 받는다.** `host:port`는

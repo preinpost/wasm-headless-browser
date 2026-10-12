@@ -226,6 +226,10 @@ impl JsRuntime {
                 _ => break,
             }
         }
+        if std::env::var_os("WHB_TRACE_RESOURCES").is_some() {
+            let usage = self.runtime.memory_usage();
+            eprintln!("[resources] tasks: {ran}, QuickJS allocated {:.1} MiB, used {:.1} MiB", usage.malloc_size as f64 / 1048576.0, usage.memory_used_size as f64 / 1048576.0);
+        }
         ran
     }
 

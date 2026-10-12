@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject;
@@ -253,8 +253,6 @@ pub struct Client {
     /// Requests started ahead of being asked for, by URL. See
     /// [`Client::preload`].
     preloads: Arc<Mutex<HashMap<String, Pending>>>,
-    /// Requests in flight on their own threads, by host.
-    slots: Arc<Slots>,
     /// What `Network.*` reports. Every clone records into the same log.
     log: Arc<NetLog>,
     /// Where requests a client asked to see wait for its answer.
@@ -269,7 +267,7 @@ const MAX_IDLE_PER_HOST: usize = 6;
 /// reuse rather than opening new ones.
 pub const MAX_CONNECTIONS_PER_HOST: usize = 6;
 
-/// A request running on its own thread.
+/// A request queued or running on the shared fetch workers.
 pub struct Pending(mpsc::Receiver<Result<Response, FetchError>>);
 
 impl Pending {
@@ -277,7 +275,7 @@ impl Pending {
     pub fn wait(self) -> Result<Response, FetchError> {
         self.0
             .recv()
-            .unwrap_or_else(|_| Err(FetchError::Io("the request could not be started on a thread".into())))
+            .unwrap_or_else(|_| Err(FetchError::Io("the fetch worker stopped before answering".into())))
     }
 
     /// Waits at most `limit`; still running after that, the request comes
@@ -287,46 +285,9 @@ impl Pending {
             Ok(answer) => Ok(answer),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(self),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Ok(Err(FetchError::Io("the request could not be started on a thread".into())))
+                Ok(Err(FetchError::Io("the fetch worker stopped before answering".into())))
             }
         }
-    }
-}
-
-/// Counts requests in flight per host and makes the next one wait when a
-/// host has [`MAX_CONNECTIONS_PER_HOST`].
-#[derive(Default)]
-struct Slots {
-    busy: Mutex<HashMap<String, usize>>,
-    freed: Condvar,
-}
-
-impl Slots {
-    fn acquire(&self, host: &str) -> Slot<'_> {
-        let mut busy = self.busy.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        while busy.get(host).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_HOST {
-            busy = self.freed.wait(busy).unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        *busy.entry(host.to_string()).or_default() += 1;
-        Slot { slots: self, host: host.to_string() }
-    }
-}
-
-/// One request's place against its host, given back when it is dropped.
-struct Slot<'a> {
-    slots: &'a Slots,
-    host: String,
-}
-
-impl Drop for Slot<'_> {
-    fn drop(&mut self) {
-        let mut busy = self.slots.busy.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = busy.get_mut(&self.host) {
-            *count -= 1;
-        }
-        // All, not one: a waiter woken for another host would sleep again
-        // and leave this host's waiter asleep.
-        self.slots.freed.notify_all();
     }
 }
 
@@ -341,7 +302,6 @@ impl Client {
             cookies,
             idle: Arc::new(Mutex::new(HashMap::new())),
             preloads: Arc::new(Mutex::new(HashMap::new())),
-            slots: Arc::new(Slots::default()),
             log: Arc::new(NetLog::default()),
             interceptor: Arc::new(Interceptor::default()),
         }
@@ -373,10 +333,10 @@ impl Client {
         self.send_direct(request)
     }
 
-    /// Starts `request` on a thread of its own and returns at once. The
-    /// answer is collected with [`Pending::wait`]. At most
-    /// [`MAX_CONNECTIONS_PER_HOST`] run against one host at a time, as in a
-    /// browser; the rest queue.
+    /// Queues `request` on the process-wide fetch pool and returns at once.
+    /// The answer is collected with [`Pending::wait`]. At most twelve workers
+    /// run across all tabs, with [`MAX_CONNECTIONS_PER_HOST`] against one
+    /// host; the rest wait in the queue without allocating thread stacks.
     ///
     /// This is how a page load stops being one request after another: the
     /// reference site's login screen is 71 requests and 26 MB, and fetched in
@@ -385,12 +345,12 @@ impl Client {
         let (tx, rx) = mpsc::channel();
         let client = self.clone();
         let host = Url::parse(&request.url).map(|u| u.authority()).unwrap_or_default();
-        // If the thread cannot be made, the sender is dropped with the
-        // closure and `wait` reports that.
-        let _ = std::thread::Builder::new().name("fetch".into()).spawn(move || {
-            let _slot = client.slots.acquire(&host);
+        let failure = tx.clone();
+        if let Err(error) = crate::fetch_pool::submit(host, move || {
             let _ = tx.send(client.send_direct(request));
-        });
+        }) {
+            let _ = failure.send(Err(FetchError::Io(error)));
+        }
         Pending(rx)
     }
 
@@ -1154,6 +1114,38 @@ mod tests {
         let response = client.send(Request { headers: vec![("Accept".into(), "*/*".into())], ..Request::get(&url) });
         assert_eq!(response.unwrap().body, b"hi");
         assert!(client.take_preload(&Request::get(&url)).is_none(), "taken once");
+    }
+
+    #[test]
+    fn shared_workers_keep_each_clients_cookies_and_network_log_separate() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string();
+        let (base, requests) = serve_script(vec![response; 80]);
+        let clients = [client(), client()];
+        let url = Url::parse(&base).unwrap();
+        for (index, client) in clients.iter().enumerate() {
+            client.cookies().lock().unwrap().store(&url, &format!("sid={index}; Path=/"), cookies::Source::Http, cookies::now());
+            client.log().enable(None, None);
+        }
+        let mut pending = Vec::new();
+        for n in 0..80 {
+            pending.push(clients[n % 2].start(Request::get(&format!("{base}/{}", n % 2))));
+        }
+        for request in pending {
+            assert_eq!(request.wait().unwrap().body, b"ok");
+        }
+        for _ in 0..80 {
+            let request = requests.recv().unwrap();
+            let index = if request.starts_with("GET /0 ") { 0 } else { 1 };
+            assert!(request.contains(&format!("Cookie: sid={index}\r\n")), "{request}");
+        }
+        for (index, client) in clients.iter().enumerate() {
+            let events = client.log().take_events();
+            let started: Vec<_> = events.iter().filter(|(method, _)| method == "Network.requestWillBeSent").collect();
+            assert_eq!(started.len(), 40);
+            for (_, params) in started {
+                assert_eq!(params["request"]["url"], format!("{base}/{index}"));
+            }
+        }
     }
 
     #[test]

@@ -6,6 +6,10 @@
 //   E3  can the HOST PAGE reach it (ports.expose + fetch)?
 //   E4  can the sandbox reach the public internet at all?
 //   E5  can the sandbox do a real HTTPS request (curl, so TLS is in the guest)?
+//   E6  does the real engine load and script a page?
+//   E7  does whb drive the engine?
+//   E8  does agent-browser drive the engine?
+//   E9  do repeated page loads keep navigating and evaluating?
 //
 // E1 is the one that decides the architecture. E4 decides whether crawling from
 // inside the sandbox is possible, which is a separate question: the browser
@@ -174,7 +178,8 @@ async function main() {
 
   // ---- E0: start the engine, watch its banner --------------------------
   const engineArgs = engineKind ? ['--engine', engineKind, `127.0.0.1:${port}`] : [`127.0.0.1:${port}`]
-  const proc = await sandbox.command('engine', engineArgs).spawn({})
+  const engineEnv = params.get('resources') === '1' ? { WHB_TRACE_RESOURCES: '1' } : {}
+  const proc = await sandbox.command('engine', engineArgs, { env: engineEnv }).spawn({})
   let engineOutput = ''
 
   // ReadableBytes exposes an async generator of lines, not a ReadableStream.
@@ -331,6 +336,26 @@ async function main() {
       }
     } catch (e) {
       record('E8 agent-browser drives the engine in the sandbox', false, e?.message ?? String(e))
+    }
+  }
+
+  // ---- E9: repeated heavy loads in the same engine ---------------------
+  const loads = Number(params.get('loads') ?? 1)
+  if (engineKind === 'html' && loads > 1) {
+    try {
+      const out = await sandbox
+        .command('client', ['cdp', `127.0.0.1:${port}`, pageUrl, String(loads)])
+        .run({ timeoutMs: Math.max(60_000, loads * 30_000) })
+      const text = out.stdout?.text?.() ?? ''
+      for (const line of text.split('\n')) if (line.trim()) log(`  [repeat] ${line}`)
+      const completed = (text.match(/\[cdp\] load value:/g) ?? []).length
+      record(
+        'E9 repeated page loads keep the engine alive',
+        out.ok && completed === loads && /\[cdp\] RESULT: page loaded/.test(text),
+        `${completed}/${loads} navigations and evaluations completed`,
+      )
+    } catch (e) {
+      record('E9 repeated page loads keep the engine alive', false, e?.message ?? String(e))
     }
   }
 

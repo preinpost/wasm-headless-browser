@@ -1070,7 +1070,7 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         });
     }
     {
-        // The same request, started now on its own thread, for `fetch`, an
+        // The same request, queued on the shared fetch workers, for `fetch`, an
         // asynchronous XHR, or a script or stylesheet that script inserted.
         // The prelude collects it with `httpFinish` from the task that
         // delivers it, so the page sees events in the same order as before
@@ -1103,8 +1103,8 @@ fn put_platform<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
         });
     }
     {
-        // An aborted request: its answer is not wanted. The thread finishes
-        // on its own.
+        // An aborted request: its answer is not wanted. The worker finishes
+        // the request and discards the answer.
         let requests = Arc::clone(&state.requests);
         install_fn!(ctx, api, "httpDrop", move |handle: u32| {
             if let Ok(mut requests) = requests.lock() {

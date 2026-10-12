@@ -17,6 +17,7 @@
 //   wasmer run --net /tmp/loopback-client.wasm -- 127.0.0.1:9222
 //   wasmer run --net /tmp/loopback-client.wasm -- example.com:80 / example.com
 //   wasmer run --net /tmp/loopback-client.wasm -- cdp 127.0.0.1:9222 https://example.com/
+//   wasmer run --net /tmp/loopback-client.wasm -- cdp 127.0.0.1:9222 https://example.com/ 10
 //
 // The `cdp` mode is the smallest CDP client: a WebSocket to the engine, then
 // Target.createTarget, attachToTarget, Page.navigate and Runtime.evaluate. It
@@ -53,7 +54,9 @@ fn main() {
         args.next();
         let addr = args.next().unwrap_or_else(|| "127.0.0.1:9222".to_string());
         let url = args.next().unwrap_or_else(|| "https://example.com/".to_string());
-        cdp(&addr, &url);
+        let loads = args.next().map(|n| n.parse::<u32>().expect("load count must be a positive integer")).unwrap_or(1);
+        assert!(loads > 0, "load count must be positive");
+        cdp(&addr, &url, loads);
         return;
     }
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:9222".to_string());
@@ -202,7 +205,7 @@ fn field(message: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn cdp(addr: &str, url: &str) {
+fn cdp(addr: &str, url: &str, loads: u32) {
     println!("[cdp] target {addr}, page {url}");
     let run = || -> Result<String, String> {
         let mut ws = websocket(addr)?;
@@ -212,27 +215,36 @@ fn cdp(addr: &str, url: &str) {
         let attached = call(&mut ws, 2, None, "Target.attachToTarget", &format!("{{\"targetId\":\"{target}\",\"flatten\":true}}"))?;
         let session = field(&attached, "sessionId").ok_or(format!("no sessionId in {attached}"))?;
         println!("[cdp] attached to {target}");
-        let navigated = call(&mut ws, 3, Some(&session), "Page.navigate", &format!("{{\"url\":\"{url}\"}}"))?;
-        if let Some(error) = field(&navigated, "errorText") {
-            return Err(format!("navigation failed: {error}"));
+        let mut value = String::new();
+        for load in 0..loads {
+            let id = 3 + load * 2;
+            let navigated = call(&mut ws, id, Some(&session), "Page.navigate", &format!("{{\"url\":\"{url}\"}}"))?;
+            if let Some(error) = field(&navigated, "errorText") {
+                return Err(format!("navigation failed: {error}"));
+            }
+            println!("[cdp] navigated ({}/{loads})", load + 1);
+            // A page-built value, so a reply proves the page's JavaScript runs.
+            let expression = "JSON.stringify({title: document.title, links: document.querySelectorAll('a').length, sum: [1,2,3].reduce((a, b) => a + b), loaded: globalThis.__loaded})";
+            let evaluated = call(
+                &mut ws,
+                id + 1,
+                Some(&session),
+                "Runtime.evaluate",
+                &format!("{{\"expression\":\"{}\",\"returnByValue\":true}}", expression.replace('"', "\\\"")),
+            )?;
+            value = field(&evaluated, "value").ok_or(format!("no value in {evaluated}"))?;
+            println!("[cdp] load value: {value}");
         }
-        println!("[cdp] navigated");
-        // A page-built value, so a reply proves the page's JavaScript runs.
-        let expression = "JSON.stringify({title: document.title, links: document.querySelectorAll('a').length, sum: [1,2,3].reduce((a, b) => a + b)})";
-        let evaluated = call(
-            &mut ws,
-            4,
-            Some(&session),
-            "Runtime.evaluate",
-            &format!("{{\"expression\":\"{}\",\"returnByValue\":true}}", expression.replace('"', "\\\"")),
-        )?;
-        field(&evaluated, "value").ok_or(format!("no value in {evaluated}"))
+        Ok(value)
     };
     match run() {
         Ok(value) => {
             println!("[cdp] value: {value}");
             println!("[cdp] RESULT: page loaded");
         }
-        Err(e) => println!("[cdp] RESULT: failed: {e}"),
+        Err(e) => {
+            println!("[cdp] RESULT: failed: {e}");
+            std::process::exit(1);
+        }
     }
 }

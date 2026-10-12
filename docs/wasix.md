@@ -264,6 +264,31 @@ cargo wasix build --release
 wasmer run --net target/wasm32-wasmer-wasi/release/tls-probe.wasm -- example.com
 ```
 
+## Repeated heavy page loads
+
+Measured on 2026-10-12: repeated loads originally exhausted WASIX thread
+stacks (`thread_spawn`, `Errno::overflow`). Fetches now reuse a process-wide
+pool of twelve workers, with six requests per host. Requests waiting for a
+host occupy queue entries instead of allocating stacks; a saturated host
+does not hold workers needed by another host.
+
+The browser still ran out of memory until computed styles stopped copying
+thousands of inherited CSS variables into every element and pseudo-element.
+The variable map and immutable values are now shared, copied only where
+an element overrides variables. The 32 MB script stack stays unchanged and
+is reused when navigating within a tab.
+
+`verify-loads.sh` passes natively and under Wasmer: three tabs with ten loads
+each, 2,400 asset requests, all forty scripts executing on every load. Each
+page also has 1,600 root CSS variables and 800 spans, with pseudo-element
+rules, to exercise the large-theme case without relying on a public site.
+
+In the browser sandbox, NAVER passes E6, E7, E8 and E9's ten additional
+navigations in the same engine. Allocated linear memory at the end of the
+final verification run was 339.2 MiB (not live heap; linear memory cannot
+shrink). Run with `LOADS=10 RESOURCES=1` to repeat and observe it; see
+[`../harness/README.md`](../harness/README.md).
+
 ## Commands
 
 ```bash
@@ -274,6 +299,7 @@ scripts/wasix-build.sh           # → target/wasm32-wasmer-wasi/release/*.wasm
 scripts/wasix-run.sh             # → serves on 127.0.0.1:9222
 
 MODE=wasix ./scripts/verify-m0.sh
+MODE=wasix ./scripts/verify-loads.sh
 
 # the browser-sandbox probes, driven and judged automatically
 ./scripts/verify-harness.sh

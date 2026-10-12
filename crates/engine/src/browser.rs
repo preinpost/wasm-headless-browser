@@ -95,6 +95,7 @@ impl HtmlEngine {
         let viewport = (800.0, 600.0);
         let client = fetch::Client::new(cookies);
         let script = ScriptHost::spawn(Arc::clone(&doc), client.clone(), viewport, USER_AGENT).ok();
+        trace_resources("script host created");
         let frame_id = ids::token(&mut counter);
         client.log().set_frame(&frame_id);
         let images = Arc::new(ImageStore::new(client.clone()));
@@ -371,6 +372,7 @@ impl HtmlEngine {
     /// becomes an error page, which is what a browser shows and a client can
     /// read.
     fn replace_document(&mut self, request: Request) {
+        trace_resources("load start");
         // The document lock borrows `self`, so everything that touches other
         // fields is collected here and applied once the guard is dropped.
         let request = request.of_kind(ResourceType::Document);
@@ -424,7 +426,9 @@ impl HtmlEngine {
         self.last_error = new_error;
 
         self.preload_subresources();
+        trace_resources("preloads queued");
         self.load_stylesheets();
+        trace_resources("stylesheets loaded");
 
         // What the old document logged goes before its context does.
         self.collect_page_events();
@@ -567,12 +571,15 @@ impl HtmlEngine {
         }
         script.run_tasks(LOAD_BUDGET_MS, MAX_TASKS);
         let _ = script.run("__fireLoad()");
+        trace_resources("scripts loaded");
         script.run_tasks(LOAD_BUDGET_MS, MAX_TASKS);
+        trace_resources("load tasks settled");
         // `<img>`s were fetched by their own tasks above. Backgrounds start
         // now, so they are likely there when a screenshot wants them.
         for url in self.image_urls() {
             self.images.request(&url);
         }
+        trace_resources("background images queued");
 
         if let Some(first) = errors.into_iter().next() {
             self.last_error = Some(first);
@@ -1357,6 +1364,7 @@ impl Engine for HtmlEngine {
         self.emit_network(&mut scrubbed);
         self.emit_page_events(&mut scrubbed);
         self.emit_frame(&mut scrubbed);
+        trace_resources(method);
         match result {
             Ok(mut value) => {
                 scrub_outgoing(&self.secrets, method, &mut value);
@@ -1435,6 +1443,17 @@ fn cdp_answer(answer: Value) -> Result<Value, CdpError> {
 
 fn not_yet(method: &str, why: &str) -> CdpError {
     CdpError { code: -32000, message: format!("{method} is not implemented yet: {why}") }
+}
+
+/// Linear memory cannot shrink; this is its high-water mark, not live heap.
+fn trace_resources(stage: &str) {
+    #[cfg(target_arch = "wasm32")]
+    if std::env::var_os("WHB_TRACE_RESOURCES").is_some() {
+        let mib = std::arch::wasm32::memory_size::<0>() as f64 / 16.0;
+        eprintln!("[resources] {stage}: linear memory {mib:.1} MiB");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = stage;
 }
 
 fn now() -> f64 {
