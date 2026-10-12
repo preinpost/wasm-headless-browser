@@ -8,7 +8,8 @@
 이벤트를 낸다(M3.1). 스크린샷을 그린다(M1.5), 이미지와 그라디언트까지. 실시간으로
 보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. EUC-KR 등 모든 인코딩(M1.9). `innerText`가 보이는 글자다(M2.16). 같은 문서의 뒤로·앞으로가 `popstate`다(M2.12). 접근성 트리가 Chrome 스냅샷과 맞는다(M1.2b).
 스크린샷에 그림자와 SVG가 나온다(M1.5b). `network route`로 요청을 가로챈다(M3.3).
-네이버에서 누락되던 인라인 SVG 로고를 수정했다(M1.5c). 다음 후보는 §0.4.
+네이버에서 누락되던 인라인 SVG 로고를 수정했다(M1.5c). 클리핑·의사 요소·인라인 배치를 넣었다(M1.4c).
+macOS에서 깨지던 WASIX 빌드를 고쳤다(§6). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -37,14 +38,16 @@ mkdir -p /tmp/wasmer-new && curl -sSL "https://github.com/wasmerio/wasmer/releas
 export PATH=/tmp/ab-0.38.2/node_modules/.bin:/tmp/wasmer-new/bin:$PATH   # 전역 wasmer는 4.2.6, 쓸 수 없음
 ```
 
-`cargo-wasix`와 `~/.wasixcc`는 설치되어 있다. Chrome 비교용 headless shell은
+`cargo-wasix`는 설치되어 있다. `~/.wasixcc`는 이 머신(2026-10-12)에는 없지만 필요하지 않다.
+C 코드를 wasm으로 묶을 `llvm-ar`는 `scripts/wasix-build.sh`가 찾고, 없으면 wasi-sdk를 받는다
+([docs/wasix.md](wasix.md)의 "Build notes"). Chrome 비교용 headless shell은
 `~/Library/Caches/ms-playwright/chromium_headless_shell-1228/`에 있다(§6).
 
 ### 0.3 확인 명령
 
 기존 검증 기록과 최신 확인 결과입니다. 2026-10-12에는 네이티브 워크스페이스 테스트,
-M1 50개, 로그인 35개를 다시 통과했다. 최신 WASIX 빌드는 `ring_core_0_17_14__*`의
-미정의 심볼로 링크에 실패해 이번 변경의 WASIX 실행은 검증하지 못했다.
+M1 50개, 로그인 35개를 다시 통과했다. WASIX에서도 M0 16개, 로그인 35개를 통과했다.
+그 전에는 macOS `ar`가 `ring`의 wasm 오브젝트를 담지 못해 링크가 실패했다(§6).
 
 | 명령 | 검사 수 |
 |---|---|
@@ -176,7 +179,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | 호스트 페이지에서 안으로 들어오는 경로(E3)는 필요 없다. 설령 되더라도 HTTP 전용이라 CDP의 WebSocket 업그레이드는 지나가지 못한다 | [harness/README.md](../harness/README.md) |
 | 브라우저 샌드박스에서 외부 TCP·HTTPS가 된다. WISP 릴레이를 쓴다 (E4·E5) | 이 문서의 §3 |
 | QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다. 엔진에서는 `full-wasi`를 쓸 수 없다 (§6) | [docs/quickjs.md](quickjs.md) |
-| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 글꼴과 래스터라이저까지 4.7MB, 이미지 디코더까지 5.2MB, 인코딩 5.4MB, resvg까지 6.2MB(요청 가로채기 +41KB, 6,258,603바이트). 앞의 몇 개는 빌드 스크립트 표시값이라 실제보다 클 수 있다 | `ls -l`, 커밋 기록 |
+| WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 글꼴과 래스터라이저까지 4.7MB, 이미지 디코더까지 5.2MB, 인코딩 5.4MB, resvg까지 6.2MB(요청 가로채기 +41KB, 6,258,603바이트), 의사 요소·인라인 배치까지 6,331,554바이트. 앞의 몇 개는 빌드 스크립트 표시값이라 실제보다 클 수 있다 | `ls -l`, 커밋 기록 |
 | 참조 사이트 배경은 인라인 `background-image`(1920×1080 JPEG)이고, 크기·위치는 스타일시트 규칙의 `background: ... no-repeat top; background-size: 1920px 1080px`에서 온다. `cover`를 쓰는 규칙은 `min-height:1081px` 미디어 쿼리 안이라 800×600에서는 안 맞는다 | 2026-10-10 Chrome과 비교 |
 | 참조 사이트는 Noto Sans KR 웹 글꼴을 쓴다. 왼쪽 절반은 화면 전체에 깔린 배경 이미지와 그 위의 흰 글자이고, 로그인 상자는 그 위의 80% 흰색이다 | 2026-10-09 CSS와 Chrome 스크린샷 |
 | 참조 사이트 로그인 상자는 오른쪽에서 미끄러져 들어온다. Chrome에서 열자마자 재면 x가 수십 px 다르다 | 같은 날 |
@@ -394,7 +397,7 @@ E5 PASS: HTTP/1.1 200 OK
       네이버 N 로고의 색은 `#03C75A`, 박스는 `(344,110,24,24)`로 Chrome과 같다(1280×900).
       사이트에 의존하지 않는 회귀 테스트 7개를 추가했다. 네이버 전체 화면에는 아이콘,
       광고 영역, 숨겨진 글자의 배치 등 차이가 남고, 광고 SDK 오류도 남는다. WASIX 빌드는
-      `ring`의 미정의 심볼 때문에 링크에 실패했으므로 이번 변경의 게스트 실행은 미검증이다.
+      당시 `ring`의 미정의 심볼 때문에 링크에 실패했다. 빌드 스크립트를 고친 뒤 WASIX에서도 검증했다(§6).
 - [x] M1.4c 네이버 화면의 클리핑·컨트롤·의사 요소·인라인 배치를 일반 기능으로 수정했다(2026-10-12, 네이티브).
       접근성용 1px 상자의 `clip: rect(0,0,0,0)`과 `clip-path: inset()`이 그리기와 히트 테스트에 적용된다.
       작성자가 `border`·`background`를 초기화한 컨트롤은 기본 외형을 다시 그리지 않는다.
@@ -402,7 +405,7 @@ E5 PASS: HTTP/1.1 200 OK
       인라인 텍스트는 단어·CJK 조각으로 줄바꿈하고, 중첩 인라인과 `<br>`을 공유하며 기준선을 맞춘다.
       `z-index`는 쌓임 맥락 안에서만 비교한다. 렌더링 픽스처 12개 박스는 Chrome과 2px 안, 평균 0.9px 차이다.
       네이버 검색창·입력란·서비스 메뉴의 크기와 상대 위치도 같다. 전체 세로 위치는 상단 배너 처리 때문에 40px 차이가 남는다.
-      광고 iframe, 회전·확대, 완전한 중첩 쌓임 맥락은 범위에 넣지 않았다. WASIX 링크 오류는 그대로라 게스트 실행은 미검증이다.
+      광고 iframe, 회전·확대, 완전한 중첩 쌓임 맥락은 범위에 넣지 않았다. WASIX에서도 M0·로그인 검증을 통과했다.
 - [ ] M1.6 실제 사이트로 다시 측정한다. 참조 사이트 로그인 화면은 레이아웃까지
       Chrome과 비교했다(§2). 로그인 뒤 화면과 CDP 표면 재캡처는 아직이다.
 - [x] M1.7 `browser` 바이너리에 `--engine fake|html` 플래그를 넣었다.
@@ -656,6 +659,13 @@ E5 PASS: HTTP/1.1 200 OK
   끝나면 락파일을 되돌리고 `.cargo/config.toml`을 지운다. 그 파일이 남아 있으면
   네이티브 빌드가 깨지기 때문이다. 새 의존성이 "candidate versions found which
   didn't match: X+wasix.1"로 실패하면 X를 `WASIX_FORKS`에 추가한다.
+- **macOS의 `ar`는 wasm 오브젝트를 묶지 못한다.** `ring`의 C 코드는 wasm으로 잘 컴파일되지만,
+  `cc` 크레이트가 Apple clang 옆에서 `llvm-ar`를 찾지 못하면 시스템 `ar`로 묶는다. 그러면
+  `not a mach-o file` 경고와 함께 96바이트짜리 빈 아카이브가 나오고, 링크가
+  `undefined symbol: ring_core_0_17_14__*`로 실패한다. `scripts/wasix-build.sh`가 wasm을
+  아는 `llvm-ar`를 찾아 `AR_wasm32_wasmer_wasi`로 넘긴다. 또 `ring`의 빌드 스크립트는
+  아카이버가 바뀌어도 다시 돌지 않으므로, 빈 아카이브가 남아 있으면 스크립트가 `ring`의
+  빌드 산출물을 지운다. QuickJS는 rquickjs-sys가 받은 wasi-sdk로 묶어서 문제가 없었다.
 - **엔진에서 `rquickjs`의 `full-wasi`를 쓰면 WASIX 빌드가 깨진다.**
   `full-wasi`가 `rquickjs-macro`를 끌어오는데, WASIX 툴체인의 rustc가
   cargo가 만든 그 proc-macro를 읽지 못한다 (E0463 "can't find crate").

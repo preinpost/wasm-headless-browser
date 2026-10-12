@@ -171,8 +171,31 @@ read this page at all, which is the whole argument for M2.
 
 **No C toolchain was needed at first.** The project was pure Rust, and nothing
 in the dependency tree needed a sysroot. QuickJS and ring changed that: both
-compile C, and both build through `cargo wasix` without further setup. See
-[quickjs.md](quickjs.md) for QuickJS.
+compile C. See [quickjs.md](quickjs.md) for QuickJS.
+
+**The C archiver must understand wasm.** Each crate's C objects are put into a
+static archive, and the linker finds them through the archive's symbol table.
+macOS's own `ar` and `ranlib` cannot read wasm objects: they warn
+`archive member '...' not a mach-o file` and write an archive whose only member
+is an empty `__.SYMDEF` (96 bytes). The link then fails:
+
+```
+rust-lld: error: ... undefined symbol: ring_core_0_17_14__LIMB_is_zero
+```
+
+The `cc` crate looks for `llvm-ar` next to the C compiler for wasm targets, and
+Apple's clang has none beside it, so it falls back to `ar`. QuickJS is not hit,
+because rquickjs-sys archives with the wasi-sdk it fetches. `ring` is.
+`scripts/wasix-build.sh` therefore finds a wasm-capable `llvm-ar` and passes it
+as `AR_wasm32_wasmer_wasi` and `RANLIB_wasm32_wasmer_wasi`. It looks at
+`WASI_SDK`, `WASI_SDK_PATH`, `PATH`, rustup's `llvm-tools`, Homebrew's LLVM, and
+last the wasi-sdk rquickjs-sys fetched into the target directory. When there is
+none, it builds rquickjs-sys first, which fetches that wasi-sdk, so a clean
+machine needs nothing extra installed.
+
+ring's build script does not rerun when the archiver changes. An empty archive
+left by a wrong `ar` would keep failing the link after the fix, so the script
+removes ring's build outputs when it finds one.
 
 **`sha1` was removed for this reason.** The `sha1` crate reaches `libc` through
 `cpufeatures`, and the WASIX overlay registry has no matching `libc`, which
