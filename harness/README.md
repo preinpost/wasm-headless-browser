@@ -22,11 +22,20 @@ does not, CDP has to be carried over a pipe, or the client has to run outside.
 | E3 | Can the **host page** reach it (`ports.expose` + `fetch`)? |
 | E4 | Can the sandbox reach the public internet at all? |
 | E5 | Can the sandbox complete a real HTTPS request? |
+| E6 | Does the **real engine** load and script a page inside the sandbox? |
 
 Two WASIX modules are loaded into one sandbox as commands: `engine` is the real
 `wasm-headless-browser`, and `client` is `scripts/wasix-loopback-client.rs`,
 which opens a TCP connection to `127.0.0.1`, speaks HTTP, and prints what came
 back. The engine is spawned in the background; the client runs against it.
+
+The engine binary starts its M0 fake engine unless told otherwise, and E0-E2
+ask only whether it serves. `engine=html` starts the real one (QuickJS, TLS,
+layout) instead, and adds E6: the client's `cdp` mode opens a WebSocket to the
+engine over loopback and sends `Target.createTarget`, `Target.attachToTarget`,
+`Page.navigate` and `Runtime.evaluate`. The engine fetches the page through the
+WISP relay with TLS in the guest and runs its scripts in QuickJS, and the
+evaluated value comes back.
 
 E4 and E5 are a different question from E0-E3, and need the WISP relay, because
 the browser sandbox has no direct network access. E4 opens a plain TCP
@@ -48,6 +57,13 @@ only, with no WebSocket upgrade, so CDP could not pass through it.
 
 E4 and E5 pass.
 
+E6 passes with the real engine (2026-10-12, a 6,331,554-byte module):
+`https://example.com/` comes back as `{"title":"Example Domain","links":1}`,
+the link made by the page's external script, and `https://www.naver.com/` as
+`{"title":"NAVER","links":172}`. The whole NAVER run of `verify-harness.sh`,
+server and sandbox start included, took about 23 seconds; natively the page
+alone loads in about 4.7. The page load in the sandbox was not timed apart.
+
 ## Running it
 
 The easy way drives and judges everything:
@@ -55,11 +71,15 @@ The easy way drives and judges everything:
 ```bash
 ../scripts/verify-harness.sh
 OUTBOUND=login.example.com:443 CURL=https://login.example.com/ ../scripts/verify-harness.sh
+ENGINE=html ../scripts/verify-harness.sh                      # adds E6
+ENGINE=html PAGE_URL=https://www.naver.com/ ../scripts/verify-harness.sh
 ```
 
-It starts the harness and the WISP relay, opens the page, polls until the page
-reports it is done, and asserts on each expected probe. It cleans up after
-itself; use `../scripts/harness-stop.sh` if something was started by hand.
+It starts the harness and the WISP relay, refreshes `public/engine.wasm` when
+the WASIX build differs from it (and the client when its source is newer),
+opens the page, polls until the page reports it is done, and asserts on each
+expected probe. It cleans up after itself; use `../scripts/harness-stop.sh` if
+something was started by hand.
 
 By hand:
 
@@ -76,6 +96,7 @@ Then open a URL. Chrome is required: the SDK needs JSPI as well as
 ```
 http://127.0.0.1:8099/?mode=wisp&wisp=ws://127.0.0.1:5010/&outbound=example.com:80
 http://127.0.0.1:8099/?mode=wisp&wisp=ws://127.0.0.1:5010/&outbound=login.example.com:443&curl=https://login.example.com/
+http://127.0.0.1:8099/?mode=wisp&wisp=ws://127.0.0.1:5010/&outbound=example.com:80&engine=html&page=https://example.com/
 ```
 
 Query parameters:
@@ -86,6 +107,9 @@ Query parameters:
 - `port` — the port the engine listens on, default `9222`.
 - `outbound` / `outboundPath` — the E4 target.
 - `curl` — the E5 URL.
+- `engine` — passed to the binary as `--engine`; unset starts its default, the
+  M0 fake engine. `html` starts the real engine and runs E6.
+- `page` — the page E6 loads, default `https://example.com/`.
 
 ## Notes
 

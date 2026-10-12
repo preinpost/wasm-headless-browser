@@ -37,12 +37,17 @@ async function main() {
   const params = new URLSearchParams(location.search)
   const mode = params.get('mode') ?? 'http'
   const port = Number(params.get('port') ?? 9222)
+  // `fake` is the binary's default (the M0 page model); `html` is the real
+  // engine, with QuickJS and TLS, which is what the sandbox will run.
+  const engineKind = params.get('engine')
+  // The page the real engine loads in E6.
+  const pageUrl = params.get('page') ?? 'https://example.com/'
   const wispUrl = params.get('wisp')
   const outbound = params.get('outbound')
   const outboundPath = params.get('outboundPath') ?? '/'
   const curlUrl = params.get('curl')
 
-  log(`mode=${mode} port=${port}`)
+  log(`mode=${mode} port=${port} engine=${engineKind ?? 'default'}`)
   if (wispUrl) log(`wisp=${wispUrl}`)
   if (outbound) log(`outbound=${outbound}${outboundPath}`)
   if (curlUrl) log(`curl=${curlUrl}`)
@@ -152,7 +157,8 @@ async function main() {
   }
 
   // ---- E0: start the engine, watch its banner --------------------------
-  const proc = await sandbox.command('engine', [`127.0.0.1:${port}`]).spawn({})
+  const engineArgs = engineKind ? ['--engine', engineKind, `127.0.0.1:${port}`] : [`127.0.0.1:${port}`]
+  const proc = await sandbox.command('engine', engineArgs).spawn({})
   let engineOutput = ''
 
   // ReadableBytes exposes an async generator of lines, not a ReadableStream.
@@ -204,6 +210,30 @@ async function main() {
     )
   } catch (e) {
     record('E1 sandbox-internal client reaches the engine', false, e?.message ?? String(e))
+  }
+
+  // ---- E6: the real engine loads and scripts a page ---------------------
+  // A CDP client inside the sandbox drives the engine over a WebSocket on
+  // loopback. The engine fetches the page through the WISP relay, with TLS
+  // in the guest, and runs its JavaScript in QuickJS.
+  if (engineKind === 'html') {
+    try {
+      const out = await sandbox
+        .command('client', ['cdp', `127.0.0.1:${port}`, pageUrl])
+        .run({ timeoutMs: 120_000 })
+      const text = out.stdout?.text?.() ?? ''
+      for (const line of text.split('\n')) if (line.trim()) log(`  [cdp] ${line}`)
+      const loaded = /\[cdp\] RESULT: page loaded/.test(text)
+      record(
+        'E6 real engine loads a page in the sandbox',
+        loaded,
+        loaded
+          ? (text.match(/\[cdp\] value: .*/)?.[0] ?? 'page loaded')
+          : text.trim().split('\n').slice(-1)[0] || 'no output',
+      )
+    } catch (e) {
+      record('E6 real engine loads a page in the sandbox', false, e?.message ?? String(e))
+    }
   }
 
   // ---- E3: can the host page reach in? ---------------------------------

@@ -9,7 +9,8 @@
 보면서 조작할 수 있다(`scripts/watch.sh`, M3.6). ES 모듈이 돈다(M2.11). 스크롤된다(M1.12). 콘솔과 오류를 낸다(M3.7). id 전역 이름(M2.15)과 접근성 트리의 `disabled`. EUC-KR 등 모든 인코딩(M1.9). `innerText`가 보이는 글자다(M2.16). 같은 문서의 뒤로·앞으로가 `popstate`다(M2.12). 접근성 트리가 Chrome 스냅샷과 맞는다(M1.2b).
 스크린샷에 그림자와 SVG가 나온다(M1.5b). `network route`로 요청을 가로챈다(M3.3).
 네이버에서 누락되던 인라인 SVG 로고를 수정했다(M1.5c). 클리핑·의사 요소·인라인 배치를 넣었다(M1.4c).
-macOS에서 깨지던 WASIX 빌드를 고쳤다(§6). 다음 후보는 §0.4.
+macOS에서 깨지던 WASIX 빌드를 고쳤다(§6). 브라우저 샌드박스 안에서 실제 엔진이 페이지를
+불러오는 것까지 확인했다(E6, §2). 다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -51,6 +52,7 @@ M1 50개, 로그인 35개를 다시 통과했다. WASIX에서도 M0 16개, 로�
 
 | 명령 | 검사 수 |
 |---|---|
+| `ENGINE=html ./scripts/verify-harness.sh` | 브라우저 샌드박스 E0·E1·E2·E4·E6, 5개 (2026-10-12) |
 | `cargo test --release --workspace` | 엔진 242, browser-core 2, cdp-wire 3 (2026-10-12) |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 50 |
@@ -178,6 +180,7 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 | 브라우저 샌드박스 안에서도 loopback이 동작한다. 엔진과 클라이언트를 한 샌드박스에 함께 둘 수 있다 (E1) | 같은 문서 |
 | 호스트 페이지에서 안으로 들어오는 경로(E3)는 필요 없다. 설령 되더라도 HTTP 전용이라 CDP의 WebSocket 업그레이드는 지나가지 못한다 | [harness/README.md](../harness/README.md) |
 | 브라우저 샌드박스에서 외부 TCP·HTTPS가 된다. WISP 릴레이를 쓴다 (E4·E5) | 이 문서의 §3 |
+| 브라우저 샌드박스 안에서 실제 엔진(`--engine html`)이 페이지를 불러오고 JS를 실행한다. 같은 샌드박스의 CDP 프로브가 WebSocket으로 `Page.navigate`·`Runtime.evaluate`를 보내면, 엔진이 WISP와 게스트 안 TLS로 `example.com`(제목·링크 1개)과 네이버(링크 172개)를 읽는다 (E6). 이전 하니스는 엔진을 플래그 없이 띄워 가짜 엔진만 시험했고, 272KB짜리 옛 `engine.wasm`을 갱신하지도 않았다 | 2026-10-12, [harness/README.md](../harness/README.md) |
 | QuickJS는 WASIX에서 실행된다. `rquickjs` 0.14 + `bindgen`, 컨텍스트는 `Context::custom`으로 만든다. 엔진에서는 `full-wasi`를 쓸 수 없다 (§6) | [docs/quickjs.md](quickjs.md) |
 | WASIX 모듈 크기: QuickJS 이전 272KB, QuickJS 1.6MB, TLS 2.3MB, 레이아웃까지 3.3MB, 글꼴과 래스터라이저까지 4.7MB, 이미지 디코더까지 5.2MB, 인코딩 5.4MB, resvg까지 6.2MB(요청 가로채기 +41KB, 6,258,603바이트), 의사 요소·인라인 배치까지 6,331,554바이트. 앞의 몇 개는 빌드 스크립트 표시값이라 실제보다 클 수 있다 | `ls -l`, 커밋 기록 |
 | 참조 사이트 배경은 인라인 `background-image`(1920×1080 JPEG)이고, 크기·위치는 스타일시트 규칙의 `background: ... no-repeat top; background-size: 1920px 1080px`에서 온다. `cover`를 쓰는 규칙은 `min-height:1081px` 미디어 쿼리 안이라 800×600에서는 안 맞는다 | 2026-10-10 Chrome과 비교 |
