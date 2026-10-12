@@ -6,7 +6,8 @@ browser automation can happen where the credentials are.
 The immediate goal is modest: when a task needs a little crawling, do it inside
 the sandbox. A user hands over an id and password, those live in memory only,
 and a browser automation client drives the requests. The longer-term goal is
-that a coding agent running in the same sandbox can reach for it as a tool.
+that an agent running as JavaScript in a browser page can use a client in
+the engine's sandbox as a tool.
 
 It is not a browser for people. There is no window, no compositor, and no
 rendering pipeline. It speaks the Chrome DevTools Protocol so that existing
@@ -95,6 +96,13 @@ a WASIX module and uses blocking sockets only.
 both sides under Wasmer (`MODE=wasix`). The harness runs whb (E7) and
 agent-browser (E8) in the browser sandbox.
 
+**`BrowserSession`** (`harness/public/browser-session.js`) is the page-side
+adapter: `start()`, `run(argv)` and `stop()` own the engine, daemon and CLI
+processes, returning separate stdout/stderr, exit status, timeout/abort and
+truncation flags. It needs no shell or pi integration. E8 uses it and E10
+checks its lifecycle against the real SDK; see
+[`docs/browser-session.md`](docs/browser-session.md).
+
 ## Why the shape is what it is
 
 **No rendering engine.** A headless browser for automation needs the DOM, a
@@ -147,6 +155,7 @@ docs/
   wasix.md                What the WASIX run proved, and how it was measured.
   quickjs.md              Why Context::full aborts, and the context setup that works.
   credentials.md          How secrets are typed and kept from the client, and the limits.
+  browser-session.md      Page-side command adapter: results, lifecycle and SDK limits.
   backlog.md              What is measured, what is left, and what was decided against.
   capture/                Raw frames and expressions from a real Chrome session.
 experiments/
@@ -156,7 +165,7 @@ experiments/
 vendor/rquickjs-sys/      QuickJS, patched; see vendor/README.md.
 tools/cdp-log-proxy/      The logging proxy used to take that capture.
 fixtures/                 Pages the M1 test serves, and fixtures/login, a login site.
-harness/                  Browser-sandbox experiments (E0-E9) and a runner page.
+harness/                  Browser-sandbox experiments (E0-E10), adapter and Node tests.
 scripts/
   verify-m0.sh            M0 acceptance test, native or WASIX.
   verify-m1.sh            M1 acceptance test: fetch, parse, script, snapshot, click.

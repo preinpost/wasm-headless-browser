@@ -11,7 +11,8 @@
 #                                                  # loads a page (E6)
 #   ENGINE=html PAGE_URL=https://example.org/ ./scripts/verify-harness.sh
 #   ENGINE=html AGENT_BROWSER_WASM=path/to/agent-browser.wasm ./scripts/verify-harness.sh
-#                                                  # adds E8: agent-browser patched
+#                                                  # adds E8/E10: browser adapter driving
+#                                                  # agent-browser patched
 #                                                  # for WASIX (experiments/agent-browser)
 #   ENGINE=html LOADS=10 RESOURCES=1 PAGE_URL=https://example.org/ ./scripts/verify-harness.sh
 #                                                  # adds E9 and resource tracing
@@ -107,7 +108,10 @@ if [[ "$ENGINE_KIND" == "html" ]]; then
   PAGE="${PAGE}&page=${PAGE_URL}&resources=${RESOURCES:-0}&loads=${LOADS:-1}"
   EXPECTED+=("E6 real engine loads a page in the sandbox")
   EXPECTED+=("E7 whb drives the engine in the sandbox")
-  [[ -n "${AGENT_BROWSER_WASM:-}" ]] && EXPECTED+=("E8 agent-browser drives the engine in the sandbox")
+  if [[ -n "${AGENT_BROWSER_WASM:-}" ]]; then
+    EXPECTED+=("E8 agent-browser drives the engine in the sandbox")
+    EXPECTED+=("E10 browser adapter returns results and stops owned processes")
+  fi
   if ((${LOADS:-1} > 1)); then EXPECTED+=("E9 repeated page loads keep the engine alive"); fi
 fi
 if [[ -n "$CURL_URL" ]]; then
@@ -174,6 +178,19 @@ else:
     fail=$((fail + 1))
   fi
 done
+
+harness_error="$(python3 -c '
+import json,sys
+try:
+    d=json.loads(sys.argv[1]); d=json.loads(d) if isinstance(d,str) else d
+    print((d.get("results", {}).get("error") or {}).get("detail", ""))
+except Exception as e:
+    print("unparseable harness result: " + str(e))
+' "$RESULTS")"
+if [[ -n "$harness_error" ]]; then
+  echo "  FAIL harness lifecycle: $harness_error"
+  fail=$((fail + 1))
+fi
 
 echo
 if ((fail > 0)); then

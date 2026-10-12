@@ -26,6 +26,7 @@ does not, CDP has to be carried over a pipe, or the client has to run outside.
 | E7 | Does **whb**, one process per command, drive the engine there? |
 | E8 | Does **agent-browser** itself, patched for WASIX, drive it there? |
 | E9 | Do repeated loads in the same engine still navigate and evaluate? |
+| E10 | Does the browser adapter return structured results and stop what it owns? |
 
 Two WASIX modules are loaded into one sandbox as commands: `engine` is the real
 `wasm-headless-browser`, and `client` is `scripts/wasix-loopback-client.rs`,
@@ -48,10 +49,19 @@ command's `/tmp` is its own, and the SDK refuses paths outside `/workspace`.
 
 E8 runs when `public/agent-browser.wasm` is served, which `verify-harness.sh`
 does for `AGENT_BROWSER_WASM=<path>` (build it with
-`../scripts/build-agent-browser-wasix.sh`). The page starts agent-browser's
-daemon as it starts the engine, since the CLI cannot spawn it under WASIX, and
-then runs `agent-browser open`, `snapshot -i` and `eval` as separate commands.
-See [`../experiments/agent-browser`](../experiments/agent-browser/README.md).
+`../scripts/build-agent-browser-wasix.sh`). The page uses `BrowserSession`
+(`public/browser-session.js`) to start the engine and agent-browser daemon,
+since the CLI cannot spawn its daemon under WASIX. It then runs `open`,
+`snapshot -i` and `eval` through the adapter as separate CLI processes.
+See [`../docs/browser-session.md`](../docs/browser-session.md) for the
+interface and [`../experiments/agent-browser`](../experiments/agent-browser/README.md)
+for the WASIX build.
+
+E10 runs alongside E8. It checks stdin evaluation, a nonzero exit with stderr,
+output truncation, AbortSignal cancellation, SDK timeout, idempotent stop,
+refusal after stop and a fresh session in the same sandbox on another port.
+Only processes and the private directory created by the adapter are its
+responsibility; the page owns and closes the sandbox.
 
 E4 and E5 are a different question from E0-E3, and need the WISP relay, because
 the browser sandbox has no direct network access. E4 opens a plain TCP
@@ -94,9 +104,9 @@ use 32 MB stacks, reused across navigations.
 
 With `LOADS=10`, E9 keeps one tab and WebSocket, navigating and evaluating
 after each load. NAVER passes E6, E7, E8 and those ten extra loads in the
-same engine (eight checks in all); allocated linear memory at the end of
-the final verification run was 339.2 MiB. This is allocated linear memory, which cannot
-shrink, not the live heap. `RESOURCES=1` prints it and QuickJS usage.
+same engine (nine checks including adapter-backed E8 and E10); allocated
+linear memory after the repeat segment was 341.5 MiB. This cannot shrink
+and is not the live heap. `RESOURCES=1` prints it and QuickJS usage.
 
 ## Running it
 
@@ -108,10 +118,16 @@ OUTBOUND=login.example.com:443 CURL=https://login.example.com/ ../scripts/verify
 ENGINE=html ../scripts/verify-harness.sh                      # adds E6
 ENGINE=html LOADS=10 RESOURCES=1 PAGE_URL=https://www.naver.com/ ../scripts/verify-harness.sh
 ENGINE=html AGENT_BROWSER_WASM=../target/agent-browser-wasix/agent-browser.wasm \
-  ../scripts/verify-harness.sh                                 # adds E8
+  ../scripts/verify-harness.sh                                 # adds E8 and E10
 ```
 
-It starts the harness and the WISP relay, refreshes `public/engine.wasm` when
+The adapter has 36 Node tests, requiring no Wasmer or browser:
+
+```bash
+(cd harness && npm test)   # from the repository root
+```
+
+The runner starts the harness and the WISP relay, refreshes `public/engine.wasm` when
 the WASIX build differs from it (and the client when its source is newer),
 opens the page, polls until the page reports it is done, and asserts on each
 expected probe. It cleans up after itself; use `../scripts/harness-stop.sh` if
@@ -167,3 +183,11 @@ Query parameters:
   bare boolean for exactly this reason.
 - `curl/curl` has to be fetched before the sandbox is created, because a
   sandbox's package set is fixed at creation time.
+- SDK 0.19.0 sometimes leaves service pipe EOF pending after confirmed
+  process exit, and immediate reuse of the old TCP port can fail. The adapter
+  bounds log observers by process exit; E10 uses a different port for an
+  immediate fresh session. See the adapter doc for the implications.
+- SDK `wasmer.close()` remained pending even after `sandbox.close()` completed
+  in a measured run. The page requests client shutdown and waits at most one
+  second, logging when it is still pending. The runner then closes the Chrome
+  page. E10 does not assert completion of SDK-client worker teardown.

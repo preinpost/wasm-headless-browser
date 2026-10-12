@@ -4,6 +4,7 @@
   "type": "module",
   "description": "Browser harness for the @wasmer/sdk sandbox questions that cannot be answered from outside it.",
   "scripts": {
+    "test": "node --test test/*.test.js",
     "vendor": "node vendor-sdk.mjs",
     "prestart": "node vendor-sdk.mjs && node copy-wasm.mjs",
     "start": "node serve.mjs",

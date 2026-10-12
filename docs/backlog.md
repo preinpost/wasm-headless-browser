@@ -13,7 +13,9 @@ macOS에서 깨지던 WASIX 빌드를 고쳤다(§6). 브라우저 샌드박스 
 불러오는 것까지 확인했다(E6, §2). 샌드박스 안 클라이언트 `whb`를 넣었고(E7), agent-browser도
 패치해 브라우저 샌드박스에서 돌렸다(E8, §5). 무거운 페이지 반복 로드도 검증했다(E9).
 다운로드 스레드를 프로세스 공용 풀로 재사용하고, 상속된 CSS 변수 맵을 공유해 스택과
-계산 스타일의 메모리 증가를 줄였다(§6). 다음 후보는 §0.4.
+계산 스타일의 메모리 증가를 줄였다(§6). 브라우저 전용 명령 실행 어댑터 `BrowserSession`도
+추가했다. `start/run/stop`으로 엔진·데몬과 CLI를 관리하며 E10에서 반환 값과 종료를 검증한다.
+다음 후보는 §0.4.
 
 ## 0. 다음 세션 시작하기
 
@@ -55,11 +57,12 @@ M1 50개, 로그인 35개를 다시 통과했다. WASIX에서도 M0 16개, 로�
 
 | 명령 | 검사 수 |
 |---|---|
-| `ENGINE=html AGENT_BROWSER_WASM=target/agent-browser-wasix/agent-browser.wasm ./scripts/verify-harness.sh` | 브라우저 샌드박스 E0·E1·E2·E4·E6·E7·E8, 7개 (2026-10-12). 모듈은 `scripts/build-agent-browser-wasix.sh`로 만든다 |
+| `ENGINE=html AGENT_BROWSER_WASM=target/agent-browser-wasix/agent-browser.wasm ./scripts/verify-harness.sh` | 브라우저 샌드박스 E0·E1·E2·E4·E6·E7·E8·E10, 8개 (2026-10-12). 모듈은 `scripts/build-agent-browser-wasix.sh`로 만든다 |
+| `(cd harness && npm test)` | 명령 실행 어댑터의 Node 테스트 36개 (2026-10-12) |
 | `./scripts/verify-client.sh`, `MODE=wasix ./scripts/verify-client.sh` | `whb`로 로그인 흐름, 31개씩 (2026-10-12) |
 | `cargo test --release --workspace` | 엔진 249, browser-core 2, cdp-wire 4, 클라이언트 9 (2026-10-12) |
 | `./scripts/verify-loads.sh`, `MODE=wasix ./scripts/verify-loads.sh` | 각각 탭 3개 × 로드 10회, 리소스 2,400개. 페이지마다 CSS 변수 1,600개와 span 800개 (2026-10-12) |
-| `ENGINE=html LOADS=10 RESOURCES=1 PAGE_URL=<공개 페이지 URL> AGENT_BROWSER_WASM=target/agent-browser-wasix/agent-browser.wasm ./scripts/verify-harness.sh` | E9 포함 8개. 네이버에서 E6·E7·E8과 추가 로드 10회 통과, 마지막 실행 선형 메모리 339.2MB (2026-10-12) |
+| `ENGINE=html LOADS=10 RESOURCES=1 PAGE_URL=<공개 페이지 URL> AGENT_BROWSER_WASM=target/agent-browser-wasix/agent-browser.wasm ./scripts/verify-harness.sh` | E9·E10 포함 9개. 네이버에서 어댑터를 통한 조작과 추가 로드 10회, CLI 중단·종료가 통과했다 (2026-10-12) |
 | `./scripts/verify-m0.sh`, `MODE=wasix ./scripts/verify-m0.sh` | 16 |
 | `./scripts/verify-m1.sh` | 50 |
 | `./scripts/verify-login.sh`, `MODE=wasix ./scripts/verify-login.sh` | 35 |
@@ -70,9 +73,11 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 ### 0.4 다음 후보
 
-- **브라우저 페이지에서 실행되는 pi와 연결한다.** E8까지는 페이지가 정해진 CLI 명령을
-  실행하는 검증이다. 실제 에이전트가 도구 호출로 `sandbox.command(...)`를 실행하고 결과를
-  받아 다음 동작을 정하는 흐름은 아직 연결하지 않았다.
+- **브라우저 페이지에서 실행되는 pi와 연결한다.** 명령 실행 어댑터는 추가했다.
+  `harness/public/browser-session.js`의 `BrowserSession`이 엔진·데몬 시작, 직렬 CLI 실행,
+  결과 반환, timeout·AbortSignal과 종료를 담당한다. 이제 pi의 도구 호출을 `browser.run(argv)`에
+  연결하고, 반환된 결과를 읽어 다음 동작을 정하는 에이전트 흐름을 구현해야 한다.
+  인터페이스와 사용법은 [docs/browser-session.md](browser-session.md)에 있다.
 
 - **과거 참조 사이트 로고 기록은 재현이 필요하다.** `<img>`에 `src`가 없다는 기록은
   있지만 이번 세션에는 재현 URL이 없었다. 대신 네이버를 검사했다. 네이버의 이미지 `src`와
@@ -685,6 +690,19 @@ E5 PASS: HTTP/1.1 200 OK
   그동안 타이머도 돌지 않는다. agent-browser 데몬이 엔진에 붙을 때 이것에 걸렸다.
   `experiments/agent-browser/mio-wasix-nonblocking.patch`가 연결 직후와 listen 직후에
   논블로킹으로 바꾼다. 엔진과 `whb`는 tokio를 쓰지 않아 해당이 없다.
+- **명령 실행 어댑터는 제공받은 샌드박스를 닫지 않는다.** `BrowserSession`은 자기가 띄운
+  엔진·데몬·CLI와 `/workspace/.browser-sessions/<세션>`만 관리한다. stdout·stderr, 종료 코드,
+  timeout·abort와 출력 잘림 여부를 별도로 반환한다. CLI가 timeout이나 중단으로 끝나더라도
+  데몬이 이미 받은 페이지 조작은 끝날 수 있으므로, 제출 같은 동작을 무조건 다시 시도하면
+  안 된다. 세션을 포기할 때는 `stop()`으로 데몬과 엔진도 종료한다.
+- **SDK 0.19.0에서는 종료 확인과 I/O 정리가 동시에 끝나지 않을 수 있다.** 실제 하니스에서
+  프로세스 종료 후 로그 파이프의 EOF가 오지 않는 경우와, 같은 포트에 즉시 새 엔진을 띄우면
+  `AddrInUse`가 나는 경우를 확인했다. 어댑터의 로그 수집기는 SDK 프로세스 종료를 기준으로
+  끝나며, 새 세션을 바로 시작하려면 다른 빈 포트나 별도로 격리한 샌드박스를 쓰는 편이 낫다.
+  종료한 샌드박스에 대해 `wasmer.close()`도 계속 대기하는 경우가 있었다. 하니스는 프로세스와
+  샌드박스 종료를 기다리고, SDK 클라이언트 종료는 요청한 뒤 최대 1초만 기다린다. 계속 대기하면
+  그 사실을 로그에 남기며, 검증 스크립트가 마지막에 Chrome 페이지를 닫는다. E10은 어댑터의
+  프로세스 생명주기를 검증한 것이며 SDK 워커 전체의 종료 완료를 증명하는 것은 아니다.
 - **`@wasmer/sdk`는 JSPI를 요구한다.** `SharedArrayBuffer`만으로는 부족하다.
   Chrome이나 Edge가 필요하다.
 - **`sha1` 크레이트를 쓰면 WASIX 빌드가 깨진다.** `cpufeatures`를 거쳐
