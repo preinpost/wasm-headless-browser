@@ -11,8 +11,7 @@
 #      applies experiments/agent-browser/wasix.patch;
 #   2. resolves the lockfile against the WASIX registry, which carries forks
 #      of tokio, mio, socket2, hyper, reqwest and others;
-#   3. copies the mio fork it picked, applies the patch in
-#      docs/wasix-org-mio-patch (where the bug is written up), and
+#   3. copies the mio fork it picked, applies mio-wasix-nonblocking.patch, and
 #      uses that copy through [patch.crates-io]. Unpatched, connected sockets
 #      stay blocking and the daemon's first wait on the engine hangs;
 #   4. builds with a wasm-capable llvm-ar (scripts/lib/llvm-ar.sh).
@@ -58,7 +57,7 @@ if [[ -z "$mio_src" ]]; then
 fi
 rm -rf "$WORK/mio"
 cp -R "$mio_src" "$WORK/mio"
-patch --quiet -p1 -d "$WORK/mio" <"$ROOT/docs/wasix-org-mio-patch/mio-wasix-nonblocking.patch"
+patch --quiet -p1 -d "$WORK/mio" <"$PATCHES/mio-wasix-nonblocking.patch"
 printf '\n[patch.crates-io]\nmio = { path = "%s" }\n' "$WORK/mio" >>Cargo.toml
 
 if [[ -z "${AR_wasm32_wasmer_wasi:-}" ]]; then

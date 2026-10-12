@@ -47,10 +47,8 @@ so every function split on those two lost its body:
 | `is_pid_alive`, `which_exists`, Playwright path, dashboard config | Small stand-ins |
 
 **`mio-wasix-nonblocking.patch`, for the WASIX fork of mio
-(`1.0.3+wasix.1`).** It lives in
-[`docs/wasix-org-mio-patch`](../../docs/wasix-org-mio-patch/README.md), with
-a minimal reproduction and an issue ready to file. The fork's `new_socket`
-says it makes a non-blocking socket and does not: `sock_open` gives a blocking one. Accepted sockets are fine
+(`1.0.3+wasix.1`).** The fork's `new_socket` says it makes a non-blocking
+socket and does not: `sock_open` gives a blocking one. Accepted sockets are fine
 (`sock_accept_v2` is asked for `FDFLAGS_NONBLOCK`), but a socket tokio
 *connects* stays blocking. A read with no data then blocks the runtime's
 thread until Wasmer's socket timeout, 30 seconds, and fails with `ETIMEDOUT`;

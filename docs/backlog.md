@@ -75,10 +75,6 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
   추정이다. 가장 먼저 확인할 것은 요청 스레드를 재사용하는 풀(호스트당 6개)과 스레드
   스택 크기다. 재현: `ENGINE=html PAGE_URL=https://www.naver.com/ ./scripts/verify-harness.sh`
   (E7 실패), 또는 같은 엔진에 `wasix-loopback-client.rs`의 `cdp` 모드를 세 번.
-- **mio WASIX 포크 버그를 업스트림에 보고한다.** 재현 프로그램, 패치, 붙여 넣을 이슈 본문이
-  [docs/wasix-org-mio-patch](wasix-org-mio-patch/README.md)에 있다. wasix-org/mio는 이슈를 받지 않으므로
-  wasmerio/wasmer에 이슈를 올리고, 원하면 `wasix-1.0.3` 브랜치에 PR을 보낸다. 고쳐진 mio가 나오면
-  `scripts/build-agent-browser-wasix.sh`에서 패치를 뺀다.
 
 - **과거 참조 사이트 로고 기록은 재현이 필요하다.** `<img>`에 `src`가 없다는 기록은
   있지만 이번 세션에는 재현 URL이 없었다. 대신 네이버를 검사했다. 네이버의 이미지 `src`와
@@ -673,7 +669,7 @@ E5 PASS: HTTP/1.1 200 OK
   `sock_open`만 부르고 논블로킹으로 만들지 않는다(accept한 소켓은 논블로킹). 그래서 tokio로
   연결한 소켓에서 데이터 없이 읽으면 런타임 스레드 전체가 30초 멈춘 뒤 `ETIMEDOUT`이 난다.
   그동안 타이머도 돌지 않는다. agent-browser 데몬이 엔진에 붙을 때 이것에 걸렸다.
-  `docs/wasix-org-mio-patch/mio-wasix-nonblocking.patch`가 연결 직후와 listen 직후에
+  `experiments/agent-browser/mio-wasix-nonblocking.patch`가 연결 직후와 listen 직후에
   논블로킹으로 바꾼다. 엔진과 `whb`는 tokio를 쓰지 않아 해당이 없다.
 - **`@wasmer/sdk`는 JSPI를 요구한다.** `SharedArrayBuffer`만으로는 부족하다.
   Chrome이나 Edge가 필요하다.

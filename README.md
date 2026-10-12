@@ -148,7 +148,6 @@ docs/
   quickjs.md              Why Context::full aborts, and the context setup that works.
   credentials.md          How secrets are typed and kept from the client, and the limits.
   backlog.md              What is measured, what is left, and what was decided against.
-  wasix-org-mio-patch/    A bug in the WASIX fork of mio: repro, patch, issue to file.
   capture/                Raw frames and expressions from a real Chrome session.
 experiments/
   quickjs/                Probe: QuickJS evaluating JavaScript inside WASIX.

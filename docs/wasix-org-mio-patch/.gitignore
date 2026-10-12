@@ -1,5 +1,0 @@
-target/
-.cargo/
-mio-patched/
-build.log
-.Cargo.lock.pinned
