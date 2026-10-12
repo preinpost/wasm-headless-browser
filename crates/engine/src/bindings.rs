@@ -421,13 +421,13 @@ fn put_reads<'js>(
     {
         let doc = Arc::clone(doc);
         install_fn!(ctx, api, "attr", move |id: usize, name: String| {
-            with_doc(&doc, |d| d.attr(id, &name.to_ascii_lowercase()).map(str::to_string)).flatten()
+            with_doc(&doc, |d| d.attr(id, &name).map(str::to_string)).flatten()
         });
     }
     {
         let doc = Arc::clone(doc);
         install_fn!(ctx, api, "hasAttr", move |id: usize, name: String| {
-            with_doc(&doc, |d| d.has_attr(id, &name.to_ascii_lowercase())).unwrap_or(false)
+            with_doc(&doc, |d| d.has_attr(id, &name)).unwrap_or(false)
         });
     }
     {
@@ -571,13 +571,13 @@ fn put_mutations<'js>(
     {
         let doc = Arc::clone(doc);
         install_fn!(ctx, api, "setAttr", move |id: usize, name: String, value: String| {
-            let _ = with_doc_mut(&doc, |d| d.set_attr(id, &name.to_ascii_lowercase(), &value));
+            let _ = with_doc_mut(&doc, |d| d.set_attr(id, &name, &value));
         });
     }
     {
         let doc = Arc::clone(doc);
         install_fn!(ctx, api, "removeAttr", move |id: usize, name: String| {
-            let _ = with_doc_mut(&doc, |d| d.remove_attr(id, &name.to_ascii_lowercase()));
+            let _ = with_doc_mut(&doc, |d| d.remove_attr(id, &name));
         });
     }
     {
@@ -796,11 +796,12 @@ fn put_geometry<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
     {
         // The cascade's answer for one property, or its initial value.
         let doc = Arc::clone(&state.doc);
-        install_fn!(ctx, api, "computedValue", move |id: usize, name: String| {
+        install_fn!(ctx, api, "computedValue", move |id: usize, name: String, pseudo: rquickjs::function::Opt<String>| {
+            let pseudo = pseudo.0.unwrap_or_default();
             with_doc(&doc, |d| {
-                crate::style::document_styles(d)
-                    .get(id)
-                    .map(|s| s.get(&name).to_string())
+                let styles = crate::style::document_styles(d);
+                let computed = if pseudo.is_empty() { styles.get(id) } else { styles.pseudo(id, &pseudo) };
+                computed.map(|s| s.get(&name).to_string())
                     .unwrap_or_else(|| crate::style::initial_value(&name).to_string())
             })
             .unwrap_or_default()
@@ -808,11 +809,13 @@ fn put_geometry<'js>(ctx: &Ctx<'js>, api: &Object<'js>, state: &Arc<DomState>) -
     }
     {
         let doc = Arc::clone(&state.doc);
-        install_fn!(ctx, api, "computedNames", move |id: usize| {
+        install_fn!(ctx, api, "computedNames", move |id: usize, pseudo: rquickjs::function::Opt<String>| {
+            let pseudo = pseudo.0.unwrap_or_default();
             with_doc(&doc, |d| {
                 let styles = crate::style::document_styles(d);
+                let computed = if pseudo.is_empty() { styles.get(id) } else { styles.pseudo(id, &pseudo) };
                 let mut names: Vec<String> =
-                    styles.get(id).map(|s| s.properties().map(|(n, _)| n.to_string()).collect()).unwrap_or_default();
+                    computed.map(|s| s.properties().map(|(n, _)| n.to_string()).collect()).unwrap_or_default();
                 names.sort();
                 names
             })

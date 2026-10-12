@@ -2504,7 +2504,7 @@ mod tests {
                 (
                     "/",
                     "text/html",
-                    "<body style='margin:0'><img id=i src=red.png>\
+                    "<body style='margin:0'><img id=i src=red.png style='vertical-align:top'>\
                      <script>window.log = []; const i = document.getElementById('i');\
                      i.onload = () => log.push('img ' + i.naturalWidth);\
                      addEventListener('load', () => log.push('window ' + i.complete));\
@@ -2533,6 +2533,62 @@ mod tests {
         let decoded = crate::images::decode(&shot).unwrap();
         assert_eq!(decoded.pixel(15, 5), [255, 0, 0, 255]);
         assert_eq!(decoded.pixel(35, 5), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn script_created_svg_logo_keeps_its_viewbox_and_paints_its_computed_fill() {
+        let html = "<style>body { margin:0 } :root { --color-logo: var(--core-green); --core-green: #03c75a } \
+             #logo { width:24px; height:24px } #logo > svg { fill:var(--color-logo) }</style>\
+             <body><div id=logo></div><script>\
+             const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');\
+             icon.setAttribute('viewBox', '0 0 24 24'); icon.setAttribute('fill', 'none');\
+             const path = document.createElementNS(icon.namespaceURI, 'path');\
+             path.setAttribute('d', 'M0 0h24v24H0z'); icon.appendChild(path);\
+             document.getElementById('logo').appendChild(icon);</script></body>";
+        let mut engine = HtmlEngine::new("t");
+        use base64::Engine as _;
+        engine.load(&format!("data:text/html;base64,{}", base64::engine::general_purpose::STANDARD.encode(html)));
+        assert_eq!(evaluate(&mut engine, "document.querySelector('svg').getAttributeNames().join()")["result"]["value"], "viewBox,fill");
+        assert_eq!(evaluate(&mut engine, "document.querySelector('svg').getAttribute('viewBox')")["result"]["value"], "0 0 24 24");
+        assert_eq!(evaluate(&mut engine, "document.querySelector('svg').hasAttribute('viewbox')")["result"]["value"], false);
+        assert_eq!(evaluate(&mut engine, "getComputedStyle(document.querySelector('svg')).fill")["result"]["value"], "#03c75a");
+        let rect = evaluate(&mut engine, "(() => { const r = document.querySelector('svg').getBoundingClientRect(); return JSON.stringify([r.width, r.height]); })()");
+        assert_eq!(rect["result"]["value"], "[24,24]");
+        let shot = screenshot_png(&mut engine, json!({ "clip": { "x": 0, "y": 0, "width": 30, "height": 30, "scale": 1 } }));
+        let decoded = crate::images::decode(&shot).unwrap();
+        assert_eq!(decoded.pixel(12, 12), [3, 199, 90, 255]);
+        assert_eq!(decoded.pixel(27, 12), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn generated_styles_are_queryable_without_leaking_render_nodes_into_the_dom() {
+        let mut engine = engine_with(
+            "<style>#label::before{content:'prefix ';color:red} #label:after{content:attr(data-suffix)}</style>\
+             <body><button id=label data-suffix='!'><span style='position:absolute;clip:rect(0,0,0,0)'>Accessible label</span></button></body>",
+        );
+        let answer = evaluate(&mut engine, "(() => { const b=document.getElementById('label'); \
+            b.getBoundingClientRect(); return JSON.stringify([getComputedStyle(b,'::before').content, \
+            getComputedStyle(b,':after').content,b.childNodes.length,b.textContent,document.querySelectorAll('whb-pseudo,whb-text').length]); })()");
+        assert_eq!(answer["result"]["value"], r#"["'prefix '","attr(data-suffix)",1,"Accessible label",0]"#);
+        let ax = dispatch(&mut engine,"Accessibility.getFullAXTree",json!({}));
+        assert!(ax["nodes"].as_array().unwrap().iter().any(|n| n["role"]["value"] == "button" && n["name"]["value"] == "Accessible label"));
+    }
+
+    #[test]
+    fn svg_attribute_apis_are_case_sensitive_but_html_attributes_are_not() {
+        let mut engine = engine_with("<div id=h></div><svg id=s viewBox='0 0 10 10'></svg>");
+        let answer = evaluate(&mut engine, "(() => {\
+            const h = document.getElementById('h'), s = document.getElementById('s');\
+            h.setAttribute('DATA-X', 'html'); s.setAttribute('viewBox', '0 0 24 24');\
+            const attr = s.attributes.getNamedItem('viewBox');\
+            const values = [h.getAttribute('data-x'), h.hasAttribute('DATA-X'),\
+              s.getAttribute('viewBox'), s.hasAttribute('viewbox'), attr.name, attr.value,\
+              s.getAttributeNode('viewBox').value, s.outerHTML.includes('viewBox=')];\
+            s.removeAttribute('viewbox'); values.push(s.hasAttribute('viewBox'));\
+            s.removeAttribute('viewBox'); values.push(s.hasAttribute('viewBox'));\
+            h.removeAttribute('DATA-X'); values.push(h.hasAttribute('data-x'));\
+            return JSON.stringify(values); })()");
+        assert_eq!(answer["result"]["value"], r#"["html",true,"0 0 24 24",false,"viewBox","0 0 24 24","0 0 24 24",true,true,false,false]"#);
     }
 
     #[test]
@@ -2688,7 +2744,8 @@ mod tests {
 
         // The screenshot shows the viewport where it is scrolled to.
         let png = screenshot_png(&mut engine, json!({}));
-        assert_eq!(crate::images::decode(&png).unwrap().pixel(50, 300), [0, 0, 255, 255]);
+        // Sample its face, away from the now-centred button label.
+        assert_eq!(crate::images::decode(&png).unwrap().pixel(5, 285), [0, 0, 255, 255]);
 
         // The wheel over the inner list scrolls the list, not the page.
         evaluate(&mut engine, "scrollTo(0, 0)");

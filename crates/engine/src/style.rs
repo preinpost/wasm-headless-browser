@@ -12,7 +12,7 @@
 //! keep: a map from node to properties that differ from the initial value.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +24,8 @@ use crate::select::{self, Context, Selector, Simple};
 #[derive(Debug, Clone, Default)]
 pub struct ComputedStyle {
     props: HashMap<String, String>,
+    /// Winning author declarations, even when they reset to initial values.
+    authored: HashSet<String>,
 }
 
 impl ComputedStyle {
@@ -37,6 +39,21 @@ impl ComputedStyle {
         self.props.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
+    pub(crate) fn inherited_text(&self) -> Self {
+        Self { props: self.props.iter().filter(|(n, _)| INHERITED.contains(&n.as_str()))
+            .map(|(n,v)| (n.clone(),v.clone())).collect(), authored: HashSet::new() }
+    }
+
+    pub(crate) fn with_value(mut self, name: &str, value: &str) -> Self {
+        self.props.insert(name.to_string(), value.to_string());
+        self
+    }
+
+    /// Whether the page owns the control's face, including explicit resets.
+    pub fn authored_face(&self) -> bool {
+        self.authored.iter().any(|n| n.starts_with("border-") || n.starts_with("background"))
+    }
+
     /// `font-size` in pixels.
     pub fn font_size(&self) -> f64 {
         self.get("font-size").trim_end_matches("px").parse().unwrap_or(16.0)
@@ -44,14 +61,23 @@ impl ComputedStyle {
 }
 
 /// Computed styles for every element of a document.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Styles {
     styles: HashMap<NodeId, ComputedStyle>,
+    pseudos: HashMap<(NodeId, String), ComputedStyle>,
 }
 
 impl Styles {
     pub fn get(&self, id: NodeId) -> Option<&ComputedStyle> {
         self.styles.get(&id)
+    }
+
+    pub fn pseudo(&self, id: NodeId, name: &str) -> Option<&ComputedStyle> {
+        self.pseudos.get(&(id, name.trim_start_matches(':').to_string()))
+    }
+
+    pub(crate) fn insert(&mut self, id: NodeId, style: ComputedStyle) {
+        self.styles.insert(id, style);
     }
 
     /// Whether the element is not rendered: it or an ancestor has
@@ -205,9 +231,15 @@ fn compute_with(doc: &Document, index: &RuleIndex, focus: Option<NodeId>) -> Sty
     while let Some((id, parent)) = stack.pop() {
         if doc.is_element(id) {
             let parent_style = parent.and_then(|p| styles.styles.get(&p)).cloned();
-            let style = cascade(doc, id, &index, ctx, parent_style.as_ref(), &root_font);
+            let style = cascade(doc, id, &index, ctx, parent_style.as_ref(), &root_font, None);
             if parent.is_none() {
                 root_font.set(style.font_size());
+            }
+            if index.has_pseudo {
+                for name in ["before", "after"] {
+                    let pseudo = cascade(doc, id, index, ctx, Some(&style), &root_font, Some(name));
+                    styles.pseudos.insert((id, name.to_string()), pseudo);
+                }
             }
             styles.styles.insert(id, style);
             for child in doc.children(id).iter().rev() {
@@ -228,6 +260,7 @@ struct IndexedRule {
     specificity: u32,
     order: u32,
     user_agent: bool,
+    pseudo_name: Option<String>,
     declarations: Arc<Vec<Declaration>>,
 }
 
@@ -236,6 +269,7 @@ struct IndexedRule {
 #[derive(Default)]
 struct RuleIndex {
     rules: Vec<IndexedRule>,
+    has_pseudo: bool,
     by_id: HashMap<String, Vec<usize>>,
     by_class: HashMap<String, Vec<usize>>,
     by_tag: HashMap<String, Vec<usize>>,
@@ -254,17 +288,22 @@ impl RuleIndex {
                 }
                 let declarations = Arc::new(rule.declarations.clone());
                 for selector in &rule.selectors {
-                    if selector.pseudo_element {
+                    if selector.pseudo_element && !matches!(selector.pseudo_name.as_deref(), Some("before" | "after")) {
                         continue;
                     }
+                    index.has_pseudo |= selector.pseudo_element;
                     let at = index.rules.len();
                     let order = at as u32;
                     index.bucket(selector, at);
+                    let mut originating = selector.clone();
+                    originating.pseudo_element = false;
+                    originating.pseudo_name = None;
                     index.rules.push(IndexedRule {
-                        selector: selector.clone(),
+                        selector: originating,
                         specificity: selector.specificity(),
                         order,
                         user_agent,
+                        pseudo_name: selector.pseudo_name.clone(),
                         declarations: Arc::clone(&declarations),
                     });
                 }
@@ -338,12 +377,27 @@ fn cascade(
     ctx: Context,
     parent: Option<&ComputedStyle>,
     root_font: &std::cell::Cell<f64>,
+    pseudo: Option<&str>,
 ) -> ComputedStyle {
     // (precedence, specificity, order) for each winning candidate.
     let mut applied: Vec<((u8, u32, u32), &Declaration)> = Vec::new();
+    // SVG presentation attributes are author declarations with zero
+    // specificity, before the stylesheets. They beat inheritance but CSS
+    // can override them, including an explicit `fill="none"`.
+    let presentation: Vec<Declaration> = if pseudo.is_none() && doc.namespace(id) == "http://www.w3.org/2000/svg" {
+        ["color", "fill", "stroke", "fill-opacity", "stroke-opacity", "stroke-width", "visibility"]
+            .iter().filter_map(|name| doc.attr(id, name).map(|value| Declaration {
+                name: name.to_string(), value: value.to_string(), important: false,
+            })).collect()
+    } else {
+        Vec::new()
+    };
+    for declaration in &presentation {
+        applied.push(((precedence(false, false, false), 0, 0), declaration));
+    }
     for at in index.candidates(doc, id) {
         let rule = &index.rules[at];
-        if !select::matches_selector(doc, id, &rule.selector, ctx) {
+        if rule.pseudo_name.as_deref() != pseudo || !select::matches_selector(doc, id, &rule.selector, ctx) {
             continue;
         }
         for declaration in rule.declarations.iter() {
@@ -351,7 +405,7 @@ fn cascade(
             applied.push((key, declaration));
         }
     }
-    let inline = doc.attr(id, "style").map(css::parse_declarations).unwrap_or_default();
+    let inline = if pseudo.is_none() { doc.attr(id, "style").map(css::parse_declarations).unwrap_or_default() } else { Vec::new() };
     for (order, declaration) in inline.iter().enumerate() {
         applied.push(((precedence(false, true, declaration.important), u32::MAX, order as u32), declaration));
     }
@@ -359,8 +413,10 @@ fn cascade(
 
     // Specified values, longhands only, the last applied winning.
     let mut specified: HashMap<String, String> = HashMap::new();
-    for (_, declaration) in &applied {
+    let mut authored = HashSet::new();
+    for (key, declaration) in &applied {
         for (name, value) in expand_shorthand(&declaration.name, &declaration.value) {
+            if matches!(key.0, 0 | 5) { authored.remove(&name); } else { authored.insert(name.clone()); }
             specified.insert(name, value);
         }
     }
@@ -375,17 +431,26 @@ fn cascade(
         }
     }
 
-    // Custom properties first, so other values can refer to them.
-    let mut custom: Vec<(&String, &String)> = specified.iter().filter(|(n, _)| n.starts_with("--")).collect();
-    custom.sort();
+    // Resolve the complete dependency graph before using or inheriting
+    // custom values. An alias may refer to a declaration that sorts later.
+    let custom = resolve_custom_properties(&specified, &props);
     for (name, value) in custom {
-        let resolved = substitute_vars(value, &props, 0);
-        props.insert(name.clone(), resolved);
+        props.remove(&name);
+        if let Some(value) = value {
+            props.insert(name, value);
+        }
     }
 
     let parent_font = parent.map(ComputedStyle::font_size).unwrap_or(16.0);
     for (name, value) in specified.iter().filter(|(n, _)| !n.starts_with("--")) {
-        let value = substitute_vars(value, &props, 0);
+        let Some(value) = substitute_vars(value, &mut |name| props.get(name).cloned()) else {
+            // Invalid at computed-value time: inherit, or use the initial
+            // value, rather than keeping an empty colour or an earlier rule.
+            if !INHERITED.contains(&name.as_str()) {
+                props.remove(name);
+            }
+            continue;
+        };
         let keyword = value.trim().to_ascii_lowercase();
         let inherits = INHERITED.contains(&name.as_str());
         match keyword.as_str() {
@@ -415,52 +480,104 @@ fn cascade(
             }
         }
     }
-    ComputedStyle { props }
+    ComputedStyle { props, authored }
 }
 
-/// Replaces `var(--name, fallback)` with the custom property's value.
-fn substitute_vars(value: &str, props: &HashMap<String, String>, depth: u8) -> String {
-    if depth > 8 || !value.contains("var(") {
-        return value.to_string();
+/// Resolves local custom properties against already-computed inherited
+/// values. Cycles include references inside unused fallbacks, per CSS
+/// Variables; only the members of a cycle are invalid, so a dependent
+/// property can still recover with a fallback.
+fn resolve_custom_properties(
+    specified: &HashMap<String, String>,
+    inherited: &HashMap<String, String>,
+) -> HashMap<String, Option<String>> {
+    struct Resolver<'a> {
+        raw: HashMap<&'a str, &'a str>,
+        inherited: &'a HashMap<String, String>,
+        resolved: HashMap<String, Option<String>>,
+        stack: Vec<String>,
+        invalid: HashSet<String>,
     }
+    impl Resolver<'_> {
+        fn resolve(&mut self, name: &str) -> Option<String> {
+            if let Some(value) = self.resolved.get(name) {
+                return value.clone();
+            }
+            let Some(&value) = self.raw.get(name) else { return self.inherited.get(name).cloned() };
+            if let Some(at) = self.stack.iter().position(|n| n == name) {
+                self.invalid.extend(self.stack[at..].iter().cloned());
+                return None;
+            }
+            self.stack.push(name.to_string());
+            // Visit every reference, including ones nested in fallbacks.
+            let mut rest = value;
+            while let Some(at) = rest.find("var(") {
+                rest = &rest[at + 4..];
+                let end = rest.find([',', ')']).unwrap_or(rest.len());
+                self.resolve(rest[..end].trim());
+            }
+            let resolved = if self.invalid.contains(name) {
+                None
+            } else {
+                match value.trim() {
+                    "initial" => None,
+                    "inherit" | "unset" | "revert" | "revert-layer" => self.inherited.get(name).cloned(),
+                    _ => substitute_vars(value, &mut |dependency| self.resolve(dependency)),
+                }
+            };
+            self.stack.pop();
+            self.resolved.insert(name.to_string(), resolved.clone());
+            resolved
+        }
+    }
+    let raw: HashMap<&str, &str> = specified.iter().filter(|(n, _)| n.starts_with("--"))
+        .map(|(n, v)| (n.as_str(), v.as_str())).collect();
+    let names: Vec<&str> = raw.keys().copied().collect();
+    let mut resolver = Resolver { raw, inherited, resolved: HashMap::new(), stack: Vec::new(), invalid: HashSet::new() };
+    for name in names {
+        resolver.resolve(name);
+    }
+    resolver.resolved
+}
+
+/// Substitutes computed custom values. `None` is guaranteed-invalid;
+/// `Some("")` is a valid empty value and must not select a fallback.
+fn substitute_vars(value: &str, lookup: &mut impl FnMut(&str) -> Option<String>) -> Option<String> {
     let mut out = String::new();
     let mut rest = value;
     while let Some(at) = rest.find("var(") {
         out.push_str(&rest[..at]);
         let inner_start = at + 4;
-        let mut depth_paren = 1;
-        let mut end = inner_start;
+        let mut depth = 1;
+        let mut end = None;
         for (i, c) in rest[inner_start..].char_indices() {
             match c {
-                '(' => depth_paren += 1,
+                '(' => depth += 1,
                 ')' => {
-                    depth_paren -= 1;
-                    if depth_paren == 0 {
-                        end = inner_start + i;
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(inner_start + i);
                         break;
                     }
                 }
                 _ => {}
             }
         }
-        if depth_paren != 0 {
-            out.push_str(&rest[at..]);
-            return out;
-        }
+        let end = end?;
         let inner = &rest[inner_start..end];
         let (name, fallback) = match inner.split_once(',') {
             Some((n, f)) => (n.trim(), Some(f.trim())),
             None => (inner.trim(), None),
         };
-        let replacement = match props.get(name) {
-            Some(v) if !v.trim().is_empty() => v.clone(),
-            _ => fallback.map(|f| substitute_vars(f, props, depth + 1)).unwrap_or_default(),
+        let replacement = match lookup(name) {
+            Some(value) => value,
+            None => substitute_vars(fallback?, lookup)?,
         };
         out.push_str(&replacement);
         rest = &rest[end + 1..];
     }
     out.push_str(rest);
-    substitute_vars(&out, props, depth + 1)
+    Some(out)
 }
 
 /// `font-size` in px: lengths, percentages, `em`/`rem`, and the keywords.
@@ -514,6 +631,7 @@ const INHERITED: &[&str] = &[
     "overflow-wrap", "word-wrap", "caret-color", "writing-mode", "user-select", "-webkit-user-select",
     "tab-size", "hyphens", "orphans", "widows", "border-collapse", "border-spacing", "caption-side",
     "empty-cells", "text-shadow", "font-stretch", "line-break", "-webkit-text-fill-color",
+    "fill", "stroke", "fill-opacity", "stroke-opacity", "stroke-width",
 ];
 
 /// A property's initial value, for the ones layout and clients read.
@@ -522,6 +640,13 @@ pub fn initial_value(name: &str) -> &'static str {
         "display" => "inline",
         "visibility" => "visible",
         "position" => "static",
+        "clip" => "auto",
+        "clip-path" => "none",
+        "content" => "normal",
+        "appearance" | "-webkit-appearance" => "auto",
+        "vertical-align" => "baseline",
+        "text-indent" => "0px",
+        "letter-spacing" | "word-spacing" => "normal",
         "opacity" => "1",
         "cursor" => "auto",
         "pointer-events" => "auto",
@@ -545,6 +670,9 @@ pub fn initial_value(name: &str) -> &'static str {
         "white-space" => "normal",
         "text-align" => "start",
         "color" => "rgb(0, 0, 0)",
+        "fill" => "black",
+        "stroke" => "none",
+        "fill-opacity" | "stroke-opacity" | "stroke-width" => "1",
         "background-color" => "rgba(0, 0, 0, 0)",
         "direction" => "ltr",
         "column-gap" | "row-gap" => "normal",
@@ -642,6 +770,14 @@ fn expand_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
             let column = parts.get(1).map(|s| s.to_string()).unwrap_or_else(|| row.clone());
             vec![("row-gap".into(), row), ("column-gap".into(), column)]
         }
+        "list-style" => {
+            let mut out = Vec::new();
+            for part in &parts {
+                if matches!(*part, "inside" | "outside") { out.push(("list-style-position".into(), part.to_string())); }
+                else if !part.starts_with("url(") { out.push(("list-style-type".into(), part.to_string())); }
+            }
+            out
+        }
         "overflow" => {
             let x = parts.first().map(|s| s.to_string()).unwrap_or_default();
             let y = parts.get(1).map(|s| s.to_string()).unwrap_or_else(|| x.clone());
@@ -727,6 +863,7 @@ ul, ol, menu, dir { padding-left: 40px }
 b, strong, th { font-weight: bold }
 a:any-link { cursor: pointer; color: #0000ee; text-decoration: underline }
 input, select, textarea, button { font-size: 13.3333px }
+button, input[type=button], input[type=submit], input[type=reset] { text-align: center }
 pre, code, kbd, samp, tt { font-family: monospace }
 pre, listing, xmp, plaintext { white-space: pre }
 textarea { white-space: pre-wrap }
@@ -830,6 +967,59 @@ mod tests {
         assert_eq!(p.get("font-size"), "15px");
         assert_eq!(p.get("display"), "block");
         assert_eq!(p.get("cursor"), "pointer");
+    }
+
+    #[test]
+    fn svg_presentation_attributes_cascade_below_css_and_are_inherited() {
+        let (doc, s) = styles(
+            "<svg id='s' color='blue' fill='none' stroke='red'><path id='p' /></svg>",
+            "svg { fill: green }",
+        );
+        let svg = s.get(by_id(&doc, "s")).unwrap();
+        let path = s.get(by_id(&doc, "p")).unwrap();
+        assert_eq!(svg.get("color"), "blue");
+        assert_eq!(svg.get("fill"), "green");
+        assert_eq!(path.get("fill"), "green");
+        assert_eq!(path.get("stroke"), "red");
+    }
+
+    #[test]
+    fn custom_properties_resolve_forward_references_before_inheritance() {
+        let (doc, s) = styles(
+            "<div id='d'><span id='s'></span></div>",
+            ":root { --color-logo: var(--core-green); --core-green: #03c75a; \
+             --a: var(--z); --z: var(--core-green); --empty: } \
+             #d { color: var(--a); background-color: var(--color-logo) } \
+             #s { --core-green: red; color: var(--color-logo); --empty-alias: var(--empty, 9px) }",
+        );
+        let d = s.get(by_id(&doc, "d")).unwrap();
+        assert_eq!(d.get("color"), "#03c75a");
+        assert_eq!(d.get("background-color"), "#03c75a");
+        let child = s.get(by_id(&doc, "s")).unwrap();
+        assert_eq!(child.get("color"), "#03c75a", "inherit the resolved alias, not its tokens");
+        assert_eq!(child.get("--empty-alias"), "", "an empty custom value does not use the fallback");
+    }
+
+    #[test]
+    fn cyclic_custom_properties_are_invalid_and_fallbacks_can_recover() {
+        let (doc, s) = styles(
+            "<div id='d'><span id='s'></span></div>",
+            "#d { --a: var(--b); --b: var(--a); --c: var(--a, green); \
+             --self: var(--missing, var(--self)); --ok: blue; \
+             --fallback-cycle: var(--ok, var(--fallback-cycle)); \
+             color: var(--c); background-color: var(--self, red); \
+             border-color: var(--fallback-cycle, teal) } \
+             #s { color: var(--a); background-color: var(--missing, var(--c)) }",
+        );
+        let d = s.get(by_id(&doc, "d")).unwrap();
+        assert_eq!(d.get("--a"), "");
+        assert_eq!(d.get("--b"), "");
+        assert_eq!(d.get("color"), "green");
+        assert_eq!(d.get("background-color"), "red");
+        assert_eq!(d.get("border-top-color"), "teal");
+        let child = s.get(by_id(&doc, "s")).unwrap();
+        assert_eq!(child.get("color"), "green", "invalid inherited property takes its parent's value");
+        assert_eq!(child.get("background-color"), "green");
     }
 
     #[test]

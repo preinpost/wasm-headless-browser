@@ -373,13 +373,14 @@ function matchMedia(query) {
 }
 
 // The engine's cascade, one property at a time, so a page reading only
-// `display` does not pay for the rest. Pseudo-elements have no computed
-// style here and read as empty.
+// `display` does not pay for the rest. Generated pseudo-elements have
+// their own cascade without becoming DOM nodes.
 function getComputedStyle(element, pseudoElement) {
   const id = element !== null && typeof element === 'object' ? nodeIds.get(element) : undefined;
-  const live = id !== undefined && isElementId(id) && !pseudoElement;
-  const lookup = (name) => (live ? api.computedValue(id, String(name)) : '');
-  const names = () => (live ? api.computedNames(id) : []);
+  const pseudo = pseudoElement ? String(pseudoElement).replace(/^:+/, '') : '';
+  const live = id !== undefined && isElementId(id) && (!pseudo || pseudo === 'before' || pseudo === 'after');
+  const lookup = (name) => (live ? api.computedValue(id, String(name), pseudo) : '');
+  const names = () => (live ? api.computedNames(id, pseudo) : []);
   const readOnly = () => {
     throw domError('NoModificationAllowedError', 'These styles are computed, and therefore read-only.');
   };

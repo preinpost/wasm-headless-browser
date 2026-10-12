@@ -26,6 +26,8 @@ pub struct Selector {
     pub parts: Vec<(Combinator, Compound)>,
     /// Set when the selector ends in a pseudo-element, such as `a::before`.
     pub pseudo_element: bool,
+    /// The trailing pseudo-element name, retained for generated boxes.
+    pub pseudo_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +153,7 @@ impl Parser {
     fn complex(&mut self, relative: bool) -> Option<Selector> {
         let mut parts = Vec::new();
         let mut pseudo_element = false;
+        let mut pseudo_name;
         let mut combinator = Combinator::Descendant;
         if relative {
             if let Some(c) = self.combinator_char() {
@@ -165,7 +168,8 @@ impl Parser {
                 return None;
             }
             let (compound, ends_in_pseudo_element) = self.compound()?;
-            pseudo_element = ends_in_pseudo_element;
+            pseudo_element = ends_in_pseudo_element.is_some();
+            pseudo_name = ends_in_pseudo_element;
             parts.push((combinator, compound));
             let had_ws = self.skip_ws();
             match self.peek() {
@@ -183,7 +187,7 @@ impl Parser {
                 }
             }
         }
-        Some(Selector { parts, pseudo_element })
+        Some(Selector { parts, pseudo_element, pseudo_name })
     }
 
     fn combinator_char(&self) -> Option<Combinator> {
@@ -196,7 +200,7 @@ impl Parser {
     }
 
     /// One compound. Also reports whether it ended in a pseudo-element.
-    fn compound(&mut self) -> Option<(Compound, bool)> {
+    fn compound(&mut self) -> Option<(Compound, Option<String>)> {
         let mut compound = Compound::default();
         let start = self.pos;
         if self.peek() == Some('*') {
@@ -230,31 +234,31 @@ impl Parser {
                 }
                 Some(':') if self.peek_at(1) == Some(':') => {
                     self.pos += 2;
-                    self.pseudo_element_name()?;
-                    return Some((compound, true));
+                    let name = self.pseudo_element_name()?;
+                    return Some((compound, Some(name)));
                 }
                 Some(':') => {
                     self.pos += 1;
                     let name = self.ident()?.to_ascii_lowercase();
                     // The legacy single-colon pseudo-elements.
                     if matches!(name.as_str(), "before" | "after" | "first-line" | "first-letter") {
-                        return Some((compound, true));
+                        return Some((compound, Some(name)));
                     }
                     compound.simple.push(Simple::Pseudo(self.pseudo_class(&name)?));
                 }
                 _ => break,
             }
         }
-        (self.pos > start).then_some((compound, false))
+        (self.pos > start).then_some((compound, None))
     }
 
-    fn pseudo_element_name(&mut self) -> Option<()> {
-        self.ident()?;
+    fn pseudo_element_name(&mut self) -> Option<String> {
+        let name = self.ident()?.to_ascii_lowercase();
         // `::part(x)`, `::slotted(x)` and friends: skip the argument.
         if self.peek() == Some('(') {
             self.skip_parenthesised()?;
         }
-        Some(())
+        Some(name)
     }
 
     fn skip_parenthesised(&mut self) -> Option<()> {
@@ -456,7 +460,7 @@ fn only(first: &str, last: &str) -> Selector {
     };
     let mut simple = pseudo(first);
     simple.extend(pseudo(last));
-    Selector { parts: vec![(Combinator::Descendant, Compound { tag: None, simple })], pseudo_element: false }
+    Selector { parts: vec![(Combinator::Descendant, Compound { tag: None, simple })], pseudo_element: false, pseudo_name: None }
 }
 
 fn is_ident_start(c: char) -> bool {

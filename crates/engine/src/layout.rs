@@ -43,6 +43,20 @@ impl Rect {
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.x && y >= self.y && x < self.x + self.width && y < self.y + self.height
     }
+
+    pub fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        Self { x, y, width: (self.x + self.width).max(other.x + other.width) - x,
+            height: (self.y + self.height).max(other.y + other.height) - y }
+    }
+
+    pub fn intersect(self, other: Self) -> Self {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        Self { x, y, width: (self.x + self.width).min(other.x + other.width) - x,
+            height: (self.y + self.height).min(other.y + other.height) - y }
+    }
 }
 
 /// What units resolve against.
@@ -412,7 +426,11 @@ fn taffy_style(style: &ComputedStyle, basis: Basis) -> Style {
 #[derive(Debug, Clone)]
 enum Content {
     Text { words: Vec<f64>, space: f64, line: f64, wrap: bool },
-    Replaced { width: f64, height: f64 },
+    Replaced { width: f64, height: f64, baseline: Option<f64> },
+    /// An SVG with a viewBox but no intrinsic width or height fills the
+    /// available width and derives its height from the viewBox ratio.
+    Svg { ratio: f64 },
+    Fragment { width: f64, line: f64, baseline: f64, blank: bool },
 }
 
 /// The advance of `c`, from the font text is painted with (`crate::font`).
@@ -448,7 +466,20 @@ impl Content {
                 let height = known.height.map(f64::from).unwrap_or(lines as f64 * line);
                 Size { width: width.ceil() as f32, height: height.ceil() as f32 }
             }
-            Content::Replaced { width, height } => {
+            Content::Fragment { width, line, .. } => Size {
+                width: known.width.unwrap_or(*width as f32), height: known.height.unwrap_or(*line as f32),
+            },
+            Content::Svg { ratio } => {
+                let width = known.width.map(f64::from)
+                    .or_else(|| known.height.map(|h| h as f64 * ratio))
+                    .unwrap_or_else(|| match available.width {
+                        AvailableSpace::Definite(w) => w as f64,
+                        AvailableSpace::MinContent => 0.0,
+                        AvailableSpace::MaxContent => 300.0,
+                    });
+                Size { width: width as f32, height: known.height.unwrap_or((width / ratio) as f32) }
+            }
+            Content::Replaced { width, height, .. } => {
                 let ratio = if *height > 0.0 { width / height } else { 0.0 };
                 match (known.width, known.height) {
                     (Some(w), Some(h)) => Size { width: w, height: h },
@@ -490,7 +521,9 @@ pub(crate) fn line_starts(words: &[f64], space: f64, width: f64) -> Vec<usize> {
 pub(crate) fn measure_with(style: &ComputedStyle) -> impl Fn(char) -> f64 {
     let font = style.font_size();
     let monospace = style.get("font-family").contains("monospace");
-    move |c| char_width(c, font, monospace)
+    let letter = style::length_px(style.get("letter-spacing"), font, 16.0, font).unwrap_or(0.0);
+    let word = style::length_px(style.get("word-spacing"), font, 16.0, font).unwrap_or(0.0);
+    move |c| char_width(c, font, monospace) + letter + if c == ' ' { word } else { 0.0 }
 }
 
 /// The size an `<img>` has of its own, if its image has arrived. Layout does
@@ -500,6 +533,19 @@ fn intrinsic_size(doc: &Document, id: NodeId) -> Option<(f64, f64)> {
     let url = doc.image_url(id)?;
     let (w, h) = doc.images()?.size(&url, std::time::Instant::now())?;
     Some((w as f64, h as f64))
+}
+
+/// A viewBox provides an aspect ratio, not intrinsic pixel dimensions.
+fn svg_ratio(doc: &Document, id: NodeId) -> Option<f64> {
+    if !doc.is_tag(id, "svg") {
+        return None;
+    }
+    let values = doc.attr(id, "viewBox")?.split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|v| !v.is_empty()).map(str::parse::<f64>).collect::<Result<Vec<_>, _>>().ok()?;
+    if values.len() != 4 || !values.iter().all(|v| v.is_finite()) || values[2] <= 0.0 || values[3] <= 0.0 {
+        return None;
+    }
+    Some(values[2] / values[3])
 }
 
 /// Chrome's default size for a replaced element or form control.
@@ -562,6 +608,7 @@ fn replaced_size(doc: &Document, id: NodeId, style: &ComputedStyle) -> Option<(f
 /// Boxes for a document, and what hit testing needs.
 #[derive(Debug, Default)]
 pub struct Layout {
+    render: Option<crate::render::RenderTree>,
     boxes: HashMap<NodeId, Rect>,
     /// Elements with a box, back to front.
     paint: Vec<NodeId>,
@@ -577,6 +624,28 @@ pub struct Layout {
 }
 
 impl Layout {
+    pub(crate) fn render_doc<'a>(&'a self, original: &'a Document) -> &'a Document {
+        self.render.as_ref().map(|r| &r.doc).unwrap_or(original)
+    }
+
+    pub(crate) fn render_styles<'a>(&'a self, original: &'a Styles) -> &'a Styles {
+        self.render.as_ref().map(|r| &r.styles).unwrap_or(original)
+    }
+
+    pub(crate) fn text_source(&self, id: NodeId) -> Option<&crate::render::TextSource> {
+        self.render.as_ref()?.text_sources.get(&id)
+    }
+
+    pub(crate) fn first_text_fragment(&self, id: NodeId, source: NodeId) -> bool {
+        self.render.as_ref().is_some_and(|r| r.text_sources.iter()
+            .filter(|(fragment, text)| text.source == source && self.boxes.contains_key(fragment))
+            .map(|(fragment, _)| *fragment).min() == Some(id))
+    }
+
+    pub(crate) fn owner(&self, id: NodeId) -> NodeId {
+        self.render.as_ref().and_then(|r| r.owners.get(&id)).copied().unwrap_or(id)
+    }
+
     /// Elements with a box, back to front.
     pub fn paint_order(&self) -> &[NodeId] {
         &self.paint
@@ -613,6 +682,25 @@ impl Layout {
         Some(Rect { x: rect.x - dx, y: rect.y - dy, ..rect })
     }
 
+    /// CSS clipping in viewport coordinates, shared by painting and hit
+    /// testing. An element's overflow clips its contents, not its own face.
+    pub fn visual_clip(&self, doc: &Document, styles: &Styles, id: NodeId, contents: bool) -> Option<Rect> {
+        let mut clip: Option<Rect> = None;
+        let render_doc = self.render_doc(doc);
+        for ancestor in std::iter::successors(Some(id), |n| render_doc.parent(*n)) {
+            let (Some(style), Some(rect)) = (styles.get(ancestor), self.client_rect(doc, ancestor)) else { continue };
+            let mut add = |r: Rect| clip = Some(clip.map(|old| old.intersect(r)).unwrap_or(r));
+            if (ancestor != id || contents) && (style.get("overflow-x") != "visible" || style.get("overflow-y") != "visible") {
+                let mut r = rect;
+                if style.get("overflow-x") == "visible" { r.x = -1e9; r.width = 2e9; }
+                if style.get("overflow-y") == "visible" { r.y = -1e9; r.height = 2e9; }
+                add(r);
+            }
+            if let Some(r) = css_clip(style, rect) { add(r); }
+        }
+        clip
+    }
+
     pub fn is_fixed(&self, id: NodeId) -> bool {
         self.fixed.contains(&id)
     }
@@ -631,7 +719,9 @@ impl Layout {
     /// Every element at a viewport point that takes pointer input, front to
     /// back.
     pub fn hits(&self, doc: &Document, styles: &Styles, x: f64, y: f64) -> Vec<NodeId> {
+        let styles = self.render_styles(styles);
         let at = |id: NodeId| self.client_rect(doc, id).is_some_and(|r| r.contains(x, y));
+        let mut seen = HashSet::new();
         self.paint
             .iter()
             .rev()
@@ -642,9 +732,38 @@ impl Layout {
                     s.get("pointer-events") != "none" && !matches!(s.get("visibility"), "hidden" | "collapse")
                 })
             })
-            .filter(|id| self.clips_of(*id).iter().all(|c| at(*c)))
+            .filter(|id| self.visual_clip(doc, styles, *id, false).is_none_or(|r| r.contains(x, y)))
+            .map(|id| self.owner(id))
+            .filter(|id| seen.insert(*id))
             .collect()
     }
+}
+
+/// Rectangular CSS clip shapes. Legacy `clip` applies only to positioned
+/// boxes; `inset()` applies to any element and resolves against its box.
+fn css_clip(style: &ComputedStyle, rect: Rect) -> Option<Rect> {
+    let resolve = |v: &str, basis: f64| style::length_px(v, style.font_size(), 16.0, basis);
+    let legacy = if matches!(style.get("position"), "absolute" | "fixed") {
+        style.get("clip").trim().strip_prefix("rect(").and_then(|v| v.strip_suffix(')')).and_then(|v| {
+            let parts: Vec<_> = v.split(|c: char| c == ',' || c.is_whitespace()).filter(|v| !v.is_empty()).collect();
+            if parts.len() != 4 { return None; }
+            let edge = |i: usize, size: f64, default: f64| if parts[i] == "auto" { Some(default) } else { resolve(parts[i], size) };
+            let (top, right, bottom, left) = (edge(0, rect.height, 0.0)?, edge(1, rect.width, rect.width)?,
+                edge(2, rect.height, rect.height)?, edge(3, rect.width, 0.0)?);
+            Some(Rect { x: rect.x + left, y: rect.y + top, width: right - left, height: bottom - top })
+        })
+    } else { None };
+    let inset = style.get("clip-path").trim().strip_prefix("inset(").and_then(|v| v.strip_suffix(')')).and_then(|v| {
+        let parts: Vec<_> = v.split("round").next()?.split_whitespace().collect();
+        let pick = |i: usize| match parts.len() {
+            1 => Some(parts[0]), 2 => Some(parts[i % 2]), 3 => Some(parts[[0, 1, 2, 1][i]]),
+            4 => Some(parts[i]), _ => None,
+        };
+        let (top, right, bottom, left) = (resolve(pick(0)?, rect.height)?, resolve(pick(1)?, rect.width)?,
+            resolve(pick(2)?, rect.height)?, resolve(pick(3)?, rect.width)?);
+        Some(Rect { x: rect.x + left, y: rect.y + top, width: rect.width - left - right, height: rect.height - top - bottom })
+    });
+    match (legacy, inset) { (Some(a), Some(b)) => Some(a.intersect(b)), (a, b) => a.or(b) }
 }
 
 /// Items an element's box contributes to its parent.
@@ -653,11 +772,13 @@ enum Item {
     Flow(taffy::NodeId, bool),
     /// Absolutely positioned within the parent.
     OutOfFlow(taffy::NodeId),
+    Break(taffy::NodeId),
 }
 
 struct Builder<'a> {
     doc: &'a Document,
     styles: &'a Styles,
+    text_sources: &'a HashMap<NodeId, crate::render::TextSource>,
     tree: TaffyTree<Content>,
     viewport: (f64, f64),
     root_font: f64,
@@ -670,8 +791,10 @@ struct Builder<'a> {
     /// layer is the document position of the nearest positioned inclusive
     /// ancestor, offset past every unpositioned element, or the element's
     /// own position when there is none.
-    order: Vec<(i64, usize, usize, NodeId)>,
+    order: Vec<(Vec<i64>, usize, usize, NodeId)>,
     clips: HashMap<NodeId, Vec<NodeId>>,
+    inline_nodes: Vec<NodeId>,
+    indent_runs: Vec<(taffy::NodeId, String, f64)>,
 }
 
 impl Builder<'_> {
@@ -679,7 +802,7 @@ impl Builder<'_> {
         Basis { font: style.font_size(), root_font: self.root_font, viewport: self.viewport }
     }
 
-    fn element(&mut self, id: NodeId, level: i64, layer: Option<usize>, clips: &[NodeId]) -> Vec<Item> {
+    fn element(&mut self, id: NodeId, level: &[i64], layer: Option<usize>, clips: &[NodeId]) -> Vec<Item> {
         let Some(style) = self.styles.get(id) else { return Vec::new() };
         let (outer, inner) = display(style);
         match outer {
@@ -689,23 +812,69 @@ impl Builder<'_> {
         }
         let position = style.get("position");
         let positioned = position != "static";
-        let level = match style.get("z-index").parse::<i64>() {
-            Ok(z) if positioned => z,
-            _ => level,
-        };
+        let z = style.get("z-index").parse::<i64>().ok().filter(|_| positioned);
+        let context = z.is_some() || style.get("transform") != "none"
+            || style.get("opacity").parse::<f64>().is_ok_and(|o| o < 1.0);
+        let mut context_path = level.to_vec();
+        if context { context_path.push(z.unwrap_or(0)); }
+        let level = context_path.as_slice();
         // In a stacking context, positioned boxes paint after the unpositioned
         // ones, in document order, each together with its unpositioned
         // descendants.
         let position_in_document = self.order.len();
         let layer = if positioned { Some(position_in_document) } else { layer };
         let layer_key = layer.map(|l| usize::MAX / 2 + l).unwrap_or(position_in_document);
-        self.order.push((level, layer_key, position_in_document, id));
+        let mut paint_path = context_path.clone();
+        // A context's face is behind even its negative-z descendants. Its
+        // descendants sort within this path and cannot escape into a
+        // neighbouring context by choosing a large z-index.
+        paint_path.push(if context { i64::MIN } else { 0 });
+        self.order.push((paint_path, layer_key, position_in_document, id));
         if !clips.is_empty() {
             self.clips.insert(id, clips.to_vec());
         }
 
+        if self.doc.is_tag(id, "br") {
+            let node = self.tree.new_leaf(Style::default()).expect("line break");
+            self.dom_of.insert(node, id);
+            self.node_of.insert(id, node);
+            return vec![Item::Break(node)];
+        }
+        let flex_item = self.doc.parent(id).and_then(|p| self.styles.get(p))
+            .is_some_and(|s| matches!(s.get("display"), "flex" | "inline-flex" | "grid" | "inline-grid"));
+        if style.get("display") == "inline" && position == "static" && !flex_item
+            && replaced_size(self.doc, id, style).is_none() {
+            self.inline_nodes.push(id);
+            return self.children(id, style, level, layer, clips, false);
+        }
         let mut taffy = taffy_style(style, self.basis(style));
-        let node = if let Some((width, height)) = replaced_size(self.doc, id, style) {
+        if !flex_item && outer == Outer::Inline {
+            taffy.align_self = match style.get("vertical-align") {
+                "top" | "text-top" => Some(AlignItems::FLEX_START),
+                "bottom" | "text-bottom" => Some(AlignItems::FLEX_END),
+                "middle" => Some(AlignItems::CENTER),
+                _ => taffy.align_self,
+            };
+        }
+        let auto_svg = svg_ratio(self.doc, id)
+            .filter(|_| !self.doc.has_attr(id, "width") && !self.doc.has_attr(id, "height"));
+        let node = if self.text_sources.contains_key(&id) {
+            let text = self.doc.text_content(id);
+            let text = match style.get("text-transform") {
+                "uppercase" => text.to_uppercase(), "lowercase" => text.to_lowercase(), _ => text,
+            };
+            let width = text.chars().map(measure_with(style)).sum();
+            let line = line_height(style);
+            let (ascent, descent) = crate::font::ascent_descent(style.font_size());
+            let baseline = (line - ascent - descent) / 2.0 + ascent;
+            taffy.flex_shrink = 0.0;
+            self.tree.new_leaf_with_context(taffy, Content::Fragment { width, line, baseline, blank: text.trim().is_empty() }).expect("inline fragment")
+        } else if let Some(ratio) = auto_svg {
+            taffy.item_is_replaced = true;
+            taffy.display = Display::Block;
+            taffy.aspect_ratio = taffy.aspect_ratio.or(Some(ratio as f32));
+            self.tree.new_leaf_with_context(taffy, Content::Svg { ratio }).expect("taffy SVG leaf")
+        } else if let Some((width, height)) = replaced_size(self.doc, id, style) {
             taffy.item_is_replaced = true;
             taffy.display = Display::Block;
             // A control keeps its own size unless styled; it is not
@@ -717,12 +886,18 @@ impl Builder<'_> {
             if css_height == "auto" && css_width == "auto" {
                 taffy.size.height = Dimension::length(height as f32);
             }
-            self.tree.new_leaf_with_context(taffy, Content::Replaced { width, height }).expect("taffy leaf")
+            let textual_control = matches!(self.doc.tag(id), Some("input" | "select"))
+                && !matches!(self.doc.attr(id,"type"), Some("checkbox" | "radio" | "range" | "color" | "image"));
+            let baseline = textual_control.then(|| {
+                let (ascent, descent) = crate::font::ascent_descent(style.font_size());
+                (ascent - descent) / 2.0
+            });
+            self.tree.new_leaf_with_context(taffy, Content::Replaced { width, height, baseline }).expect("taffy leaf")
         } else {
             // A button's content is centred vertically in it, whatever its
             // height, as Chrome lays it out: a column of line boxes, centred.
             let button = self.doc.is_tag(id, "button") && inner == Inner::Flow;
-            let inline_flow = outer == Outer::Inline && inner == Inner::Flow && !button;
+            let inline_flow = outer == Outer::Inline && inner == Inner::Flow && !button && !flex_item;
             taffy.display = match inner {
                 Inner::Flow if inline_flow => Display::Flex,
                 Inner::Flow => Display::Block,
@@ -733,7 +908,7 @@ impl Builder<'_> {
                 // An inline box: its content wraps as a row would.
                 taffy.flex_direction = FlexDirection::Row;
                 taffy.flex_wrap = FlexWrap::Wrap;
-                taffy.align_items = Some(AlignItems::FLEX_START);
+                taffy.align_items = Some(AlignItems::BASELINE);
             }
             if button {
                 taffy.display = Display::Flex;
@@ -788,7 +963,7 @@ impl Builder<'_> {
         &mut self,
         id: NodeId,
         style: &ComputedStyle,
-        level: i64,
+        level: &[i64],
         layer: Option<usize>,
         clips: &[NodeId],
         as_items: bool,
@@ -817,7 +992,30 @@ impl Builder<'_> {
                 _ => {}
             }
         }
-        items
+        if as_items {
+            // All fragments of anonymous text form one flex/grid item.
+            // Container gaps must not be inserted between its characters.
+            let mut grouped = Vec::new();
+            let mut text = Vec::new();
+            let flush = |builder: &mut Self, text: &mut Vec<Item>, grouped: &mut Vec<Item>| {
+                if text.is_empty() { return; }
+                let lines = builder.arrange(std::mem::take(text), style, false);
+                if !lines.is_empty() {
+                    let wrapper = builder.tree.new_with_children(Style { display: Display::Block, ..Style::default() }, &lines).expect("anonymous text item");
+                    grouped.push(Item::Flow(wrapper, false));
+                }
+            };
+            for item in items {
+                let fragment = match &item {
+                    Item::Flow(node, _) => matches!(self.tree.get_node_context(*node), Some(Content::Fragment { .. } | Content::Text { .. })),
+                    _ => false,
+                };
+                if fragment { text.push(item); }
+                else { flush(self, &mut text, &mut grouped); grouped.push(item); }
+            }
+            flush(self, &mut text, &mut grouped);
+            grouped
+        } else { items }
     }
 
     /// Children for the container's taffy node. In block flow, each run of
@@ -832,24 +1030,60 @@ impl Builder<'_> {
             "right" | "end" | "-webkit-right" => Some(AlignContent::FLEX_END),
             _ => None,
         };
-        let flush = |builder: &mut Self, run: &mut Vec<taffy::NodeId>, children: &mut Vec<taffy::NodeId>| {
-            if run.is_empty() {
-                return;
-            }
+        let mut first_line = true;
+        let mut flush = |builder: &mut Self, run: &mut Vec<taffy::NodeId>, children: &mut Vec<taffy::NodeId>| {
+            let blank = |id| matches!(builder.tree.get_node_context(id), Some(Content::Fragment { blank: true, .. }));
+            while run.first().is_some_and(|id| blank(*id)) { run.remove(0); }
+            while run.last().is_some_and(|id| blank(*id)) { run.pop(); }
+            if run.is_empty() { return; }
             let line = Style {
                 display: Display::Flex,
                 flex_direction: FlexDirection::Row,
-                flex_wrap: FlexWrap::Wrap,
-                align_items: Some(AlignItems::FLEX_START),
+                flex_wrap: if matches!(style.get("white-space"), "nowrap" | "pre") { FlexWrap::NoWrap } else { FlexWrap::Wrap },
+                align_items: Some(AlignItems::BASELINE),
+                min_size: Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::length(line_height(style) as f32) },
+                // Intrinsic text sizes and padding are f32 in taffy. A tiny
+                // cancelling end margin avoids an exact-fit word wrapping
+                // because the containing width lost a few ulps.
+                margin: taffy::Rect { left:LengthPercentageAuto::length(0.0), top:LengthPercentageAuto::length(0.0),
+                    bottom:LengthPercentageAuto::length(0.0), right:LengthPercentageAuto::length(-0.01) },
                 justify_content: justify,
                 ..Style::default()
             };
-            children.push(builder.tree.new_with_children(line, run).expect("taffy line"));
+            // The parent's zero-width strut supplies ascent/descent even
+            // when a line contains only an inline-block or a small icon.
+            let atomic = run.iter().any(|id| !matches!(builder.tree.get_node_context(*id),
+                Some(Content::Fragment { .. } | Content::Text { .. } | Content::Svg { .. })));
+            if atomic {
+                let height = line_height(style);
+                let (ascent, descent) = crate::font::ascent_descent(style.font_size());
+                let strut = builder.tree.new_leaf_with_context(Style { flex_shrink:0.0, ..Style::default() },
+                    Content::Fragment { width:0.0, line:height, baseline:(height-ascent-descent)/2.0+ascent, blank:false }).expect("line strut");
+                run.insert(0, strut);
+            }
+            let node = builder.tree.new_with_children(line, run).expect("taffy line");
+            if first_line {
+                let indent = style.get("text-indent");
+                if !matches!(indent, "" | "0" | "0px") { builder.indent_runs.push((node, indent.to_string(), style.font_size())); }
+                first_line = false;
+            }
+            children.push(node);
             run.clear();
         };
         for item in items {
             match item {
                 Item::OutOfFlow(node) => absolute.push(node),
+                Item::Break(node) if flat => children.push(node),
+                Item::Break(node) => {
+                    let blank_line = run.is_empty();
+                    flush(self, &mut run, &mut children);
+                    if blank_line {
+                        let mut s = self.tree.style(node).expect("break style").clone();
+                        s.size.height = Dimension::length(line_height(style) as f32);
+                        self.tree.set_style(node, s).expect("break height");
+                    }
+                    children.push(node);
+                }
                 Item::Flow(node, _) if flat => children.push(node),
                 Item::Flow(node, true) => run.push(node),
                 Item::Flow(node, false) => {
@@ -866,6 +1100,21 @@ impl Builder<'_> {
 
 /// Lays out the whole document in a viewport.
 pub fn compute(doc: &Document, styles: &Styles, viewport: (f64, f64)) -> Layout {
+    let render = crate::render::RenderTree::new(doc, styles);
+    let mut layout = compute_render(&render, viewport);
+    for (fragment, source) in &render.text_sources {
+        if let Some(rect) = layout.rect(*fragment) {
+            layout.boxes.entry(source.source).and_modify(|r| *r = r.union(rect)).or_insert(rect);
+            if let Some(clips) = layout.clips.get(fragment).cloned() { layout.clips.insert(source.source, clips); }
+            if layout.fixed.contains(fragment) { layout.fixed.insert(source.source); }
+        }
+    }
+    layout.render = Some(render);
+    layout
+}
+
+fn compute_render(render: &crate::render::RenderTree, viewport: (f64, f64)) -> Layout {
+    let (doc, styles) = (&render.doc, &render.styles);
     let root_font = doc
         .children(doc.document_id())
         .iter()
@@ -876,6 +1125,7 @@ pub fn compute(doc: &Document, styles: &Styles, viewport: (f64, f64)) -> Layout 
     let mut builder = Builder {
         doc,
         styles,
+        text_sources: &render.text_sources,
         tree: TaffyTree::new(),
         viewport,
         root_font,
@@ -884,13 +1134,15 @@ pub fn compute(doc: &Document, styles: &Styles, viewport: (f64, f64)) -> Layout 
         hoisted: Vec::new(),
         order: Vec::new(),
         clips: HashMap::new(),
+        inline_nodes: Vec::new(),
+        indent_runs: Vec::new(),
     };
     let mut top = Vec::new();
     for child in doc.children(doc.document_id()).to_vec() {
         if doc.is_element(child) {
-            for item in builder.element(child, 0, None, &[]) {
+            for item in builder.element(child, &[], None, &[]) {
                 match item {
-                    Item::Flow(node, _) | Item::OutOfFlow(node) => top.push(node),
+                    Item::Flow(node, _) | Item::OutOfFlow(node) | Item::Break(node) => top.push(node),
                 }
             }
         }
@@ -915,10 +1167,20 @@ pub fn compute(doc: &Document, styles: &Styles, viewport: (f64, f64)) -> Layout 
         // leaf algorithm applies size, padding and border around what the
         // content measures.
         |input, _node, content, style| {
-            taffy::compute_leaf_layout(input, style, |_, _| 0.0, |known, available| match &content {
+            let mut output = taffy::compute_leaf_layout(input, style, |_, _| 0.0, |known, available| match &content {
                 Some(content) => content.measure(known, available),
                 None => Size::ZERO,
-            })
+            });
+            let baseline = match content {
+                Some(Content::Fragment { baseline, .. }) => Some(*baseline as f32),
+                Some(Content::Replaced { baseline:Some(offset), .. }) => Some(output.size.height / 2.0 + *offset as f32),
+                _ => None,
+            };
+            if let Some(baseline) = baseline {
+                output.baselines.first = Some(baseline);
+                output.baselines.last = Some(baseline);
+            }
+            output
         },
     );
 
@@ -951,6 +1213,37 @@ pub fn compute(doc: &Document, styles: &Styles, viewport: (f64, f64)) -> Layout 
         }
     }
 
+    // Indentation moves only the first line of an inline run. Compare
+    // baseline positions rather than tops, which differ with font size.
+    for (run, value, font) in &builder.indent_runs {
+        let width = builder.tree.layout(*run).map(|r| r.size.width as f64).unwrap_or(0.0);
+        let indent = style::length_px(value, *font, root_font, width).unwrap_or(0.0);
+        let children = builder.tree.children(*run).unwrap_or_default();
+        let baseline = |node| {
+            let r = builder.tree.layout(node).ok()?;
+            let b = match builder.tree.get_node_context(node) {
+                Some(Content::Fragment { baseline, .. }) => *baseline,
+                _ => r.size.height as f64,
+            };
+            Some(r.location.y as f64 + b)
+        };
+        let first = children.iter().filter_map(|n| baseline(*n)).fold(f64::INFINITY, f64::min);
+        for child in children {
+            if baseline(child).is_none_or(|b| b > first + 1.0) { continue; }
+            let mut nodes = vec![child];
+            while let Some(node) = nodes.pop() {
+                if let Some(id) = builder.dom_of.get(&node) { if let Some(rect) = boxes.get_mut(id) { rect.x += indent; } }
+                nodes.extend(builder.tree.children(node).unwrap_or_default());
+            }
+        }
+    }
+    // A real inline element can own fragments on several line boxes. Its
+    // script-visible bounding box is their union; it is not an extra row.
+    for id in builder.inline_nodes.iter().rev() {
+        let rect = doc.descendants(*id).skip(1).filter_map(|child| boxes.get(&child).copied())
+            .reduce(Rect::union);
+        if let Some(rect) = rect { boxes.insert(*id, rect); }
+    }
     let mut extents: HashMap<NodeId, (f64, f64)> = HashMap::new();
     for (id, rect) in &boxes {
         for container in builder.clips.get(id).into_iter().flatten() {
@@ -962,8 +1255,8 @@ pub fn compute(doc: &Document, styles: &Styles, viewport: (f64, f64)) -> Layout 
 
     // Back to front: stacking level, then layer, then document order.
     let mut order = builder.order;
-    order.sort_by_key(|(level, layer, at, _)| (*level, *layer, *at));
-    Layout { boxes, paint: order.into_iter().map(|(_, _, _, id)| id).collect(), clips: builder.clips, fixed, extents }
+    order.sort_by(|a, b| (&a.0, a.1, a.2).cmp(&(&b.0, b.1, b.2)));
+    Layout { render: None, boxes, paint: order.into_iter().map(|(_, _, _, id)| id).collect(), clips: builder.clips, fixed, extents }
 }
 
 /// The translation part of a `transform`: `translate()`, `translateX()`,
@@ -1089,6 +1382,106 @@ mod tests {
     }
 
     #[test]
+    fn inline_words_wrap_across_nested_elements_and_keep_dom_bounds() {
+        let (doc, _, layout) = lay(
+            "<style>body{margin:0} #run{width:70px;font:10px monospace;font-size:10px;font-family:monospace;line-height:20px}</style>\
+             <body><div id=run>aaaa <span id=middle>bbbb cccc</span><span id=end> dddd</span></div></body>",
+        );
+        let render = layout.render.as_ref().unwrap();
+        let word_rect = |word: &str| render.text_sources.keys()
+            .find(|id| render.doc.text_content(**id).trim() == word).and_then(|id| layout.rect(*id)).unwrap();
+        assert_eq!(word_rect("aaaa").y, word_rect("bbbb").y);
+        assert_eq!(word_rect("cccc").y, 20.0);
+        assert_eq!(word_rect("dddd").y, 20.0);
+        assert!(rect(&doc,&layout,"middle").height >= 40.0, "one inline spans both lines");
+        assert_eq!(doc.text_content(doc.find_id(doc.document_id(),"run").unwrap()), "aaaa bbbb cccc dddd");
+    }
+
+    #[test]
+    fn mixed_font_sizes_share_a_baseline_and_br_starts_a_new_line() {
+        let (doc, _, layout) = lay(
+            "<style>body{margin:0;font-size:10px;line-height:20px} #big{font-size:20px}</style>\
+             <body><div><span id=small>small</span><span id=big>big</span></div><div id=lines>a<br>b<br><br>c</div></body>",
+        );
+        let baseline = |id: &str, size: f64| {
+            let r = rect(&doc,&layout,id);
+            let (ascent, descent) = crate::font::ascent_descent(size);
+            r.y + (20.0 - ascent - descent)/2.0 + ascent
+        };
+        assert!((baseline("small",10.0)-baseline("big",20.0)).abs() <= 1.0);
+        assert_eq!(rect(&doc,&layout,"lines").height, 80.0);
+    }
+
+    #[test]
+    fn cjk_nowrap_and_indentation_use_the_same_fragment_geometry() {
+        let (doc, _, layout) = lay(
+            "<style>body{margin:0;font-size:10px;line-height:20px} .run{width:20px} \
+             #indent{width:100px;text-indent:20%} #nowrap{white-space:nowrap}</style>\
+             <body><div id=cjk class=run>가나다라</div><div id=nowrap class=run>가나다라</div>\
+             <div id=indent><span id=label>label</span></div></body>",
+        );
+        assert_eq!(rect(&doc,&layout,"cjk").height, 40.0);
+        assert_eq!(rect(&doc,&layout,"nowrap").height, 20.0);
+        assert_eq!(rect(&doc,&layout,"label").x, 20.0);
+    }
+
+    #[test]
+    fn intrinsic_cjk_flex_items_do_not_wrap_at_fractional_exact_fit_widths() {
+        let (doc,_,layout) = lay(
+            "<style>body{margin:0} #row{display:flex;width:384px;line-height:40px;letter-spacing:-.4px} \
+             #title{display:inline-block;font-size:15.75px;padding-right:7px} \
+             #city{font-size:13.65px;margin-left:auto;flex-shrink:0}</style>\
+             <body><div id=row><a id=title>날씨</a><span id=city>서울시 을지로3가</span></div></body>",
+        );
+        assert_eq!(rect(&doc,&layout,"title").height,40.0);
+        assert_eq!(rect(&doc,&layout,"city").height,40.0);
+    }
+
+    #[test]
+    fn text_spacing_and_case_transforms_are_measured_as_they_are_painted() {
+        let (doc,_,layout) = lay(
+            "<style>body{margin:0;font-family:monospace;font-size:10px} #spaced{letter-spacing:2px;word-spacing:3px} \
+             #case{text-transform:uppercase}</style><body><span id=spaced>ab cd</span><br><span id=case>ß</span></body>",
+        );
+        assert_eq!(rect(&doc,&layout,"spaced").width,43.0);
+        assert_eq!(rect(&doc,&layout,"case").width,12.0);
+    }
+
+    #[test]
+    fn flex_gaps_apply_to_anonymous_text_items_not_individual_characters() {
+        let (doc, _, layout) = lay(
+            "<style>body{margin:0;font-size:10px;line-height:20px} #row{display:flex;gap:10px} \
+             #icon{display:block;width:10px;height:10px}</style><body><div id=row>가나다라<span id=icon></span></div></body>",
+        );
+        let text_width = "가나다라".chars().map(|c| crate::font::advance(c,10.0,false)).sum::<f64>().round();
+        assert_eq!(rect(&doc,&layout,"icon").x, text_width + 10.0, "one gap after the complete text item");
+    }
+
+    #[test]
+    fn svg_viewbox_supplies_a_ratio_not_a_fixed_intrinsic_size() {
+        let (doc, _, layout) = lay(
+            "<style>body { margin:0 } .box { width:24px; height:24px } \
+             #sized { width:40px } #tall { height:30px } #both { width:12px; height:18px }</style>\
+             <body><div class=box><svg id=square viewBox='0 0 24 24'></svg></div>\
+             <div class=box><svg id=wide viewBox='0,0,48,24'></svg></div>\
+             <svg id=sized viewBox='0 0 48 24'></svg>\
+             <svg id=tall viewBox='0 0 48 24'></svg>\
+             <svg id=both viewBox='0 0 24 24'></svg>\
+             <svg id=missing></svg><svg id=invalid viewBox='0 0 0 24'></svg>\
+             <svg id=explicit width=10 height=20 viewBox='0 0 24 24'></svg></body>",
+        );
+        for (id, expected) in [
+            ("square", (24.0, 24.0)), ("wide", (24.0, 12.0)),
+            ("sized", (40.0, 20.0)), ("tall", (60.0, 30.0)),
+            ("both", (12.0, 18.0)), ("missing", (300.0, 150.0)),
+            ("invalid", (300.0, 150.0)), ("explicit", (10.0, 20.0)),
+        ] {
+            let r = rect(&doc, &layout, id);
+            assert_eq!((r.width, r.height), expected, "{id}");
+        }
+    }
+
+    #[test]
     fn flex_rows_and_replaced_defaults() {
         let (doc, _, layout) = lay(
             "<style>body { margin: 0 } #row { display: flex; gap: 10px } #grow { flex: 1 }</style>\
@@ -1121,6 +1514,19 @@ mod tests {
     }
 
     #[test]
+    fn z_indexes_sort_inside_their_own_stacking_contexts() {
+        let (doc,styles,layout) = lay(
+            "<style>body{margin:0} .box{position:absolute;width:40px;height:40px} \
+             #low{z-index:1} #inside{z-index:999} #high{z-index:2} \
+             #parent{left:60px;z-index:3} #negative{width:10px;height:10px;z-index:-1}</style>\
+             <body><div id=low class=box><div id=inside class=box></div></div><div id=high class=box></div>\
+             <div id=parent class=box><div id=negative class=box></div></div></body>",
+        );
+        assert_eq!(id_at(&doc,&styles,&layout,5.0,5.0), "high", "a large child z-index cannot escape its parent");
+        assert_eq!(id_at(&doc,&styles,&layout,65.0,5.0), "negative", "negative children are above the context face");
+    }
+
+    #[test]
     fn a_positioned_box_paints_with_its_content() {
         // The input is not positioned, its parent is; the input still paints
         // on top of its parent, as it does in a browser.
@@ -1143,6 +1549,20 @@ mod tests {
         assert_eq!(id_at(&doc, &styles, &layout, 20.0, 20.0), "big");
         // Outside the box, the clipped child is not there; the body is.
         assert_eq!(id_at(&doc, &styles, &layout, 100.0, 20.0), "body");
+    }
+
+    #[test]
+    fn css_clipping_limits_hits_without_removing_dom_geometry() {
+        let (doc, styles, layout) = lay(
+            "<style>body{margin:0} #hide{position:absolute;width:10px;height:10px;clip:rect(0,0,0,0)} \
+             #shape{position:absolute;left:20px;width:40px;height:40px;clip-path:inset(25%)} \
+             #shape span{display:block;width:80px;height:80px}</style>\
+             <body><button id=hide>label</button><div id=shape><span id=child></span></div></body>",
+        );
+        assert_eq!(rect(&doc,&layout,"hide").width, 10.0);
+        assert_ne!(id_at(&doc,&styles,&layout,1.0,1.0), "hide");
+        assert_eq!(id_at(&doc,&styles,&layout,35.0,15.0), "child");
+        assert_ne!(id_at(&doc,&styles,&layout,21.0,1.0), "child");
     }
 
     #[test]

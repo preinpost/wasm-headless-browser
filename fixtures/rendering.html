@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Rendering regression fixture</title>
+<style>
+  body { margin:20px; font-family:monospace; font-size:14px; line-height:20px; color:#17202a; }
+  h1 { font-size:20px; line-height:28px; }
+  section { width:360px; margin:0 0 16px; padding:12px; border:1px solid #ddd; }
+  h2 { font-size:14px; line-height:20px; margin:0 0 12px; }
+  .blind { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); }
+  #clipped { position:relative; width:160px; height:24px; background:#e8f9f0; }
+  #reset { width:160px; height:28px; border:0; background:transparent; padding:0; text-align:left; }
+  #native { width:120px; height:28px; box-sizing:border-box; }
+  #icon { position:relative; display:inline-block; width:44px; height:44px; }
+  #icon::before { content:''; position:absolute; inset:0; background:#e8f9f0; border-radius:10px; }
+  #icon::after { content:'N'; position:absolute; inset:8px; color:#03c75a; font-size:24px; line-height:28px; text-align:center; }
+  #inline { width:96px; font-size:10px; line-height:20px; }
+  #mixed { font-size:10px; line-height:28px; }
+  #mixed strong { font-size:20px; }
+  #breaks { font-size:10px; line-height:20px; }
+  #stack { position:relative; width:44px; height:44px; z-index:200; background:#fff; }
+  #stack::before { content:''; position:absolute; inset:0; background:#e8f9f0; }
+  #stack::after { content:'N'; position:absolute; inset:8px; z-index:2; color:#03c75a; font-size:24px; line-height:28px; text-align:center; }
+</style>
+<body>
+<h1>Rendering regression fixture</h1>
+<section id="clipping-section">
+  <h2>1. Clipped labels remain accessible</h2>
+  <div id="clipped"><span class="blind">This label must not be painted</span>Visible text</div>
+</section>
+<section id="controls-section">
+  <h2>2. Author resets vs native controls</h2>
+  <input id="reset" placeholder="No native border"><input id="native" aria-label="Native input">
+</section>
+<section id="pseudo-section">
+  <h2>3. Generated boxes and nested stacking</h2>
+  <a id="icon" href="#inline-section" aria-label="Generated icon"></a>
+  <div id="stack" aria-label="Nested generated icon"></div>
+</section>
+<section id="inline-section">
+  <h2>4. Shared line breaking and baselines</h2>
+  <div id="inline">aaaa <span>bbbb cccc</span><span> dddd</span></div>
+  <div id="mixed">Small <strong>BIG</strong> small</div>
+  <div id="breaks">First<br>Second<br><br>Fourth</div>
+</section>
+</body>
+</html>

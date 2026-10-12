@@ -72,21 +72,37 @@ pub fn standalone(markup: &str, color: Rgba, fill: Option<&str>, stroke: Option<
         }
     }
     let rgb = format!("rgb({}, {}, {})", color.r, color.g, color.b);
-    if !open.contains(" color=") {
-        open.push_str(&format!(" color=\"{rgb}\""));
-    }
+    let mut computed = format!("color:{rgb} !important");
     for (name, value) in [("fill", fill), ("stroke", stroke)] {
         if let Some(value) = value.filter(|v| !v.is_empty()) {
-            if !open.contains(&format!(" {name}=")) {
-                let value = if value.eq_ignore_ascii_case("currentcolor") { rgb.clone() } else { value.replace('"', "'") };
-                open.push_str(&format!(" {name}=\"{value}\""));
+            let value = if value.eq_ignore_ascii_case("currentcolor") { rgb.clone() } else { value.to_string() };
+            computed.push_str(&format!(";{name}:{value} !important"));
+        }
+    }
+    computed.push(';');
+    // Computed CSS wins over presentation attributes, even `fill="none"`,
+    // and over the original inline declaration it was computed from. usvg
+    // keeps the first important declaration, so prepend the computed ones.
+    // Keep unrelated inline properties rather than replacing the style.
+    if let Some(at) = open.find(" style=") {
+        let start = at + " style=".len();
+        if let Some(quote @ ('\"' | '\'')) = open[start..].chars().next() {
+            if open[start + 1..].contains(quote) {
+                let escaped = escape_attribute(&computed, quote);
+                open.insert_str(start + 1, &escaped);
             }
         }
+    } else {
+        open.push_str(&format!(" style=\"{}\"", escape_attribute(&computed, '"')));
     }
     if self_closing {
         open.push('/');
     }
     format!("{open}{rest}")
+}
+
+fn escape_attribute(value: &str, quote: char) -> String {
+    value.replace('&', "&amp;").replace(quote, if quote == '"' { "&quot;" } else { "&apos;" })
 }
 
 #[cfg(test)]
@@ -107,10 +123,30 @@ mod tests {
     }
 
     #[test]
+    fn computed_root_style_overrides_presentation_and_inline_values() {
+        for attributes in [
+            r#"fill="none""#,
+            r#"fill="none" style="fill:red !important;opacity:0.5""#,
+            "fill='none' style='fill:red !important;opacity:0.5'",
+        ] {
+            let markup = format!(r#"<svg viewBox="0 0 4 4" {attributes}><path d="M0 0h4v4H0z"/></svg>"#);
+            let document = standalone(&markup, Rgba::rgb(0, 0, 0), Some("#03c75a"), None);
+            let image = rasterize(document.as_bytes(), 4, 4).unwrap();
+            for (actual, expected) in image.pixel(2, 2)[..3].iter().zip([3, 199, 90]) {
+                assert!(actual.abs_diff(expected) <= 1, "{document}");
+            }
+            if attributes.contains("opacity") {
+                assert!(image.pixel(2, 2)[3].abs_diff(128) <= 1, "keep the unrelated inline opacity");
+            }
+        }
+    }
+
+    #[test]
     fn inline_markup_gets_its_namespace_and_the_pages_colour() {
         let markup = r#"<svg viewBox="0 0 4 4"><path d="M0 0h4v4H0z" fill="currentColor"/></svg>"#;
         let document = standalone(markup, Rgba::rgb(0, 0, 255), None, None);
-        assert!(document.starts_with(r#"<svg viewBox="0 0 4 4" xmlns="http://www.w3.org/2000/svg" color="rgb(0, 0, 255)">"#), "{document}");
+        assert!(document.contains(r#"xmlns="http://www.w3.org/2000/svg""#), "{document}");
+        assert!(document.contains("color:rgb(0, 0, 255) !important"), "{document}");
         let image = rasterize(document.as_bytes(), 4, 4).unwrap();
         assert_eq!(image.pixel(2, 2), [0, 0, 255, 255]);
     }

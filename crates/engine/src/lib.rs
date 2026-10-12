@@ -32,6 +32,7 @@ pub mod intercept;
 pub mod js;
 pub mod layout;
 pub mod paint;
+mod render;
 pub mod parse;
 pub mod png;
 pub mod modules;

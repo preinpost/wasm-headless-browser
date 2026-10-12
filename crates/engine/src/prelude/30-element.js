@@ -1,9 +1,15 @@
 // Part 3: elements. Attributes, `classList`, `dataset`, inline `style`, markup
 // in and out, geometry, focus and clicking.
 
+// HTML attribute names fold case; SVG and other foreign elements do not.
+function attributeName(el, name) {
+  name = String(name);
+  return api.namespace(own(el)) === 'http://www.w3.org/1999/xhtml' ? name.toLowerCase() : name;
+}
+
 function setAttr(el, name, value) {
   const id = own(el);
-  name = String(name).toLowerCase();
+  name = attributeName(el, name);
   const oldValue = api.attr(id, name) ?? null;
   api.setAttr(id, name, String(value));
   queueRecord('attributes', id, { attributeName: name, oldValue });
@@ -13,7 +19,7 @@ function setAttr(el, name, value) {
 
 function removeAttr(el, name) {
   const id = own(el);
-  name = String(name).toLowerCase();
+  name = attributeName(el, name);
   if (!api.hasAttr(id, name)) return;
   const oldValue = api.attr(id, name) ?? null;
   api.removeAttr(id, name);
@@ -371,12 +377,12 @@ class Element extends Node {
     const names = api.attributeNames(own(this));
     const list = names.map((n) => attrNode(this, n));
     for (const attr of list) if (!(attr.name in list)) list[attr.name] = attr;
-    list.getNamedItem = (n) => (this.hasAttribute(n) ? attrNode(this, String(n).toLowerCase()) : null);
+    list.getNamedItem = (n) => (this.hasAttribute(n) ? attrNode(this, attributeName(this, n)) : null);
     list.item = (i) => list[i] ?? null;
     return list;
   }
   getAttribute(name) {
-    return api.attr(own(this), String(name)) ?? null;
+    return api.attr(own(this), attributeName(this, name)) ?? null;
   }
   getAttributeNS(namespace, name) {
     return this.getAttribute(String(name).split(':').pop());
@@ -394,7 +400,7 @@ class Element extends Node {
     removeAttr(this, String(name).split(':').pop());
   }
   hasAttribute(name) {
-    return api.hasAttr(own(this), String(name));
+    return api.hasAttr(own(this), attributeName(this, name));
   }
   hasAttributeNS(namespace, name) {
     return this.hasAttribute(String(name).split(':').pop());
@@ -406,7 +412,7 @@ class Element extends Node {
     return api.attributeNames(own(this));
   }
   getAttributeNode(name) {
-    return this.hasAttribute(name) ? attrNode(this, String(name).toLowerCase()) : null;
+    return this.hasAttribute(name) ? attrNode(this, attributeName(this, name)) : null;
   }
   toggleAttribute(name, force) {
     const has = this.hasAttribute(name);

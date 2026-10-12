@@ -276,8 +276,9 @@ pub fn paint(doc: &Document, region: Region, focus: Option<NodeId>, scrub: &dyn 
     let height = (region.height * region.scale).round().max(1.0) as u32;
     let (background, propagated) = canvas_background(doc, &styles);
     let mut painter = Painter {
-        doc,
-        styles: &styles,
+        doc: layout.render_doc(doc),
+        scroll_doc: doc,
+        styles: layout.render_styles(&styles),
         layout: &layout,
         region,
         canvas: Canvas::new(width, height, Rgba::WHITE),
@@ -323,6 +324,7 @@ fn background_color(style: &ComputedStyle) -> Option<Rgba> {
 
 struct Painter<'a> {
     doc: &'a Document,
+    scroll_doc: &'a Document,
     styles: &'a Styles,
     layout: &'a Layout,
     region: Region,
@@ -365,13 +367,13 @@ fn radius(style: &ComputedStyle, rect: &Rect) -> f64 {
 }
 
 /// Whether the page left a control's look alone, so Chrome would draw its
-/// own: no border, no background and no `appearance: none`. A page that
-/// sets `border: none; background: transparent` on purpose gets Chrome's
-/// look here; that cannot be told apart without knowing where a value came
-/// from.
+/// own. Explicit author resets such as `border:0; background:transparent`
+/// suppress the native face even though their computed values look like
+/// defaults. Typography alone does not suppress native controls.
 fn native_look(style: &ComputedStyle) -> bool {
     let appearance = [style.get("appearance"), style.get("-webkit-appearance")];
     !appearance.contains(&"none")
+        && !style.authored_face()
         && border_widths(style).iter().all(|w| *w == 0.0)
         && !background_color(style).is_some_and(|c| c.is_visible())
 }
@@ -382,8 +384,8 @@ impl Painter<'_> {
     /// The region painted is in the same space, so the viewport at the
     /// current scroll is `(scrollX, scrollY, width, height)`.
     fn placed(&self, id: NodeId) -> Option<Rect> {
-        let rect = self.layout.client_rect(self.doc, id)?;
-        let (sx, sy) = self.doc.scroll_offset(self.doc.document_id());
+        let rect = self.layout.client_rect(self.scroll_doc, id)?;
+        let (sx, sy) = self.scroll_doc.scroll_offset(self.scroll_doc.document_id());
         Some(Rect { x: rect.x + sx, y: rect.y + sy, ..rect })
     }
 
@@ -423,10 +425,10 @@ impl Painter<'_> {
             return;
         }
         let mut clip = self.canvas.whole();
-        for ancestor in self.layout.clips_of(id) {
-            if let Some(r) = self.placed(*ancestor) {
-                clip = clip.intersect(self.area(&r));
-            }
+        if let Some(mut r) = self.layout.visual_clip(self.scroll_doc, self.styles, id, false) {
+            let (sx, sy) = self.scroll_doc.scroll_offset(self.scroll_doc.document_id());
+            r.x += sx; r.y += sy;
+            clip = clip.intersect(self.area(&r));
         }
         if clip.is_empty() {
             return;
@@ -434,6 +436,22 @@ impl Painter<'_> {
         let area = self.area(&rect);
         let scale = self.region.scale;
         let tag = self.doc.tag(id).unwrap_or("");
+        if tag == "whb-text" {
+            if let Some(source) = self.layout.text_source(id) {
+                let original = &self.doc.node(source.source).text;
+                // Never scrub word fragments independently: a secret can
+                // contain spaces. Scrub its whole source, then paint it once.
+                if (self.scrub)(original) != *original || original.contains("{{secret:") {
+                    if source.first || self.layout.first_text_fragment(id, source.source) {
+                        let source_style = self.styles.get(source.parent).unwrap_or(style);
+                        if let Some(r) = self.placed(source.source) { self.text(original, source_style, &r, opacity, clip); }
+                    }
+                    return;
+                }
+            }
+            self.text(&self.doc.text_content(id), style, &rect, opacity, clip);
+            return;
+        }
         let control = matches!(tag, "input" | "button" | "select" | "textarea");
         let native = control && native_look(style);
         let corner = radius(style, &rect) * scale;
@@ -466,8 +484,14 @@ impl Painter<'_> {
             self.canvas.ring(area, inner, (corner, inner_radius), colors, clip);
         }
 
+        let mut text_clip = clip;
+        if let Some(mut r) = self.layout.visual_clip(self.scroll_doc, self.styles, id, true) {
+            let (sx, sy) = self.scroll_doc.scroll_offset(self.scroll_doc.document_id());
+            r.x += sx; r.y += sy;
+            text_clip = text_clip.intersect(self.area(&r));
+        }
         if control {
-            self.control(id, tag, style, &rect, native, opacity, clip);
+            self.control(id, tag, style, &rect, native, opacity, text_clip);
         } else {
             if style.get("display") == "list-item" {
                 self.list_marker(id, style, &rect, opacity, clip);
@@ -477,7 +501,7 @@ impl Painter<'_> {
                 if matches!(self.doc.node(child).data, NodeData::Text) {
                     if let Some(text_rect) = self.placed(child) {
                         let text = self.doc.node(child).text.clone();
-                        self.text(&text, style, &text_rect, opacity, clip);
+                        self.text(&text, style, &text_rect, opacity, text_clip);
                     }
                 }
             }
@@ -525,8 +549,9 @@ impl Painter<'_> {
                 _ => 0.0,
             }
             .max(0.0);
+            let indent = if n == 0 { style::length_px(style.get("text-indent"), style.font_size(), 16.0, rect.width).unwrap_or(0.0) } else { 0.0 };
             let top = rect.y + n as f64 * line_height;
-            self.line_of_text(line, style, rect.x + offset, top, line_height, text_color(style).with_alpha(opacity), clip);
+            self.line_of_text(line, style, rect.x + offset + indent, top, line_height, text_color(style).with_alpha(opacity), clip);
         }
     }
 
@@ -548,7 +573,7 @@ impl Painter<'_> {
         for c in line.chars() {
             let advance = measure(c);
             // Monospace cells are 0.6em; the glyph sits in the middle of one.
-            let inset = if monospace { (advance - font::advance(c, size, false)) / 2.0 } else { 0.0 };
+            let inset = if monospace { (font::advance(c, size, true) - font::advance(c, size, false)) / 2.0 } else { 0.0 };
             let (cx, cy) = to_canvas(pen + inset, baseline);
             self.canvas.glyph(c, size * scale, cx, cy, color, clip);
             if bold {
@@ -1044,6 +1069,7 @@ fn background(style: &ComputedStyle) -> Background {
 pub fn background_urls(doc: &Document) -> Vec<String> {
     let styles = style::document_styles(doc);
     let layout = layout::document_layout(doc);
+    let styles = layout.render_styles(&styles);
     let base = url::Url::parse(doc.url()).ok();
     let mut urls = Vec::new();
     for id in layout.paint_order() {
@@ -1645,6 +1671,24 @@ mod tests {
     }
 
     #[test]
+    fn pseudo_elements_paint_sprite_backgrounds_and_map_hits_to_the_owner() {
+        let html = format!(
+            "<style>body{{margin:0}} #icon{{position:relative;width:30px;height:30px}} \
+             #icon::before{{content:'';position:absolute;left:0;top:0;width:20px;height:20px; \
+             background:url({}) no-repeat;background-size:20px 20px}} \
+             #icon:after{{content:'';position:absolute;left:20px;top:0;width:10px;height:10px;background:#000}}</style>\
+             <body><a id=icon href='/'> </a></body>", quadrants(),
+        );
+        let (doc, canvas) = render_with_images(&html);
+        assert_eq!(canvas.pixel(2,2), [255,0,0]);
+        assert_eq!(canvas.pixel(17,2), [0,255,0]);
+        assert_eq!(canvas.pixel(25,5), [0,0,0]);
+        let owner = doc.find_id(doc.document_id(), "icon").unwrap();
+        assert_eq!(layout::document_layout(&doc).hit_test(&doc,&style::document_styles(&doc),25.0,5.0), Some(owner));
+        assert_eq!(doc.children(owner).len(), 1, "generated boxes are not live DOM children");
+    }
+
+    #[test]
     fn gradients_run_from_stop_to_stop() {
         let (_, canvas) = render(
             "<body style='margin:0'><div style='width:100px;height:10px;background:linear-gradient(to right, #000, #fff)'></div>\
@@ -1722,6 +1766,65 @@ mod tests {
         let far = canvas.pixel(148, 40)[0];
         assert!(near < far && far < 255, "a blur fades out: {near} {far}");
         assert_eq!(canvas.pixel(170, 40), [255, 255, 255], "and ends");
+    }
+
+    #[test]
+    fn clipped_accessibility_text_does_not_paint_and_descendants_are_clipped() {
+        let (_, canvas) = render(
+            "<style>body{margin:0} .blind{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)} \
+             #shape{position:absolute;left:20px;top:20px;width:20px;height:20px;background:red;clip-path:inset(50%)} \
+             #shape span{position:absolute;left:0;top:0;width:50px;height:50px;background:blue}</style>\
+             <body><span class=blind>HIDDEN LABEL</span><div id=shape><span></span></div></body>",
+        );
+        for y in 0..80 { for x in 0..200 { assert_eq!(canvas.pixel(x, y), [255,255,255], "{x},{y}"); } }
+        let (_, indented) = render("<body style='margin:0'><div style='width:40px;height:20px;overflow:hidden;text-indent:-999px'>LABEL</div></body>");
+        assert!((0..20).all(|y| (0..40).all(|x| indented.pixel(x,y) == [255,255,255])));
+    }
+
+    #[test]
+    fn an_absolute_background_inside_an_inline_flex_control_is_visible() {
+        let html = format!(
+            "<style>body{{margin:0}} button{{border:0;background:transparent;padding:0;width:71px;height:40px;text-align:center}} \
+             #host{{display:block;position:relative;z-index:200;width:71px;height:40px}} \
+             #clip{{position:absolute;width:71px;height:40px;overflow:hidden;background:white}} \
+             #inner{{position:relative;display:inline-flex;height:40px;padding:0 15px 0 12px;justify-content:center;align-items:center;z-index:2}} \
+             #asset{{position:absolute;width:71px;height:40px;background:url({}) no-repeat;background-size:cover}}</style>\
+             <body><button><span id=host><div id=clip><div id=inner><div id=asset></div></div></div></span></button></body>", quadrants(),
+        );
+        let (doc, canvas) = render_with_images(&html);
+        let layout = layout::document_layout(&doc);
+        let asset = doc.find_id(doc.document_id(),"asset").unwrap();
+        let r = layout.rect(asset).unwrap();
+        assert!(canvas.pixel(10,10) != [255,255,255], "asset {r:?}, clip {:?}", layout.visual_clip(&doc,&style::document_styles(&doc),asset,false));
+    }
+
+    #[test]
+    fn fragmented_text_is_scrubbed_before_splitting_a_multiword_secret() {
+        let make = |label: &str| {
+            let mut doc = parse_html(&format!("<body style='margin:0'><p>Welcome {label}</p></body>"));
+            doc.set_viewport((200.0,100.0));
+            paint(&doc, Region{x:0.0,y:0.0,width:200.0,height:100.0,scale:1.0}, None,
+                &|text| text.replace("alpha beta", "{{secret:user}}"))
+        };
+        assert!(make("alpha beta").to_png() == make("{{secret:user}}").to_png());
+    }
+
+    #[test]
+    fn list_style_reset_removes_markers_without_hiding_the_text() {
+        let (_, canvas) = render("<style>body{margin:0} ul{list-style:none;padding-left:20px}</style><body><ul><li>item</li></ul></body>");
+        assert!((0..100).all(|y| (0..18).all(|x| canvas.pixel(x,y) == [255,255,255])));
+        assert!((0..100).any(|y| (20..60).any(|x| canvas.pixel(x,y) != [255,255,255])));
+    }
+
+    #[test]
+    fn author_resets_do_not_resurrect_native_control_borders() {
+        let (_, canvas) = render(
+            "<style>body{margin:0} input,button,textarea{position:absolute;top:0;width:40px;height:30px} \
+             .reset{border:0;background:transparent} #i{left:0} #b{left:50px} #t{left:100px} #native{left:150px}</style>\
+             <body><input id=i class=reset><button id=b class=reset></button><textarea id=t class=reset></textarea><input id=native></body>",
+        );
+        for x in [0,50,100] { assert_eq!(canvas.pixel(x,10), [255,255,255], "author reset at {x}"); }
+        assert_ne!(canvas.pixel(150,10), [255,255,255], "an untouched input keeps its native border");
     }
 
     #[test]
