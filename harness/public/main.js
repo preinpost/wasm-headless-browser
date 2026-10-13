@@ -102,6 +102,12 @@ async function main() {
     // first if the E5 probe is wanted.
     const packages = [pkg]
     let curlCommand = null
+    const wantBash = params.get('bash') === '1'
+    if (wantBash) {
+      log('loading wasmer/bash from the registry...')
+      packages.push(...await wasmer.packages.loadMany(['wasmer/bash']))
+      log('bash package ready')
+    }
     if (curlUrl) {
       log('loading curl/curl from the registry...')
       const [curlPkg] = await wasmer.packages.loadMany(['curl/curl'])
@@ -112,6 +118,46 @@ async function main() {
 
     sandbox = await wasmer.sandboxes.create({ packages, network })
     log('sandbox up')
+
+    // ---- E11: bash in this sandbox runs the engine and agent-browser ------
+    // Package commands land on the guest PATH. This is the deployment path:
+    // a shell, not a page calling sandbox.command for every CLI step.
+    if (wantBash) {
+      const script = [
+        'echo PATH=$PATH',
+        'command -v engine || echo engine-missing',
+        'command -v agent-browser || echo agent-browser-missing',
+        'export HOME=/workspace',
+        'export AGENT_BROWSER_SOCKET_DIR=/workspace/.agent-browser-bash',
+        'export AGENT_BROWSER_SESSION=bash',
+        'mkdir -p "$AGENT_BROWSER_SOCKET_DIR" || echo mkdir-failed',
+        'engine --engine html 127.0.0.1:9333 >/workspace/bash-engine.log 2>&1 &',
+        'echo engine-pid=$!',
+        'AGENT_BROWSER_DAEMON=1 agent-browser >/workspace/bash-daemon.log 2>&1 &',
+        'echo daemon-pid=$!',
+        'for i in $(seq 1 150); do',
+        '  if [ -s "$AGENT_BROWSER_SOCKET_DIR/bash.port" ]; then break; fi',
+        '  sleep 0.1',
+        'done',
+        'echo port=$(cat "$AGENT_BROWSER_SOCKET_DIR/bash.port" 2>/dev/null || echo missing)',
+        'agent-browser --cdp http://127.0.0.1:9333 open ' + JSON.stringify(pageUrl) + ' || echo open-failed',
+        'agent-browser --cdp http://127.0.0.1:9333 snapshot -i || echo snapshot-failed',
+        'agent-browser --cdp http://127.0.0.1:9333 eval document.title || echo eval-failed',
+      ].join('\n')
+      try {
+        const out = await sandbox.command('bash', ['-c', script]).run({ timeoutMs: 120_000, check: false })
+        const text = (out.stdout?.text?.() ?? '') + (out.stderr?.text?.() ?? '')
+        for (const line of text.split('\n')) if (line.trim()) log(`  [bash] ${line}`)
+        const found = /\/usr\/bin\/engine/.test(text) && /\/usr\/bin\/agent-browser/.test(text)
+        const drove = text.includes('\u2713') && /ref=e\d+/.test(text) && /"[^"]+"/.test(text)
+        const ok = out.ok && found && drove
+        record('E11 bash drives the WASM engine with agent-browser', ok,
+          ok ? 'bash PATH has engine and agent-browser; open, snapshot and eval succeeded' :
+            `exit=${out.exitCode} ${out.reason}; ${text.trim().slice(0, 220) || 'no output'}`)
+      } catch (e) {
+        record('E11 bash drives the WASM engine with agent-browser', false, e?.message ?? String(e))
+      }
+    }
 
     // ---- E4 first: egress does not depend on anything the engine does ------
     if (outbound) {

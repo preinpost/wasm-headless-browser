@@ -14,7 +14,8 @@
 #                                                  # adds E8/E10: browser adapter driving
 #                                                  # agent-browser patched
 #                                                  # for WASIX (experiments/agent-browser)
-#   ENGINE=html LOADS=10 RESOURCES=1 PAGE_URL=https://example.org/ ./scripts/verify-harness.sh
+#   HARNESS_BASH=1 ENGINE=html ./scripts/verify-harness.sh
+#                                                  # adds E11: guest bash runs the engine
 #                                                  # adds E9 and resource tracing
 #
 # Requirements: the harness dependencies installed (cd harness && npm install),
@@ -103,6 +104,10 @@ done
 PAGE="http://127.0.0.1:${PORT}/?mode=wisp&wisp=ws://127.0.0.1:${WISP_PORT}/&outbound=${OUTBOUND}&outboundPath=${OUTBOUND_PATH}"
 if [[ -n "$ENGINE_KIND" ]]; then
   PAGE="${PAGE}&engine=${ENGINE_KIND}"
+fi
+if [[ "${HARNESS_BASH:-0}" == 1 ]]; then
+  PAGE="${PAGE}&bash=1"
+  EXPECTED+=("E11 bash drives the WASM engine with agent-browser")
 fi
 if [[ "$ENGINE_KIND" == "html" ]]; then
   PAGE="${PAGE}&page=${PAGE_URL}&resources=${RESOURCES:-0}&loads=${LOADS:-1}"

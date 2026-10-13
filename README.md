@@ -31,10 +31,10 @@ including its WASIX build driving this engine inside a browser sandbox
 The WASIX client needs the platform patches and separately started daemon
 described below; ordinary agent-browser commands still use `--cdp`.
 
-The browser harness currently invokes guest commands through
-`sandbox.command(...)`. Executing them from the sandbox's bash/PATH is a
-remaining deployment check. Running pi itself there is a separate consumer
-integration, not proof required of the web engine. Web-platform and CDP
+In the browser sandbox, guest bash can run both from `PATH`
+(`/usr/bin/engine`, `/usr/bin/agent-browser`) and drive a page with ordinary
+shell commands (E11, `HARNESS_BASH=1`). Running pi itself there is a separate
+consumer integration, not proof required of the web engine. Web-platform and CDP
 compatibility are still partial; this is not a complete Chrome replacement
 for every command or site.
 

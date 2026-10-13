@@ -73,14 +73,13 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 ### 0.4 다음 후보
 
-- **브라우저 Wasmer의 bash에서 agent-browser 실행 경로를 검증한다.** 이 프로젝트의 목적은
-  agent-browser가 Chrome 대신 이 WASM 엔진을 CDP로 사용하는 것이다. pi는 별개의 기존
-  에이전트이며, 새 pi 앱이나 에이전트 루프를 이 저장소에서 만드는 것은 목적이 아니다.
-  현재는 `sandbox.command(...)`로 클라이언트를 실행하는 경로를 검증했으므로, bash의 PATH에서
-  실행할 수 있도록 명령을 제공하는 것과 데몬·세션 환경 변수를 맞추는 것을 추가로 확인해야 한다.
-  `BrowserSession`은 엔진·데몬을 시작하는 보조 모듈로 사용할 수 있다. 별도 pi의 Node 런타임,
-  설치와 모델 연결은 소비자 실행 환경의 통합 과제로 구분한다.
-  어댑터 인터페이스는 [docs/browser-session.md](browser-session.md)에 있다.
+- **브라우저 Wasmer의 bash에서 별도 pi를 실행한다.** agent-browser가 Chrome 대신 이 WASM
+  엔진을 쓰는 경로와, 같은 샌드박스의 bash PATH에서 `engine`·`agent-browser`를 실행하는 경로는
+  확인했다(E11, 2026-10-12). 같은 패키지 샌드박스에 `wasmer/bash`를 넣으면 명령이
+  `/usr/bin`에 생긴다. WASIX에서는 데몬을 bash가 따로 띄워야 하고, `HOME`과
+  `AGENT_BROWSER_SOCKET_DIR`를 `/workspace` 아래로 맞춰야 한다. 새 pi 앱을 이 저장소에서
+  만드는 것은 목적이 아니다. 남은 것은 그 bash에서 기존 pi CLI와 Node 런타임이 도는지,
+  pi가 같은 agent-browser를 호출하는지를 소비자 환경에서 확인하는 일이다.
 
 - **과거 참조 사이트 로고 기록은 재현이 필요하다.** `<img>`에 `src`가 없다는 기록은
   있지만 이번 세션에는 재현 URL이 없었다. 대신 네이버를 검사했다. 네이버의 이미지 `src`와

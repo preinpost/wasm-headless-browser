@@ -27,6 +27,7 @@ does not, CDP has to be carried over a pipe, or the client has to run outside.
 | E8 | Does **agent-browser** itself, patched for WASIX, drive it there? |
 | E9 | Do repeated loads in the same engine still navigate and evaluate? |
 | E10 | Does the browser adapter return structured results and stop what it owns? |
+| E11 | Can guest **bash** find and run the engine and agent-browser? |
 
 Two WASIX modules are loaded into one sandbox as commands: `engine` is the real
 `wasm-headless-browser`, and `client` is `scripts/wasix-loopback-client.rs`,
@@ -56,6 +57,13 @@ since the CLI cannot spawn its daemon under WASIX. It then runs `open`,
 See [`../docs/browser-session.md`](../docs/browser-session.md) for the
 interface and [`../experiments/agent-browser`](../experiments/agent-browser/README.md)
 for the WASIX build.
+
+E11 runs when `bash=1` (`HARNESS_BASH=1`). The page also loads
+`wasmer/bash`. From that shell, `/usr/bin/engine` and
+`/usr/bin/agent-browser` are on `PATH`. The script starts both in the
+background, then runs `open`, `snapshot -i` and `eval` with ordinary shell
+commands. Measured on 2026-10-12 against `https://example.com/` in the
+browser sandbox.
 
 E10 runs alongside E8. It checks stdin evaluation, a nonzero exit with stderr,
 output truncation, AbortSignal cancellation, SDK timeout, idempotent stop,
@@ -119,6 +127,9 @@ ENGINE=html ../scripts/verify-harness.sh                      # adds E6
 ENGINE=html LOADS=10 RESOURCES=1 PAGE_URL=https://www.naver.com/ ../scripts/verify-harness.sh
 ENGINE=html AGENT_BROWSER_WASM=../target/agent-browser-wasix/agent-browser.wasm \
   ../scripts/verify-harness.sh                                 # adds E8 and E10
+HARNESS_BASH=1 ENGINE=html \
+  AGENT_BROWSER_WASM=../target/agent-browser-wasix/agent-browser.wasm \
+  ../scripts/verify-harness.sh                                 # adds E11
 ```
 
 The adapter has 36 Node tests, requiring no Wasmer or browser:

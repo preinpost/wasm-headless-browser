@@ -13,7 +13,9 @@ ENGINE=html AGENT_BROWSER_WASM=target/agent-browser-wasix/agent-browser.wasm \
 ```
 
 The module is 11.4 MB. Measured 2026-10-12 with Wasmer 7.5.0 and
-`@wasmer/sdk` 0.19.0.
+`@wasmer/sdk` 0.19.0. With `wasmer/bash` in the same sandbox, both commands
+are on the guest `PATH` as `/usr/bin/engine` and `/usr/bin/agent-browser`.
+`HARNESS_BASH=1` checks that shell path (E11).
 
 ## Running it in a sandbox
 
