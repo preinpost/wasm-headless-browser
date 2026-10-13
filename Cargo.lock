@@ -151,7 +151,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "browser"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "browser-core",
  "cdp-wire",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "browser-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde_json",
 ]
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "cdp-wire"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "serde_json",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "engine"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "ab_glyph",
  "base64 0.22.1",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "engine-fake"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "browser-core",
@@ -1641,7 +1641,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "whb-client"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "cdp-wire",
