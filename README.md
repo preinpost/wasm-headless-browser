@@ -1,19 +1,42 @@
 # wasm-headless-browser
 
-A CDP-speaking headless browser, built to run inside a WASIX sandbox so that
-browser automation can happen where the credentials are.
+A CDP-speaking headless web engine, compiled to WASIX for use in a Wasmer
+sandbox.
 
-The immediate goal is modest: when a task needs a little crawling, do it inside
-the sandbox. A user hands over an id and password, those live in memory only,
-and a browser automation client drives the requests. The longer-term goal is
-that an agent running as JavaScript in a browser page can use a client in
-the engine's sandbox as a tool.
+## Purpose
 
-It is not a browser for people. There is no window, no compositor, and no
-rendering pipeline. It speaks the Chrome DevTools Protocol so that existing
-clients work unchanged.
+**Let agent-browser use this project's WASM engine instead of Chrome/Chromium.**
 
-## Status: it logs in
+agent-browser remains the automation client, with its existing commands. This
+project supplies the web engine behind it: HTTP(S), DOM, JavaScript, CSS,
+layout, screenshots and the CDP surface those commands need. The engine is
+selected through agent-browser's existing `--cdp` connection, not a new
+built-in browser type or an engine plugin inside agent-browser.
+
+Existing agents, including pi, are consumers of agent-browser. Building a new
+pi agent, web agent UI or model/tool loop is not this project's purpose. The
+intended deployment includes agent-browser and the engine in the same
+browser-hosted Wasmer sandbox, callable from its bash environment.
+
+This is an automation engine, not a browser for people or a promise of full
+Chrome compatibility. It paints software screenshots but has no GUI or GPU
+compositor. Replacing Chrome here means replacing the engine agent-browser
+automates, not the host browser running the Wasmer SDK page.
+
+## Status: the core engine replacement works
+
+The CDP replacement path is implemented and tested with agent-browser 0.38.2,
+including its WASIX build driving this engine inside a browser sandbox
+(E8), repeated page loads (E9), and command/session lifecycle checks (E10).
+The WASIX client needs the platform patches and separately started daemon
+described below; ordinary agent-browser commands still use `--cdp`.
+
+The browser harness currently invokes guest commands through
+`sandbox.command(...)`. Executing them from the sandbox's bash/PATH is a
+remaining deployment check. Running pi itself there is a separate consumer
+integration, not proof required of the web engine. Web-platform and CDP
+compatibility are still partial; this is not a complete Chrome replacement
+for every command or site.
 
 `--engine html` is a real engine: it fetches over HTTP and HTTPS (TLS inside
 the guest), parses HTML, runs the page's JavaScript in QuickJS, applies its
@@ -67,9 +90,9 @@ Requests can be intercepted (`network route`, CDP's `Fetch` domain): failed,
 answered by the client, or passed on changed, while the page waits for the
 answer.
 
-Not there yet: sticky positioning, text inside SVG, and pausing at the
-response stage. The WASIX module is 6.3 MB, the font
-1.15 MB and the SVG renderer 0.8 MB of it.
+Not there yet: sticky positioning, text inside SVG, page-side WebAssembly
+(QuickJS does not provide it), and pausing at the response stage. The WASIX
+module is 6.3 MB, the font 1.15 MB and the SVG renderer 0.8 MB of it.
 
 ### Clients in the same sandbox
 
@@ -105,16 +128,16 @@ checks its lifecycle against the real SDK; see
 
 ## Why the shape is what it is
 
-**No rendering engine.** A headless browser for automation needs the DOM, a
-JavaScript engine, an accessibility tree, and approximate box geometry. It does
-not need pixels. Dropping the rendering pipeline also removes the WASI GPU
-problem, since WASI has no surface interface yet and `wasi:webgpu` is still a
-proposal.
+**No GPU compositor.** Automation primarily needs the DOM, JavaScript,
+accessibility and box geometry. The same computed layout also feeds software
+screenshots. This engine does not embed Chromium's renderer or require a
+WASI GPU surface.
 
 **CDP is the boundary.** Roughly 24 methods and 25 events are all a client
 touches. Measured, not assumed: see [`docs/cdp-surface.md`](docs/cdp-surface.md).
-Building to that boundary means any existing client works, and it means the
-engine can be replaced under it without touching clients.
+Building to that boundary lets agent-browser use the engine for the tested
+commands without changing their semantics. It does not imply support for the
+entire Chrome protocol or every other CDP client.
 
 **The engine is a trait.** `browser-core` owns protocol semantics and asks an
 `Engine` for answers. `engine-fake` and `engine` implement the same trait, and

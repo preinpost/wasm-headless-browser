@@ -73,11 +73,14 @@ WASIX 모드를 연달아 돌리면 포트 재사용 때문에 약 30초 기다�
 
 ### 0.4 다음 후보
 
-- **브라우저 페이지에서 실행되는 pi와 연결한다.** 명령 실행 어댑터는 추가했다.
-  `harness/public/browser-session.js`의 `BrowserSession`이 엔진·데몬 시작, 직렬 CLI 실행,
-  결과 반환, timeout·AbortSignal과 종료를 담당한다. 이제 pi의 도구 호출을 `browser.run(argv)`에
-  연결하고, 반환된 결과를 읽어 다음 동작을 정하는 에이전트 흐름을 구현해야 한다.
-  인터페이스와 사용법은 [docs/browser-session.md](browser-session.md)에 있다.
+- **브라우저 Wasmer의 bash에서 agent-browser 실행 경로를 검증한다.** 이 프로젝트의 목적은
+  agent-browser가 Chrome 대신 이 WASM 엔진을 CDP로 사용하는 것이다. pi는 별개의 기존
+  에이전트이며, 새 pi 앱이나 에이전트 루프를 이 저장소에서 만드는 것은 목적이 아니다.
+  현재는 `sandbox.command(...)`로 클라이언트를 실행하는 경로를 검증했으므로, bash의 PATH에서
+  실행할 수 있도록 명령을 제공하는 것과 데몬·세션 환경 변수를 맞추는 것을 추가로 확인해야 한다.
+  `BrowserSession`은 엔진·데몬을 시작하는 보조 모듈로 사용할 수 있다. 별도 pi의 Node 런타임,
+  설치와 모델 연결은 소비자 실행 환경의 통합 과제로 구분한다.
+  어댑터 인터페이스는 [docs/browser-session.md](browser-session.md)에 있다.
 
 - **과거 참조 사이트 로고 기록은 재현이 필요하다.** `<img>`에 `src`가 없다는 기록은
   있지만 이번 세션에는 재현 URL이 없었다. 대신 네이버를 검사했다. 네이버의 이미지 `src`와
