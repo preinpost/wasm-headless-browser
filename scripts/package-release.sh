@@ -38,6 +38,11 @@ WHB="$ROOT/target/wasm32-wasmer-wasi/release/whb.wasm"
 AGENT="$ROOT/target/agent-browser-wasix/agent-browser.wasm"
 if [[ -f "$WHB" || -f "$AGENT" ]]; then
   printf 'left out:\n'
-  [[ -f "$WHB" ]] && printf '  %s (test client)\n' "$WHB"
-  [[ -f "$AGENT" ]] && printf '  %s (harness fixture)\n' "$AGENT"
+  # A failing [[ ]] must not be the script's exit status under set -e.
+  if [[ -f "$WHB" ]]; then
+    printf '  %s (test client)\n' "$WHB"
+  fi
+  if [[ -f "$AGENT" ]]; then
+    printf '  %s (harness fixture)\n' "$AGENT"
+  fi
 fi
