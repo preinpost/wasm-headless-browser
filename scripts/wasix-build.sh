@@ -36,6 +36,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The WASIX rustc links host build scripts with -fuse-ld=lld and a gcc-ld
+# wrapper the toolchain does not ship. On Linux that fails with
+# "collect2: cannot find 'ld'". Opt the host target out; the wasm target
+# still uses the toolchain linker. cargo-wasix sets RUSTFLAGS itself, so this
+# has to be the target-scoped variable, not RUSTFLAGS.
+if [[ "$(uname -s)" == "Linux" && -z "${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-}" ]]; then
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C linker-features=-lld"
+fi
+
 lock_backup="$(mktemp)"
 cp Cargo.lock "$lock_backup"
 restore() {

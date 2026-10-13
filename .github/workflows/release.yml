@@ -90,11 +90,16 @@ jobs:
         with:
           toolchain-version: v2026-09-18.1+rust-1.97
 
-      - name: Install a wasm-capable llvm-ar
+      - name: Install a wasm-capable llvm-ar and the host linker
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y llvm clang
+          # build-essential provides /usr/bin/ld. The WASIX rustc links host
+          # build scripts with -fuse-ld=lld, so lld has to be present too.
+          sudo apt-get install -y build-essential binutils lld llvm clang
+          command -v ld
+          command -v cc
+          command -v ld.lld
           if ! command -v llvm-ar >/dev/null 2>&1; then
             found="$(find /usr/bin /usr/lib/llvm-* -name 'llvm-ar-*' -type f 2>/dev/null | head -1 || true)"
             if [[ -z "$found" ]]; then
@@ -110,6 +115,12 @@ jobs:
           llvm-ar --version
 
       - name: Build the engine
+        env:
+          # Host proc-macro builds use the WASIX rustc, which passes
+          # -B<sysroot>/.../gcc-ld -fuse-ld=lld. That wrapper is not in the
+          # toolchain, so collect2 reports "cannot find 'ld'". Keep lld for
+          # the wasm target; use the system linker only for the host.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C linker-features=-lld
         run: scripts/wasix-build.sh
 
       - name: Stage the release artefact
