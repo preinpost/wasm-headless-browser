@@ -253,7 +253,8 @@ fn read_secrets(specs: &[String]) -> Result<Secrets, String> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: wasm-headless-browser [--engine fake|html] [--secret NAME@ORIGIN]... [addr]\n\n  \
+        "usage: wasm-headless-browser [--version] [--engine fake|html] [--secret NAME@ORIGIN]... [addr]\n\n  \
+         --version      print the release version and exit\n  \
          --engine fake  fixed page model, no parsing (default)\n  \
          --engine html  fetches and runs real pages; no rasterizer yet\n  \
          --secret NAME@ORIGIN\n                \
@@ -283,6 +284,10 @@ fn parse_args() -> (EngineChoice, String, Vec<String>) {
                 None => usage(),
             },
             "-h" | "--help" => usage(),
+            "--version" | "-V" => {
+                println!("wasm-headless-browser {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             other if other.starts_with('-') => usage(),
             other => addr = Some(other.to_string()),
         }
@@ -311,7 +316,7 @@ fn main() -> io::Result<()> {
     let handler = CdpHandler::new(Browser::new(engine.factory(secrets)));
     let ws_url = format!("ws://{local}/devtools/browser/{}", handler.about.browser_id);
 
-    println!("wasm-headless-browser ({})", engine.label());
+    println!("wasm-headless-browser {} ({})", env!("CARGO_PKG_VERSION"), engine.label());
     println!("  discovery : http://{local}/json/version");
     println!("  websocket : {ws_url}");
     for secret in &held {

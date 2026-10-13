@@ -3,7 +3,7 @@ name = "whb-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "A small CDP client for wasm-headless-browser, built to run in the same WASIX sandbox."
+description = "Test CDP client for the harness. Not a release artefact; pi uses host agent-browser."
 
 [[bin]]
 name = "whb"

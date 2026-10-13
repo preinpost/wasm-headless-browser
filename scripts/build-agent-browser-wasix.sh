@@ -2,6 +2,11 @@
 # Builds agent-browser for WASIX, patched to run in the same sandbox as the
 # engine, and prints the module's path.
 #
+# Harness fixture, not a release artefact. The release is the engine wasm;
+# a host agent-browser drives that with --cdp. This module exists so E8, E10
+# and E11 can replay those commands inside the browser sandbox, which a host
+# WebSocket cannot enter.
+#
 #   ./scripts/build-agent-browser-wasix.sh
 #   ENGINE=html AGENT_BROWSER_WASM=target/agent-browser-wasix/agent-browser.wasm \
 #     ./scripts/verify-harness.sh                  # E8: it drives the engine

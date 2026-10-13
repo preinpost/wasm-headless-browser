@@ -10,10 +10,12 @@ uses it for E8; E10 exercises its result and lifecycle behavior.
 
 ## Use it
 
-Build the modules with `scripts/wasix-build.sh` and
+Build the engine with `scripts/wasix-build.sh` and the harness fixture with
 `scripts/build-agent-browser-wasix.sh`. Serve them as `engine.wasm` and
 `agent-browser.wasm`, and serve this module alongside the page. The existing
-harness does that when `AGENT_BROWSER_WASM` is set.
+harness does that when `AGENT_BROWSER_WASM` is set. Neither step publishes a
+release: `agent-browser.wasm` is a sandbox test input, and the release artefact
+is the engine wasm alone (`scripts/package-release.sh`).
 
 The page needs cross-origin isolation (COOP/COEP), SharedArrayBuffer and JSPI,
 as the Wasmer SDK does. Chrome is the tested browser. Outbound networking

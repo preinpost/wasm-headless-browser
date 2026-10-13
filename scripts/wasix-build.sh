@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Builds the browser for WASIX (wasm32-wasmer-wasi) and prints the artefact.
+# Builds the browser for WASIX (wasm32-wasmer-wasi) and prints the release artefact.
+#
+# The release artefact is wasm-headless-browser.wasm. The same workspace build
+# also produces whb.wasm, a test client for verify-client.sh and harness E7.
+# That file is not released. scripts/package-release.sh copies the engine only.
 #
 # Requires the WASIX toolchain:
 #
@@ -94,5 +98,10 @@ if [[ ! -f "$WASM" ]]; then
   exit 1
 fi
 
-printf '\nartefact: %s (%s)\n' "$WASM" "$(du -h "$WASM" | cut -f1)"
+printf '\nrelease artefact: %s (%s)\n' "$WASM" "$(du -h "$WASM" | cut -f1)"
+printf 'stage it: scripts/package-release.sh\n'
 printf 'run it:   scripts/wasix-run.sh 127.0.0.1:9222\n'
+WHB="$ROOT/target/wasm32-wasmer-wasi/release/whb.wasm"
+if [[ -f "$WHB" ]]; then
+  printf 'test client:  %s (%s) — not released\n' "$WHB" "$(du -h "$WHB" | cut -f1)"
+fi

@@ -1,0 +1,153 @@
+name: Release
+
+# Bump the workspace semver, build the engine, and publish that wasm.
+# A failed build does not push, so it does not consume the version.
+#
+# Actions → Release → Run workflow, on main, and choose patch, minor, or major.
+# The run commits the bump, tags v<version>, and attaches
+# wasm-headless-browser.wasm plus SHA256SUMS. Test modules are not attached.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semver level
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "Release runs only from main, not ${{ github.ref }}" >&2
+          exit 1
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Require an up-to-date main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            echo "checkout is not origin/main; re-run the workflow" >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "working tree is dirty" >&2
+            exit 1
+          fi
+
+      - name: Bump the workspace version
+        id: bump
+        run: |
+          set -euo pipefail
+          version="$(scripts/bump-version.sh "${{ inputs.bump }}")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "tag v$version already exists" >&2
+            exit 1
+          fi
+          echo "next release is v$version"
+
+      - name: Restore build caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/cargo-wasix
+            ~/.local/share/cargo-wasix
+            target
+          key: wasix-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            wasix-release-${{ runner.os }}-
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-wasix
+        uses: wasix-org/cargo-wasix@v0.1.34
+        with:
+          toolchain-version: v2026-09-18.1+rust-1.97
+
+      - name: Install a wasm-capable llvm-ar
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y llvm clang
+          if ! command -v llvm-ar >/dev/null 2>&1; then
+            found="$(find /usr/bin /usr/lib/llvm-* -name 'llvm-ar-*' -type f 2>/dev/null | head -1 || true)"
+            if [[ -z "$found" ]]; then
+              echo "llvm-ar not found" >&2
+              exit 1
+            fi
+            sudo ln -sf "$found" /usr/local/bin/llvm-ar
+            ranlib="${found/llvm-ar/llvm-ranlib}"
+            if [[ -x "$ranlib" ]]; then
+              sudo ln -sf "$ranlib" /usr/local/bin/llvm-ranlib
+            fi
+          fi
+          llvm-ar --version
+
+      - name: Build the engine
+        run: scripts/wasix-build.sh
+
+      - name: Stage the release artefact
+        run: scripts/package-release.sh
+
+      - name: Commit, tag, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release ${TAG}"
+          git tag -a "$TAG" -m "Release ${TAG}"
+          git push origin HEAD:main "$TAG"
+
+          sha="$(git rev-parse HEAD)"
+          cat > release-notes.md <<EOF
+          WASIX build of the engine, version ${VERSION}.
+
+          A host install of agent-browser drives it:
+
+          \`\`\`bash
+          wasmer run --net wasm-headless-browser.wasm -- --engine html 127.0.0.1:9222
+          agent-browser --cdp http://127.0.0.1:9222 open https://example.com
+          \`\`\`
+
+          \`wasmer run wasm-headless-browser.wasm -- --version\` prints \`${VERSION}\`.
+          The checksum is in \`SHA256SUMS\`. Test modules are not attached.
+
+          Built from \`${sha}\` with cargo-wasix 0.1.34 and WASIX toolchain \`v2026-09-18.1+rust-1.97\`.
+          EOF
+
+          gh release create "$TAG" \
+            dist/wasm-headless-browser.wasm \
+            dist/SHA256SUMS \
+            --title "$TAG" \
+            --notes-file release-notes.md

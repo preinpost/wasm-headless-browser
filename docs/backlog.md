@@ -652,6 +652,17 @@ E5 PASS: HTTP/1.1 200 OK
       `@e3` ref)을 따르며 데몬 없이 상태 파일로 ref를 잇는다(273KB). 브라우저에서 도는 pi가 쓸
       것은 agent-browser이고, `whb`는 검증과 대안으로 둔다. Playwright는 샌드박스 안 Node가
       필요해 보류했다.
+- [x] **릴리스 산출물과 테스트 모듈을 나눌지.** 나눈다. 릴리스에 올리는 파일은
+      `wasm-headless-browser.wasm` 하나다. pi는 호스트의 `agent-browser --cdp`로
+      이 엔진을 쓴다. `whb.wasm`은 `verify-client.sh`와 하네스 E7이 쓰는 테스트
+      클라이언트이고, `agent-browser.wasm`은 브라우저 샌드박스 안에서 같은 명령을
+      재현하는 E8, E10, E11용 개발 모듈이다. `loopback-client.wasm`은 프로브다.
+      세 파일 모두 릴리스에 넣지 않는다. `scripts/package-release.sh`가 엔진 wasm과
+      체크섬만 `dist/`에 복사한다.
+- [x] **버전을 어떻게 올릴지.** 워크스페이스 semver 하나를 `Cargo.toml`에 두고,
+      `main`에서 Release 워크플로를 `patch`, `minor`, `major` 중 하나로 실행한다.
+      빌드가 성공한 뒤에만 `Release vX.Y.Z` 커밋과 태그, GitHub Release를 푸시한다.
+      실패한 실행은 버전을 소비하지 않는다.
 - [ ] **백로그 말고 다른 문서도 한국어로 할지.** 현재 README와 `docs/*.md`는
       영어입니다.
 

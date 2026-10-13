@@ -14,22 +14,62 @@ selected through agent-browser's existing `--cdp` connection, not a new
 built-in browser type or an engine plugin inside agent-browser.
 
 Existing agents, including pi, are consumers of agent-browser. Building a new
-pi agent, web agent UI or model/tool loop is not this project's purpose. The
-intended deployment includes agent-browser and the engine in the same
-browser-hosted Wasmer sandbox, callable from its bash environment.
+pi agent, web agent UI or model/tool loop is not this project's purpose. pi
+runs `agent-browser` on the host, and that CLI drives this engine with
+`--cdp`. The release artefact is the engine module alone.
+
+The browser-hosted Wasmer sandbox cannot accept a WebSocket from the host
+page (E3). Modules that put a client inside that sandbox are harness fixtures,
+not part of the release. See [Artefacts](#artefacts).
 
 This is an automation engine, not a browser for people or a promise of full
 Chrome compatibility. It paints software screenshots but has no GUI or GPU
 compositor. Replacing Chrome here means replacing the engine agent-browser
 automates, not the host browser running the Wasmer SDK page.
 
+## Artefacts
+
+| File | Where it belongs |
+|---|---|
+| `wasm-headless-browser.wasm` | The release. WASIX build of the engine. A host `agent-browser --cdp` drives it. |
+| `whb.wasm` | Test client in this repo. `verify-client.sh` and harness E7. Not released. |
+| `agent-browser.wasm` | Harness fixture: agent-browser 0.38.2 patched for WASIX. E8, E10, E11. Not released. |
+| `loopback-client.wasm` | Harness probe for sandbox loopback. Not released. |
+
+None of these are committed. `scripts/wasix-build.sh` builds the engine and,
+because it is the same workspace, the test client `whb`. `scripts/package-release.sh`
+copies only `wasm-headless-browser.wasm` and a checksum into `dist/`.
+`scripts/build-agent-browser-wasix.sh` writes the agent-browser fixture under
+`target/agent-browser-wasix/`, and the harness copies whatever it needs into
+`harness/public/`.
+
+### Releasing
+
+The version is the workspace semver in `Cargo.toml` (`0.0.1` today). Members
+inherit it. The engine prints it: `wasm-headless-browser --version`.
+
+Do not tag by hand. On `main`, run the **Release** workflow and choose a level:
+
+| Level | From `0.0.1` |
+|---|---|
+| `patch` | `0.0.2` |
+| `minor` | `0.1.0` |
+| `major` | `1.0.0` |
+
+The workflow bumps that version, builds the engine, and only then pushes
+commit `Release vX.Y.Z`, tag `vX.Y.Z`, and a GitHub release whose assets are
+`wasm-headless-browser.wasm` and `SHA256SUMS`. A failed build pushes nothing,
+so it does not consume the version. `scripts/bump-version.sh` is the same bump
+the workflow runs.
+
 ## Status: the core engine replacement works
 
 The CDP replacement path is implemented and tested with agent-browser 0.38.2,
-including its WASIX build driving this engine inside a browser sandbox
-(E8), repeated page loads (E9), and command/session lifecycle checks (E10).
-The WASIX client needs the platform patches and separately started daemon
-described below; ordinary agent-browser commands still use `--cdp`.
+including a WASIX build of that CLI driving this engine inside a browser
+sandbox (E8), repeated page loads (E9), and command/session lifecycle checks
+(E10). That WASIX client is a harness fixture, not a release artefact. It
+needs the platform patches and separately started daemon described below;
+ordinary agent-browser commands still use `--cdp`.
 
 In the browser sandbox, guest bash can run both from `PATH`
 (`/usr/bin/engine`, `/usr/bin/agent-browser`) and drive a page with ordinary
@@ -94,30 +134,33 @@ Not there yet: sticky positioning, text inside SVG, page-side WebAssembly
 (QuickJS does not provide it), and pausing at the response stage. The WASIX
 module is 6.3 MB, the font 1.15 MB and the SVG renderer 0.8 MB of it.
 
-### Clients in the same sandbox
+### Sandbox test clients
 
-The client has to run inside the sandbox too: the browser sandbox has no way
-in for a WebSocket (E3). Two do, both checked in the browser sandbox by the
-harness.
+These are not a second product. The browser sandbox has no way in for a host
+WebSocket (E3), so a probe that asks its questions inside that sandbox has to
+load a client next to the engine. Two are checked there. Neither is released.
 
 **agent-browser itself**, patched for WASIX and built by
-`scripts/build-agent-browser-wasix.sh` (11.4 MB). Under WASIX the CLI cannot
-start its daemon, so whatever starts the engine starts the daemon too; see
+`scripts/build-agent-browser-wasix.sh` into
+`target/agent-browser-wasix/agent-browser.wasm` (11.4 MB). The harness uses it
+for E8, E10 and E11, which replay the commands pi already types, but inside
+the sandbox rather than on the host. Under WASIX the CLI cannot start its
+daemon, so whatever starts the engine starts the daemon too; see
 [`experiments/agent-browser`](experiments/agent-browser/README.md) for how,
 for the two patches, and for the bug in the WASIX fork of mio that one of
 them fixes.
 
-**`whb`** (`crates/client`), this repository's own. Its
-commands and output follow agent-browser's: `open`, `snapshot -i` with
-`@e3` refs, `click`, `fill` (placeholders included), `press`, `eval`, `get`,
-`screenshot`, `close`. Each command is its own process, as an agent runs
-them: the engine keeps the tab, and a small state file per session keeps the
-refs, so a ref is refused once the page it came from is gone. It is 273 KB as
-a WASIX module and uses blocking sockets only.
+**`whb`** (`crates/client`) is this repository's test client. Its commands and
+output follow a subset of agent-browser's: `open`, `snapshot -i` with `@e3`
+refs, `click`, `fill` (placeholders included), `press`, `eval`, `get`,
+`screenshot`, `close`. Each command is its own process: the engine keeps the
+tab, and a small state file per session keeps the refs, so a ref is refused
+once the page it came from is gone. It is 273 KB as a WASIX module and uses
+blocking sockets only. pi does not invoke it.
 
-`scripts/verify-client.sh` runs the login flow with it, natively and with
-both sides under Wasmer (`MODE=wasix`). The harness runs whb (E7) and
-agent-browser (E8) in the browser sandbox.
+`scripts/verify-client.sh` runs the login flow with `whb`, natively and with
+both sides under Wasmer (`MODE=wasix`). The harness runs whb (E7) and the
+patched agent-browser (E8) in the browser sandbox.
 
 **`BrowserSession`** (`harness/public/browser-session.js`) is the page-side
 adapter: `start()`, `run(argv)` and `stop()` own the engine, daemon and CLI
@@ -172,7 +215,7 @@ crates/
                   (src/prelude/*.js).
   engine-fake/    M0 engine: fixed page model, accessibility projection, PNG encoder.
   browser/        The binary. Wires a transport to an engine, chosen with --engine.
-  client/         whb, a CDP client for the sandbox: agent-browser's commands, no daemon.
+  client/         whb, a test CDP client for the harness. Not a release artefact.
 docs/
   cdp-surface.md          The measured protocol surface, and what it implies.
   wasix.md                What the WASIX run proved, and how it was measured.
@@ -199,8 +242,10 @@ scripts/
   make-font.sh            Rebuilds the embedded font subset.
   verify-harness.sh       Runs the browser-sandbox probes and judges them.
   harness-stop.sh         Frees the harness ports if a manual run was abandoned.
-  wasix-build.sh          Builds the WASIX modules: the engine and whb.
-  build-agent-browser-wasix.sh  Builds agent-browser for WASIX with its patches.
+  wasix-build.sh          Builds the WASIX engine. Also builds whb, a test client.
+  package-release.sh      Copies only the engine wasm and a checksum into dist/.
+  bump-version.sh         Bumps the workspace semver. The release workflow calls it.
+  build-agent-browser-wasix.sh  Builds the agent-browser harness fixture, not a release.
   lib/llvm-ar.sh          Finds an llvm-ar that can archive wasm objects.
   wasix-run.sh            Runs it under Wasmer with networking enabled.
   wasix-netprobe.rs       Isolated probe for the loopback question.
@@ -214,25 +259,21 @@ cargo build --release
 ./target/release/wasm-headless-browser --engine html 127.0.0.1:9222
 ```
 
-Then point any CDP client at it. With `agent-browser`:
+Then point the host `agent-browser` at it. That is the path pi uses:
 
 ```bash
 agent-browser --cdp http://127.0.0.1:9222 open https://example.com
 agent-browser --cdp http://127.0.0.1:9222 snapshot
 ```
 
-Or with `whb`, which also runs as a WASIX module next to the engine:
-
-```bash
-./target/release/whb --cdp 9222 open https://example.com
-./target/release/whb --cdp 9222 snapshot -i
-
-# under Wasmer: each command its own run, sharing a mounted state directory
-wasmer run --net --volume /tmp/whb:/state --env WHB_STATE_DIR=/state \
-  target/wasm32-wasmer-wasi/release/whb.wasm -- --cdp 9222 snapshot -i
-```
-
 A bare port (`--cdp 9222`) also works; `host:port` without a scheme does not.
+The WASIX engine is the same server. `scripts/wasix-build.sh` writes
+`target/wasm32-wasmer-wasi/release/wasm-headless-browser.wasm`, and
+`scripts/wasix-run.sh` serves it. `scripts/package-release.sh` stages that
+file alone in `dist/`.
+
+`whb` can drive the same port, but it is a test client. `scripts/verify-client.sh`
+uses it. Its wasm is not released.
 
 To log in, pipe the credentials in and type placeholders
 ([`docs/credentials.md`](docs/credentials.md)):

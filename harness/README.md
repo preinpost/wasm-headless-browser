@@ -3,6 +3,12 @@
 Questions about the `@wasmer/sdk` browser sandbox cannot be answered from
 outside it, so they get a page and an experiment.
 
+The wasm files under `public/` are harness inputs, not the release. `engine.wasm`
+is a copy of `wasm-headless-browser.wasm`. `whb.wasm` is the in-repo test client
+(E7). `agent-browser.wasm` is the patched agent-browser fixture, copied only when
+`AGENT_BROWSER_WASM` is set (E8, E10, E11). `loopback-client.wasm` is a probe.
+`scripts/package-release.sh` stages the engine alone.
+
 ## The question it answers
 
 Can a WASIX process listen on loopback inside the browser sandbox, and can

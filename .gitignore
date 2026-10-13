@@ -1,6 +1,9 @@
 /target
 *.log
 
+# Release staging. scripts/package-release.sh writes the engine wasm only.
+/dist
+
 # Written by cargo-wasix; points crates.io at the WASIX overlay registry.
 # Left out so a fresh clone builds from crates.io. See scripts/wasix-build.sh.
 /.cargo/config.toml

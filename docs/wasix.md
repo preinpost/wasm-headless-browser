@@ -295,7 +295,7 @@ shrink). Run with `LOADS=10 RESOURCES=1` to repeat and observe it; see
 cargo install cargo-wasix        # fetches the WASIX Rust toolchain on first use
 brew install wasmer              # runtime
 
-scripts/wasix-build.sh           # → target/wasm32-wasmer-wasi/release/*.wasm
+scripts/wasix-build.sh           # → wasm-headless-browser.wasm (release); whb.wasm is a test client
 scripts/wasix-run.sh             # → serves on 127.0.0.1:9222
 
 MODE=wasix ./scripts/verify-m0.sh

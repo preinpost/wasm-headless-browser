@@ -1,11 +1,15 @@
-//! `whb`: drive wasm-headless-browser over CDP from the command line.
+//! `whb`: a test client that drives wasm-headless-browser over CDP.
 //!
-//! Each invocation is one command, as an agent runs them: connect, attach to
-//! this session's tab, do the one thing, print, exit. The commands and their
-//! output follow agent-browser's (`open`, `snapshot -i`, `click @e3`, ...),
-//! so whatever was written for it reads this. Unlike agent-browser there is
-//! no daemon: the engine itself keeps the tab between commands, and this
-//! keeps only a small state file (`state.rs`).
+//! Not a release artefact, and not what pi invokes. pi runs host
+//! `agent-browser --cdp` against the engine. This binary exists so
+//! `verify-client.sh` and harness E7 can drive the engine without the patched
+//! agent-browser module.
+//!
+//! Each invocation is one command: connect, attach to this session's tab, do
+//! the one thing, print, exit. The commands and their output follow a subset
+//! of agent-browser's (`open`, `snapshot -i`, `click @e3`, ...). Unlike
+//! agent-browser there is no daemon: the engine itself keeps the tab between
+//! commands, and this keeps only a small state file (`state.rs`).
 //!
 //! It is built for the same WASIX sandbox as the engine. It uses blocking std
 //! sockets only, which work under Wasmer where async ones do not.

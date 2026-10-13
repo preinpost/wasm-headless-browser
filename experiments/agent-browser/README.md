@@ -6,6 +6,11 @@ and drives the engine with its CLI, one process per command, as pi in a page
 would. Two patches make it work; `scripts/build-agent-browser-wasix.sh`
 applies them and builds.
 
+The wasm it writes is a harness fixture, not a release artefact of this
+repository. The release is `wasm-headless-browser.wasm`. On the host, an
+ordinary install of agent-browser drives that engine with `--cdp`. This build
+exists because the browser sandbox accepts no WebSocket from the host page.
+
 ```bash
 ./scripts/build-agent-browser-wasix.sh          # → target/agent-browser-wasix/agent-browser.wasm
 ENGINE=html AGENT_BROWSER_WASM=target/agent-browser-wasix/agent-browser.wasm \

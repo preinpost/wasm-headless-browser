@@ -1,5 +1,8 @@
 node_modules/
 public/wasmer-sdk/
+
+# Harness inputs, copied or built locally. Not release artefacts.
+# The release artefact is wasm-headless-browser.wasm, staged by scripts/package-release.sh.
 public/engine.wasm
 public/loopback-client.wasm
 public/whb.wasm

@@ -1,7 +1,9 @@
-// Build the two probes this harness needs, straight into public/.
+// Copy harness inputs into public/. These are not release artefacts.
 //
-// The engine comes from the normal WASIX build. The client is compiled from a
-// single-file probe, so no cargo project is involved.
+// The engine comes from the normal WASIX build. whb is the in-repo test client
+// from that same build. The loopback client is compiled from a single-file
+// probe, so no cargo project is involved. agent-browser.wasm is copied by
+// verify-harness.sh only when AGENT_BROWSER_WASM is set.
 import { execFileSync } from 'node:child_process'
 import { copyFileSync, mkdirSync } from 'node:fs'
 
